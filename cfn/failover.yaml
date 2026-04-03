@@ -1,0 +1,329 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'FO Demo - Failover Orchestrator Stack'
+
+Parameters:
+  Env:
+    Type: String
+    Default: demo
+  AppStack:
+    Type: String
+    Description: Name of the app CloudFormation stack
+  NetworkStack:
+    Type: String
+    Description: Name of the network CloudFormation stack
+  PrimaryRegion:
+    Type: String
+    Default: 'us-west-1'
+  SecondaryRegion:
+    Type: String
+    Default: 'us-west-2'
+  StateTable:
+    Type: String
+    Default: 'fo-demo-state'
+  InternalAlbDns:
+    Type: String
+    Description: Internal ALB DNS name for health checks
+  AlbArnSuffix:
+    Type: String
+    Description: ALB ARN suffix (from ALB ARN after /app/)
+    Default: ''
+  EcsClusterName:
+    Type: String
+  EcsServiceName:
+    Type: String
+  AuroraClusterId:
+    Type: String
+    Default: ''
+  AuroraGlobalClusterId:
+    Type: String
+    Default: 'fo-demo-global'
+  NotificationEmail:
+    Type: String
+    Default: 'ranohep@gmail.com'
+  FailoverMode:
+    Type: String
+    Default: 'auto'
+    AllowedValues: ['auto', 'manual']
+  CooldownMinutes:
+    Type: String
+    Default: '5'
+    Description: Reduced to 5 min for demo (default is 30)
+  ConsecutiveFailuresThreshold:
+    Type: String
+    Default: '3'
+
+Resources:
+
+  # ── SNS Topic + Email Subscription ────────────────────────────────────────
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub 'fo-${Env}-alerts'
+      DisplayName: !Sub 'FO Demo Alerts (${AWS::Region})'
+      Tags:
+        - Key: Name
+          Value: !Sub 'fo-${Env}-alerts'
+
+  AlertSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # ── IAM Role for Lambda ────────────────────────────────────────────────────
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'fo-${Env}-lambda-role-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: fo-orchestrator-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # DynamoDB — state table (global table in both regions)
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DescribeTable
+                Resource:
+                  - !Sub 'arn:aws:dynamodb:*:${AWS::AccountId}:table/${StateTable}'
+              # CloudWatch — publish metrics + read alarms/metrics
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                  - cloudwatch:GetMetricStatistics
+                  - cloudwatch:DescribeAlarms
+                  - cloudwatch:SetAlarmState
+                Resource: '*'
+              # SNS — publish alerts
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref AlertTopic
+              # ECS — describe tasks/services for health check
+              - Effect: Allow
+                Action:
+                  - ecs:DescribeServices
+                  - ecs:DescribeClusters
+                  - ecs:ListTasks
+                  - ecs:DescribeTasks
+                Resource: '*'
+              # RDS — describe Aurora cluster for health + promotion
+              - Effect: Allow
+                Action:
+                  - rds:DescribeDBClusters
+                  - rds:FailoverGlobalCluster
+                  - rds:SwitchoverGlobalCluster
+                Resource: '*'
+              # ELB — describe ALB for healthy host count
+              - Effect: Allow
+                Action:
+                  - elasticloadbalancing:DescribeLoadBalancers
+                  - elasticloadbalancing:DescribeTargetGroups
+                  - elasticloadbalancing:DescribeTargetHealth
+                Resource: '*'
+              # Route 53 — health check status
+              - Effect: Allow
+                Action:
+                  - route53:GetHealthCheck
+                  - route53:GetHealthCheckStatus
+                  - route53:ListHealthChecks
+                Resource: '*'
+              # API Gateway — for 5xx error rate monitoring
+              - Effect: Allow
+                Action:
+                  - apigateway:GET
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub 'fo-${Env}-lambda-role'
+
+  # ── Failover Orchestrator Lambda ───────────────────────────────────────────
+  OrchestratorLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'fo-${Env}-orchestrator'
+      Runtime: python3.12
+      Handler: failover_orchestrator_v3.lambda_handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 55
+      MemorySize: 256
+      Code:
+        ZipFile: |
+          # Placeholder - deploy actual code via update-function-code
+          def lambda_handler(event, context):
+              return {"status": "placeholder"}
+      VpcConfig:
+        SubnetIds:
+          - !ImportValue
+            Fn::Sub: '${AppStack}-PrivateSubnet1Id'
+          - !ImportValue
+            Fn::Sub: '${AppStack}-PrivateSubnet2Id'
+        SecurityGroupIds:
+          - !ImportValue
+            Fn::Sub: '${AppStack}-LambdaSGId'
+      Environment:
+        Variables:
+          PRIMARY_REGION: !Ref PrimaryRegion
+          SECONDARY_REGION: !Ref SecondaryRegion
+          STATE_TABLE: !Ref StateTable
+          SNS_TOPIC_ARN: !Ref AlertTopic
+          CW_NAMESPACE: 'Custom/FoDemo'
+          CW_METRIC_NAME: 'RegionActiveStatus'
+          HEALTH_CHECK_URL: !Sub 'http://${InternalAlbDns}'
+          HEALTH_ENDPOINT: '/deep-healthcheck'
+          HEALTH_CHECK_TIMEOUT_SECONDS: '5'
+          HEALTH_CHECK_DISABLE_SSL_VERIFY: 'false'
+          ALB_ARN_SUFFIX: !Ref AlbArnSuffix
+          ECS_CLUSTER_NAME: !Ref EcsClusterName
+          ECS_SERVICE_NAME: !Ref EcsServiceName
+          AURORA_CLUSTER_ID: !Ref AuroraClusterId
+          AURORA_GLOBAL_CLUSTER_ID: !Ref AuroraGlobalClusterId
+          AURORA_AUTO_PROMOTE: 'false'
+          FAILOVER_MODE: !Ref FailoverMode
+          COOLDOWN_MINUTES: !Ref CooldownMinutes
+          CONSECUTIVE_FAILURES_THRESHOLD: !Ref ConsecutiveFailuresThreshold
+          HEALTH_EVALUATION_WINDOW_MINUTES: '5'
+          MIN_HEALTHY_HOST_COUNT: '1'
+          APP_NAME: !Sub 'fo-${Env}'
+      Tags:
+        - Key: Name
+          Value: !Sub 'fo-${Env}-orchestrator'
+
+  # ── Failback Lambda ────────────────────────────────────────────────────────
+  FailbackLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'fo-${Env}-failback'
+      Runtime: python3.12
+      Handler: manual_failback_v2.lambda_handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 120
+      MemorySize: 256
+      Code:
+        ZipFile: |
+          # Placeholder - deploy actual code via update-function-code
+          def lambda_handler(event, context):
+              return {"status": "placeholder"}
+      VpcConfig:
+        SubnetIds:
+          - !ImportValue
+            Fn::Sub: '${AppStack}-PrivateSubnet1Id'
+          - !ImportValue
+            Fn::Sub: '${AppStack}-PrivateSubnet2Id'
+        SecurityGroupIds:
+          - !ImportValue
+            Fn::Sub: '${AppStack}-LambdaSGId'
+      Environment:
+        Variables:
+          PRIMARY_REGION: !Ref PrimaryRegion
+          SECONDARY_REGION: !Ref SecondaryRegion
+          STATE_TABLE: !Ref StateTable
+          SNS_TOPIC_ARN: !Ref AlertTopic
+          CW_NAMESPACE: 'Custom/FoDemo'
+          CW_METRIC_NAME: 'RegionActiveStatus'
+          HEALTH_CHECK_URL: !Sub 'http://${InternalAlbDns}'
+          HEALTH_ENDPOINT: '/deep-healthcheck'
+          AURORA_CLUSTER_ID: !Ref AuroraClusterId
+          AURORA_GLOBAL_CLUSTER_ID: !Ref AuroraGlobalClusterId
+          ECS_CLUSTER_NAME: !Ref EcsClusterName
+          ECS_SERVICE_NAME: !Ref EcsServiceName
+          APP_NAME: !Sub 'fo-${Env}'
+      Tags:
+        - Key: Name
+          Value: !Sub 'fo-${Env}-failback'
+
+  # ── EventBridge Rule (1-minute schedule) ──────────────────────────────────
+  OrchestratorSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'fo-${Env}-orchestrator-schedule'
+      Description: 'Trigger failover orchestrator every minute'
+      ScheduleExpression: 'rate(1 minute)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt OrchestratorLambda.Arn
+          Id: OrchestratorTarget
+
+  OrchestratorSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt OrchestratorLambda.Arn
+      Action: 'lambda:InvokeFunction'
+      Principal: 'events.amazonaws.com'
+      SourceArn: !GetAtt OrchestratorSchedule.Arn
+
+  # ── CloudWatch Alarm on RegionActiveStatus metric ─────────────────────────
+  # ALARM when metric drops to 0 (region unhealthy) or data is missing
+  RegionActiveAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'fo-${Env}-region-inactive-${AWS::Region}'
+      AlarmDescription: !Sub 'Region ${AWS::Region} RegionActiveStatus is 0 or missing'
+      Namespace: 'Custom/FoDemo'
+      MetricName: 'RegionActiveStatus'
+      Dimensions:
+        - Name: Region
+          Value: !Ref AWS::Region
+      Statistic: Minimum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions:
+        - !Ref AlertTopic
+      OKActions:
+        - !Ref AlertTopic
+
+  # ── Route 53 Health Check (monitors the CloudWatch alarm above) ────────────
+  # This health check drives Route 53 failover records when wired up
+  Route53HealthCheck:
+    Type: AWS::Route53::HealthCheck
+    Properties:
+      HealthCheckConfig:
+        Type: CLOUDWATCH_METRIC
+        AlarmIdentifier:
+          Region: !Ref AWS::Region
+          Name: !Ref RegionActiveAlarm
+        InsufficientDataHealthStatus: Unhealthy
+      HealthCheckTags:
+        - Key: Name
+          Value: !Sub 'fo-${Env}-hc-${AWS::Region}'
+        - Key: Region
+          Value: !Ref AWS::Region
+
+Outputs:
+  OrchestratorLambdaArn:
+    Value: !GetAtt OrchestratorLambda.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-OrchestratorLambdaArn'
+  FailbackLambdaArn:
+    Value: !GetAtt FailbackLambda.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-FailbackLambdaArn'
+  AlertTopicArn:
+    Value: !Ref AlertTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-AlertTopicArn'
+  Route53HealthCheckId:
+    Value: !Ref Route53HealthCheck
+    Export:
+      Name: !Sub '${AWS::StackName}-Route53HealthCheckId'
+  RegionActiveAlarmName:
+    Value: !Ref RegionActiveAlarm
+    Export:
+      Name: !Sub '${AWS::StackName}-RegionActiveAlarmName'

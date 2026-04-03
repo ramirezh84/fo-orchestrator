@@ -1,0 +1,53 @@
+# ============================================================
+# Failover Dashboard Config
+# Copy this file, fill in every value, then run:
+#   python3 generate_dashboard.py --config your-app.yaml --deploy
+# ============================================================
+
+# Dashboard name created in CloudWatch
+dashboard_name: "my-app-failover"
+
+# AWS account ID (12 digits)
+account_id: "123456789012"
+
+# App / orchestrator identity
+app_name: "my-app"                      # human-readable label used in widget titles
+orchestrator_function: "my-app-orchestrator"  # Lambda function name (same in both regions)
+
+# Regions
+primary_region: "us-east-1"
+secondary_region: "us-east-2"
+
+# CloudWatch custom metric (published by the orchestrator Lambda)
+cw_namespace: "Custom/MyApp"            # Lambda env var: CW_NAMESPACE
+cw_metric: "RegionActiveStatus"         # Lambda env var: CW_METRIC_NAME
+
+# ECS (same cluster and service name expected in both regions)
+ecs_cluster: "my-app-cluster"           # Lambda env var: ECS_CLUSTER_NAME
+ecs_service: "my-app-svc"               # Lambda env var: ECS_SERVICE_NAME
+
+# Internal ALB ARN suffixes  (the part after "arn:aws:elasticloadbalancing:<region>:<account>:loadbalancer/")
+# Example: app/my-app-int-alb/1a2b3c4d5e6f7890
+# Find with: aws elbv2 describe-load-balancers --region <region> --query 'LoadBalancers[?contains(LoadBalancerName,`my-app`)].LoadBalancerArn'
+primary_alb_suffix: "app/my-app-int-alb/REPLACE"
+secondary_alb_suffix: "app/my-app-int-alb/REPLACE"
+
+# Target group ARN suffixes  (the part after "arn:aws:elasticloadbalancing:<region>:<account>:loadbalancer/")
+# Example: targetgroup/my-app-fargate-tg/1a2b3c4d5e6f7890
+# Find with: aws elbv2 describe-target-groups --region <region> --query 'TargetGroups[?contains(TargetGroupName,`my-app`)].TargetGroupArn'
+primary_tg_suffix: "targetgroup/my-app-fargate-tg/REPLACE"
+secondary_tg_suffix: "targetgroup/my-app-fargate-tg/REPLACE"
+
+# Aurora cluster identifiers  (Lambda env var: AURORA_CLUSTER_ID in each region)
+primary_aurora_cluster: "my-app-aurora-primary"
+secondary_aurora_cluster: "my-app-aurora-secondary"
+
+# CloudWatch alarm names for the orchestrator  (pattern: {app-name}-region-inactive-{region})
+# These back the Route 53 health checks. Created by the orchestrator CFN/setup.
+primary_alarm_name: "my-app-region-inactive-us-east-1"
+secondary_alarm_name: "my-app-region-inactive-us-east-2"
+
+# Route 53 health check IDs  (UUIDs, not ARNs)
+# Find with: aws route53 list-health-checks --query 'HealthChecks[*].{Id:Id,Alarm:HealthCheckConfig.AlarmIdentifier.Name}'
+primary_r53_hc_id: "REPLACE-UUID-HERE"
+secondary_r53_hc_id: "REPLACE-UUID-HERE"

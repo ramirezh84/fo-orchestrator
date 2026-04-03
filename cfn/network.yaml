@@ -1,0 +1,213 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'FO Demo - Network Stack'
+
+Parameters:
+  Env:
+    Type: String
+    Default: demo
+  VpcCidr:
+    Type: String
+  RoutableSubnet1Cidr:
+    Type: String
+  RoutableSubnet2Cidr:
+    Type: String
+  PrivateSubnet1Cidr:
+    Type: String
+  PrivateSubnet2Cidr:
+    Type: String
+  Az1:
+    Type: String
+  Az2:
+    Type: String
+
+Resources:
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub 'fo-${Env}-vpc'
+
+  IGW:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub 'fo-${Env}-igw'
+
+  IGWAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref IGW
+
+  # ── Routable subnets (NLB lives here; only these have VPC-peering routes) ──
+  RoutableSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref RoutableSubnet1Cidr
+      AvailabilityZone: !Ref Az1
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub 'fo-${Env}-routable-1'
+        - Key: Tier
+          Value: routable
+
+  RoutableSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref RoutableSubnet2Cidr
+      AvailabilityZone: !Ref Az2
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub 'fo-${Env}-routable-2'
+        - Key: Tier
+          Value: routable
+
+  # ── Private subnets (everything else) ────────────────────────────────────
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnet1Cidr
+      AvailabilityZone: !Ref Az1
+      Tags:
+        - Key: Name
+          Value: !Sub 'fo-${Env}-private-1'
+        - Key: Tier
+          Value: private
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnet2Cidr
+      AvailabilityZone: !Ref Az2
+      Tags:
+        - Key: Name
+          Value: !Sub 'fo-${Env}-private-2'
+        - Key: Tier
+          Value: private
+
+  # ── NAT Gateway (in RoutableSubnet1) ─────────────────────────────────────
+  NatEip:
+    Type: AWS::EC2::EIP
+    DependsOn: IGWAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub 'fo-${Env}-nat-eip'
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref RoutableSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub 'fo-${Env}-nat'
+
+  # ── Routable route table (IGW default; peering routes added post-deploy) ──
+  RoutableRT:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub 'fo-${Env}-routable-rt'
+
+  RoutableDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IGWAttachment
+    Properties:
+      RouteTableId: !Ref RoutableRT
+      DestinationCidrBlock: '0.0.0.0/0'
+      GatewayId: !Ref IGW
+
+  RoutableSubnet1Assoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref RoutableSubnet1
+      RouteTableId: !Ref RoutableRT
+
+  RoutableSubnet2Assoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref RoutableSubnet2
+      RouteTableId: !Ref RoutableRT
+
+  # ── Private route table (NAT default; NO peering routes) ─────────────────
+  PrivateRT:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub 'fo-${Env}-private-rt'
+
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: NatGateway
+    Properties:
+      RouteTableId: !Ref PrivateRT
+      DestinationCidrBlock: '0.0.0.0/0'
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnet1Assoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRT
+
+  PrivateSubnet2Assoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRT
+
+Outputs:
+  VpcId:
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${AWS::StackName}-VpcId'
+  VpcCidr:
+    Value: !GetAtt VPC.CidrBlock
+    Export:
+      Name: !Sub '${AWS::StackName}-VpcCidr'
+  RoutableSubnet1Id:
+    Value: !Ref RoutableSubnet1
+    Export:
+      Name: !Sub '${AWS::StackName}-RoutableSubnet1Id'
+  RoutableSubnet2Id:
+    Value: !Ref RoutableSubnet2
+    Export:
+      Name: !Sub '${AWS::StackName}-RoutableSubnet2Id'
+  PrivateSubnet1Id:
+    Value: !Ref PrivateSubnet1
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateSubnet1Id'
+  PrivateSubnet2Id:
+    Value: !Ref PrivateSubnet2
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateSubnet2Id'
+  RoutableRTId:
+    Value: !Ref RoutableRT
+    Export:
+      Name: !Sub '${AWS::StackName}-RoutableRTId'
+  PrivateRTId:
+    Value: !Ref PrivateRT
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateRTId'
+  NatEip:
+    Value: !Ref NatEip
+    Export:
+      Name: !Sub '${AWS::StackName}-NatEip'

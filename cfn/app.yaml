@@ -1,0 +1,568 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'FO Demo - App Stack (SGs, VPC endpoints, ECR, ECS/Fargate, ALB)'
+
+Parameters:
+  Env:
+    Type: String
+    Default: demo
+  NetworkStack:
+    Type: String
+    Description: Name of the network CloudFormation stack
+  UserIp:
+    Type: String
+    Default: '99.45.3.43/32'
+    Description: CIDR of operator IP allowed to access the app
+  ContainerImage:
+    Type: String
+    Description: Full ECR image URI (e.g. 123456.dkr.ecr.us-west-1.amazonaws.com/fo-demo-app:latest)
+    Default: 'placeholder'
+  AuroraEndpoint:
+    Type: String
+    Description: Aurora writer/reader cluster endpoint for this region
+    Default: 'placeholder'
+  AuroraPort:
+    Type: String
+    Default: '5432'
+  AuroraDb:
+    Type: String
+    Default: 'appdb'
+  AuroraUser:
+    Type: String
+    Default: 'appuser'
+  AuroraPassword:
+    Type: String
+    NoEcho: true
+    Default: 'changeme'
+  RegionName:
+    Type: String
+    Description: Logical name of the region (e.g. us-west-1)
+
+Resources:
+
+  # ── Security Groups ────────────────────────────────────────────────────────
+
+  # External NLB SG — only user IP in on 443
+  ExternalNlbSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'External NLB - allow operator IP on 443'
+      VpcId: !ImportValue
+        Fn::Sub: '${NetworkStack}-VpcId'
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref UserIp
+          Description: 'Operator access'
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: '0.0.0.0/0'
+      Tags:
+        - Key: Name
+          Value: !Sub 'fo-${Env}-ext-nlb-sg'
+
+  # execute-api VPC endpoint SG — accept 443 from external NLB only
+  EndpointSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'execute-api VPC endpoint'
+      VpcId: !ImportValue
+        Fn::Sub: '${NetworkStack}-VpcId'
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref ExternalNlbSG
+          Description: 'From external NLB'
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: '0.0.0.0/0'
+      Tags:
+        - Key: Name
+          Value: !Sub 'fo-${Env}-endpoint-sg'
+
+  # ECR / general VPC endpoint SG (ECR, S3, Logs, etc.)
+  EcrEndpointSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'ECR/service VPC endpoints'
+      VpcId: !ImportValue
+        Fn::Sub: '${NetworkStack}-VpcId'
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !ImportValue
+            Fn::Sub: '${NetworkStack}-VpcCidr'
+          Description: 'All VPC resources'
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: '0.0.0.0/0'
+      Tags:
+        - Key: Name
+          Value: !Sub 'fo-${Env}-ecr-endpoint-sg'
+
+  # Internal VPC-Link NLB SG — accept traffic from API GW (uses VPC CIDR)
+  VpcLinkNlbSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'VPC Link NLB - internal'
+      VpcId: !ImportValue
+        Fn::Sub: '${NetworkStack}-VpcId'
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !ImportValue
+            Fn::Sub: '${NetworkStack}-VpcCidr'
+          Description: 'API GW via VPC Link'
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: '0.0.0.0/0'
+      Tags:
+        - Key: Name
+          Value: !Sub 'fo-${Env}-vpclink-nlb-sg'
+
+  # Internal ALB SG — accept from VPC Link NLB and Lambda health checks
+  AlbSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'Internal ALB'
+      VpcId: !ImportValue
+        Fn::Sub: '${NetworkStack}-VpcId'
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref VpcLinkNlbSG
+          Description: 'From VPC Link NLB'
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref LambdaSG
+          Description: 'From failover Lambda health check'
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: '0.0.0.0/0'
+      Tags:
+        - Key: Name
+          Value: !Sub 'fo-${Env}-alb-sg'
+
+  # Fargate SG — accept from ALB only
+  FargateSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'Fargate tasks'
+      VpcId: !ImportValue
+        Fn::Sub: '${NetworkStack}-VpcId'
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8000
+          ToPort: 8000
+          SourceSecurityGroupId: !Ref AlbSG
+          Description: 'From ALB'
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: '0.0.0.0/0'
+      Tags:
+        - Key: Name
+          Value: !Sub 'fo-${Env}-fargate-sg'
+
+  # Aurora SG — accept from Fargate and Lambda
+  AuroraSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'Aurora PostgreSQL'
+      VpcId: !ImportValue
+        Fn::Sub: '${NetworkStack}-VpcId'
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref FargateSG
+          Description: 'From Fargate'
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref LambdaSG
+          Description: 'From Lambda'
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: '0.0.0.0/0'
+      Tags:
+        - Key: Name
+          Value: !Sub 'fo-${Env}-aurora-sg'
+
+  # Lambda SG — outbound only (health checks, AWS APIs)
+  LambdaSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'Failover Lambda'
+      VpcId: !ImportValue
+        Fn::Sub: '${NetworkStack}-VpcId'
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: '0.0.0.0/0'
+      Tags:
+        - Key: Name
+          Value: !Sub 'fo-${Env}-lambda-sg'
+
+  # ── VPC Endpoints ──────────────────────────────────────────────────────────
+
+  # execute-api interface endpoint (Private API Gateway)
+  ExecuteApiEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !ImportValue
+        Fn::Sub: '${NetworkStack}-VpcId'
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.execute-api'
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !ImportValue
+          Fn::Sub: '${NetworkStack}-PrivateSubnet1Id'
+        - !ImportValue
+          Fn::Sub: '${NetworkStack}-PrivateSubnet2Id'
+      SecurityGroupIds:
+        - !Ref EndpointSG
+      PrivateDnsEnabled: true
+
+  # ECR API endpoint
+  EcrApiEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !ImportValue
+        Fn::Sub: '${NetworkStack}-VpcId'
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ecr.api'
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !ImportValue
+          Fn::Sub: '${NetworkStack}-PrivateSubnet1Id'
+        - !ImportValue
+          Fn::Sub: '${NetworkStack}-PrivateSubnet2Id'
+      SecurityGroupIds:
+        - !Ref EcrEndpointSG
+      PrivateDnsEnabled: true
+
+  # ECR Docker endpoint
+  EcrDkrEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !ImportValue
+        Fn::Sub: '${NetworkStack}-VpcId'
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ecr.dkr'
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !ImportValue
+          Fn::Sub: '${NetworkStack}-PrivateSubnet1Id'
+        - !ImportValue
+          Fn::Sub: '${NetworkStack}-PrivateSubnet2Id'
+      SecurityGroupIds:
+        - !Ref EcrEndpointSG
+      PrivateDnsEnabled: true
+
+  # S3 gateway endpoint (ECR image layers)
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !ImportValue
+        Fn::Sub: '${NetworkStack}-VpcId'
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !ImportValue
+          Fn::Sub: '${NetworkStack}-PrivateRTId'
+
+  # CloudWatch Logs endpoint (Fargate container logs)
+  LogsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !ImportValue
+        Fn::Sub: '${NetworkStack}-VpcId'
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.logs'
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !ImportValue
+          Fn::Sub: '${NetworkStack}-PrivateSubnet1Id'
+        - !ImportValue
+          Fn::Sub: '${NetworkStack}-PrivateSubnet2Id'
+      SecurityGroupIds:
+        - !Ref EcrEndpointSG
+      PrivateDnsEnabled: true
+
+  # DynamoDB gateway endpoint (Lambda state table)
+  DynamoDBEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !ImportValue
+        Fn::Sub: '${NetworkStack}-VpcId'
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.dynamodb'
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !ImportValue
+          Fn::Sub: '${NetworkStack}-PrivateRTId'
+
+  # ── ECS Cluster ────────────────────────────────────────────────────────────
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub 'fo-${Env}-cluster'
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+      Tags:
+        - Key: Name
+          Value: !Sub 'fo-${Env}-cluster'
+
+  # ── IAM for ECS ────────────────────────────────────────────────────────────
+  EcsTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'fo-${Env}-ecs-exec-role-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Tags:
+        - Key: Name
+          Value: !Sub 'fo-${Env}-ecs-exec-role'
+
+  EcsTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'fo-${Env}-ecs-task-role-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: app-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'cloudwatch:PutMetricData'
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub 'fo-${Env}-ecs-task-role'
+
+  # ── CloudWatch Log Group ───────────────────────────────────────────────────
+  AppLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/fo-${Env}/app'
+      RetentionInDays: 7
+
+  # ── Internal ALB ───────────────────────────────────────────────────────────
+  InternalAlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub 'fo-${Env}-int-alb'
+      Scheme: internal
+      Type: application
+      Subnets:
+        - !ImportValue
+          Fn::Sub: '${NetworkStack}-PrivateSubnet1Id'
+        - !ImportValue
+          Fn::Sub: '${NetworkStack}-PrivateSubnet2Id'
+      SecurityGroups:
+        - !Ref AlbSG
+      Tags:
+        - Key: Name
+          Value: !Sub 'fo-${Env}-int-alb'
+
+  AlbTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub 'fo-${Env}-fargate-tg'
+      Protocol: HTTP
+      Port: 8000
+      VpcId: !ImportValue
+        Fn::Sub: '${NetworkStack}-VpcId'
+      TargetType: ip
+      HealthCheckPath: /healthcheck
+      HealthCheckIntervalSeconds: 15
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: '200'
+      Tags:
+        - Key: Name
+          Value: !Sub 'fo-${Env}-fargate-tg'
+
+  AlbListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref InternalAlb
+      Protocol: HTTP
+      Port: 80
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref AlbTargetGroup
+
+  # ── ECS Task Definition ────────────────────────────────────────────────────
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub 'fo-${Env}-app'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: '256'
+      Memory: '512'
+      ExecutionRoleArn: !GetAtt EcsTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt EcsTaskRole.Arn
+      ContainerDefinitions:
+        - Name: app
+          Image: !Ref ContainerImage
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8000
+              Protocol: tcp
+          Environment:
+            - Name: DB_HOST
+              Value: !Ref AuroraEndpoint
+            - Name: DB_PORT
+              Value: !Ref AuroraPort
+            - Name: DB_NAME
+              Value: !Ref AuroraDb
+            - Name: DB_USER
+              Value: !Ref AuroraUser
+            - Name: DB_PASS
+              Value: !Ref AuroraPassword
+            - Name: REGION
+              Value: !Ref RegionName
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref AppLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: app
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - 'curl -f http://localhost:8000/healthcheck || exit 1'
+            Interval: 15
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 30
+
+  # ── ECS Fargate Service ────────────────────────────────────────────────────
+  EcsService:
+    Type: AWS::ECS::Service
+    DependsOn: AlbListener
+    Properties:
+      ServiceName: !Sub 'fo-${Env}-app-svc'
+      Cluster: !Ref EcsCluster
+      TaskDefinition: !Ref TaskDefinition
+      LaunchType: FARGATE
+      DesiredCount: 2
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets:
+            - !ImportValue
+              Fn::Sub: '${NetworkStack}-PrivateSubnet1Id'
+            - !ImportValue
+              Fn::Sub: '${NetworkStack}-PrivateSubnet2Id'
+          SecurityGroups:
+            - !Ref FargateSG
+      LoadBalancers:
+        - ContainerName: app
+          ContainerPort: 8000
+          TargetGroupArn: !Ref AlbTargetGroup
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 50
+        MaximumPercent: 200
+      HealthCheckGracePeriodSeconds: 60
+      Tags:
+        - Key: Name
+          Value: !Sub 'fo-${Env}-app-svc'
+
+Outputs:
+  VpcId:
+    Value: !ImportValue
+      Fn::Sub: '${NetworkStack}-VpcId'
+    Export:
+      Name: !Sub '${AWS::StackName}-VpcId'
+  ExecuteApiEndpointId:
+    Value: !Ref ExecuteApiEndpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-ExecuteApiEndpointId'
+  InternalAlbDns:
+    Value: !GetAtt InternalAlb.DNSName
+    Export:
+      Name: !Sub '${AWS::StackName}-InternalAlbDns'
+  InternalAlbArn:
+    Value: !Ref InternalAlb
+    Export:
+      Name: !Sub '${AWS::StackName}-InternalAlbArn'
+  AlbTargetGroupArn:
+    Value: !Ref AlbTargetGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-AlbTargetGroupArn'
+  EcsClusterName:
+    Value: !Ref EcsCluster
+    Export:
+      Name: !Sub '${AWS::StackName}-EcsClusterName'
+  EcsServiceName:
+    Value: !GetAtt EcsService.Name
+    Export:
+      Name: !Sub '${AWS::StackName}-EcsServiceName'
+  ExternalNlbSGId:
+    Value: !Ref ExternalNlbSG
+    Export:
+      Name: !Sub '${AWS::StackName}-ExternalNlbSGId'
+  EndpointSGId:
+    Value: !Ref EndpointSG
+    Export:
+      Name: !Sub '${AWS::StackName}-EndpointSGId'
+  VpcLinkNlbSGId:
+    Value: !Ref VpcLinkNlbSG
+    Export:
+      Name: !Sub '${AWS::StackName}-VpcLinkNlbSGId'
+  AlbSGId:
+    Value: !Ref AlbSG
+    Export:
+      Name: !Sub '${AWS::StackName}-AlbSGId'
+  LambdaSGId:
+    Value: !Ref LambdaSG
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaSGId'
+  AuroraSGId:
+    Value: !Ref AuroraSG
+    Export:
+      Name: !Sub '${AWS::StackName}-AuroraSGId'
+  PrivateSubnet1Id:
+    Value: !ImportValue
+      Fn::Sub: '${NetworkStack}-PrivateSubnet1Id'
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateSubnet1Id'
+  PrivateSubnet2Id:
+    Value: !ImportValue
+      Fn::Sub: '${NetworkStack}-PrivateSubnet2Id'
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateSubnet2Id'
+  RoutableSubnet1Id:
+    Value: !ImportValue
+      Fn::Sub: '${NetworkStack}-RoutableSubnet1Id'
+    Export:
+      Name: !Sub '${AWS::StackName}-RoutableSubnet1Id'
+  RoutableSubnet2Id:
+    Value: !ImportValue
+      Fn::Sub: '${NetworkStack}-RoutableSubnet2Id'
+    Export:
+      Name: !Sub '${AWS::StackName}-RoutableSubnet2Id'

@@ -1,0 +1,114 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'FO Demo - Aurora PostgreSQL Cluster (one stack per region)'
+
+Parameters:
+  Env:
+    Type: String
+    Default: demo
+  AppStack:
+    Type: String
+    Description: Name of the app CloudFormation stack
+  NetworkStack:
+    Type: String
+    Description: Name of the network CloudFormation stack
+  GlobalClusterIdentifier:
+    Type: String
+    Default: 'fo-demo-aurora-global'
+  LocalClusterIdentifier:
+    Type: String
+    Description: Unique identifier for this region's Aurora cluster
+  DBMasterUsername:
+    Type: String
+    Default: 'appuser'
+  DBMasterPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+  CreateGlobalCluster:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Set true only for primary (us-west-1) stack
+
+Conditions:
+  IsPrimary: !Equals [!Ref CreateGlobalCluster, 'true']
+
+Resources:
+
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: !Sub 'fo-${Env} Aurora subnet group'
+      SubnetIds:
+        - !ImportValue
+          Fn::Sub: '${NetworkStack}-PrivateSubnet1Id'
+        - !ImportValue
+          Fn::Sub: '${NetworkStack}-PrivateSubnet2Id'
+      Tags:
+        - Key: Name
+          Value: !Sub 'fo-${Env}-aurora-subnet-group'
+
+  # Global cluster — created only in primary region stack
+  AuroraGlobalCluster:
+    Type: AWS::RDS::GlobalCluster
+    Condition: IsPrimary
+    Properties:
+      GlobalClusterIdentifier: !Ref GlobalClusterIdentifier
+      Engine: aurora-postgresql
+      EngineVersion: '16.4'
+      StorageEncrypted: true
+      DeletionProtection: false
+
+  # Regional cluster
+  AuroraCluster:
+    Type: AWS::RDS::DBCluster
+    DependsOn: DBSubnetGroup
+    Properties:
+      DBClusterIdentifier: !Ref LocalClusterIdentifier
+      Engine: aurora-postgresql
+      EngineVersion: '16.4'
+      DatabaseName: !If [IsPrimary, 'appdb', !Ref 'AWS::NoValue']
+      MasterUsername: !If [IsPrimary, !Ref DBMasterUsername, !Ref 'AWS::NoValue']
+      MasterUserPassword: !If [IsPrimary, !Ref DBMasterPassword, !Ref 'AWS::NoValue']
+      GlobalClusterIdentifier: !Ref GlobalClusterIdentifier
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VpcSecurityGroupIds:
+        - !ImportValue
+          Fn::Sub: '${AppStack}-AuroraSGId'
+      BackupRetentionPeriod: 1
+      DeletionProtection: false
+      StorageEncrypted: true
+      Port: 5432
+      Tags:
+        - Key: Name
+          Value: !Sub 'fo-${Env}-aurora-${AWS::Region}'
+
+  AuroraInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Sub '${LocalClusterIdentifier}-instance-1'
+      DBClusterIdentifier: !Ref AuroraCluster
+      DBInstanceClass: db.r5.large
+      Engine: aurora-postgresql
+      PubliclyAccessible: false
+      Tags:
+        - Key: Name
+          Value: !Sub 'fo-${Env}-aurora-instance-${AWS::Region}'
+
+Outputs:
+  AuroraClusterEndpoint:
+    Value: !GetAtt AuroraCluster.Endpoint.Address
+    Export:
+      Name: !Sub '${AWS::StackName}-AuroraClusterEndpoint'
+  AuroraReaderEndpoint:
+    Value: !GetAtt AuroraCluster.ReadEndpoint.Address
+    Export:
+      Name: !Sub '${AWS::StackName}-AuroraReaderEndpoint'
+  AuroraClusterIdentifier:
+    Value: !Ref AuroraCluster
+    Export:
+      Name: !Sub '${AWS::StackName}-AuroraClusterId'
+  DBSubnetGroupName:
+    Value: !Ref DBSubnetGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-DBSubnetGroupName'
