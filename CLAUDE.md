@@ -13,8 +13,8 @@ Multi-region failover orchestrator for AWS infrastructure (Deposits 2.0 platform
 No build system. Deployment is manual via AWS CLI:
 
 ```bash
-# Package and deploy orchestrator Lambda (include state_backend.py)
-zip failover_orchestrator_v3.zip failover_orchestrator_v3.py state_backend.py
+# Package and deploy orchestrator Lambda (include state_backend.py + ai module)
+zip failover_orchestrator_v3.zip failover_orchestrator_v3.py state_backend.py ai/__init__.py ai/config.py ai/collector.py ai/rca_analyzer.py
 aws lambda update-function-code \
   --function-name failover-orchestrator-prod \
   --zip-file fileb://failover_orchestrator_v3.zip \
@@ -47,10 +47,14 @@ Runtime dependencies: `boto3`, `botocore` (provided by Lambda runtime). Dashboar
 | `state_backend.py` | State backend abstraction: DynamoDB Global Table or S3 CRR. |
 | `failover_cli.py` | Interactive CLI for operators: live health monitoring, failure simulation, state inspection. |
 | `failover_dashboard_local.py` | Flask web dashboard reading state from backend. |
+| `ai/config.py` | AI RCA configuration (env vars, model, timeouts). |
+| `ai/collector.py` | Collects incident context from ECS, Aurora, ALB, CloudWatch at failover time. |
+| `ai/rca_analyzer.py` | Claude API integration for root cause analysis. |
 | `tools/setup_s3_state_backend.py` | Infrastructure setup script for S3 CRR backend. |
 | `tools/generate_dashboard.py` | CloudWatch dashboard generator. |
 | `tests/test_state_backend.py` | Unit + integration + CRR replication tests for state backends. |
 | `tests/test_e2e_s3_backend.py` | End-to-end scenario tests for S3 backend. |
+| `tests/test_rca.py` | Unit + integration tests for AI RCA module. |
 
 ### Supported Use Cases
 
@@ -127,6 +131,12 @@ All configuration is via Lambda environment variables. Key variables:
 | `MIN_HEALTHY_HOST_COUNT` | 1 | Minimum ALB targets |
 | `API_GW_5XX_THRESHOLD_PERCENT` | 50.0 | Error rate threshold |
 | `ACTIVE_REGION_STALE_THRESHOLD_MINUTES` | 3 | Heartbeat age to declare region failed |
+| `AI_RCA_ENABLED` | false | Enable AI-powered root cause analysis on failover |
+| `AI_RCA_MODEL` | claude-haiku-4-5-20251001 | Claude model for RCA (haiku or sonnet) |
+| `AI_RCA_TIMEOUT_SECONDS` | 15 | API call timeout (non-blocking) |
+| `APP_LOG_GROUP` | (empty) | CloudWatch log group for app logs (enhances RCA) |
+| `ALB_FULL_ARN` | (empty) | Full ALB ARN for target health collection (enhances RCA) |
+| `ANTHROPIC_API_KEY_SECRET_NAME` | failover-orchestrator/anthropic-api-key | Secrets Manager key name |
 
 ## Key Design Decisions
 
@@ -194,4 +204,11 @@ CRR_TEST=1 \
   CRR_PRIMARY_BUCKET=<primary-bucket> \
   CRR_SECONDARY_BUCKET=<secondary-bucket> \
   python3 -m pytest tests/test_state_backend.py -v -k "CRR"
+
+# AI RCA unit tests (no AWS or API key required)
+python3 -m pytest tests/test_rca.py -v
+
+# AI RCA integration test (requires Anthropic API key)
+AI_RCA_INTEGRATION_TEST=1 ANTHROPIC_API_KEY=sk-ant-your-key \
+  python3 -m pytest tests/test_rca.py -v -k "RCAIntegration"
 ```

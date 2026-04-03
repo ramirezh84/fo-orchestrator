@@ -55,6 +55,10 @@ from botocore.exceptions import ClientError
 
 from state_backend import create_backend, ConditionalCheckFailedError
 
+from ai.config import AI_RCA_ENABLED
+from ai.collector import collect_incident_context
+from ai.rca_analyzer import analyze_incident, format_rca_for_sns
+
 # ---------------------------------------------------------------------------
 # Configuration - set as Lambda environment variables
 # ---------------------------------------------------------------------------
@@ -97,10 +101,16 @@ if HEALTH_CHECK_DISABLE_SSL_VERIFY:
 # CloudWatch Metric Resource Identifiers (local region)
 # ---------------------------------------------------------------------------
 ALB_ARN_SUFFIX = os.environ.get("ALB_ARN_SUFFIX", "")
+ALB_FULL_ARN = os.environ.get("ALB_FULL_ARN", "")
 TG_ARN_SUFFIX = os.environ.get("TG_ARN_SUFFIX", "")
 ECS_CLUSTER_NAME = os.environ.get("ECS_CLUSTER_NAME", "")
 ECS_SERVICE_NAME = os.environ.get("ECS_SERVICE_NAME", "")
 API_GW_NAME = os.environ.get("API_GW_NAME", "")
+
+# ---------------------------------------------------------------------------
+# AI RCA - Application log group for incident context collection
+# ---------------------------------------------------------------------------
+APP_LOG_GROUP = os.environ.get("APP_LOG_GROUP", "")
 AURORA_CLUSTER_ID = os.environ.get("AURORA_CLUSTER_ID", "")
 AURORA_GLOBAL_CLUSTER_ID = os.environ.get("AURORA_GLOBAL_CLUSTER_ID", "")
 
@@ -1069,6 +1079,41 @@ def send_warning_notification(subject: str, message: str, state: dict) -> None:
         logger.error(f"Error sending warning notification: {e}")
 
 
+# ---------------------------------------------------------------------------
+# AI Root Cause Analysis
+# ---------------------------------------------------------------------------
+def _run_rca_analysis(health_signals: dict) -> str:
+    """
+    Run AI-powered root cause analysis if enabled.
+
+    Returns formatted RCA text to append to SNS notifications,
+    or empty string if disabled/failed. Never raises.
+    """
+    if not AI_RCA_ENABLED:
+        return ""
+
+    try:
+        logger.info("AI RCA enabled — collecting incident context")
+        context = collect_incident_context(
+            region=CURRENT_REGION,
+            health_signals=health_signals,
+            ecs_cluster=ECS_CLUSTER_NAME,
+            ecs_service=ECS_SERVICE_NAME,
+            aurora_cluster_id=AURORA_CLUSTER_ID,
+            alb_arn=ALB_FULL_ARN or None,
+            log_group=APP_LOG_GROUP or None,
+        )
+
+        logger.info("Calling Claude API for RCA analysis")
+        rca_text = analyze_incident(context, region=CURRENT_REGION)
+        formatted = format_rca_for_sns(rca_text, context)
+        logger.info("AI RCA analysis complete")
+        return f"\n\n{formatted}"
+    except Exception as e:
+        logger.error(f"AI RCA failed (non-blocking): {type(e).__name__}: {e}")
+        return ""
+
+
 # ===========================================================================
 # Active-Active Handler
 # ===========================================================================
@@ -2023,6 +2068,9 @@ def _handle_active_region(state: dict, active_region: str,
         },
     )
 
+    # Run AI RCA analysis (non-blocking — returns "" on failure or if disabled)
+    rca_appendix = _run_rca_analysis(health.get("signals", {}))
+
     try:
 
         # Move DNS by publishing unhealthy for this region
@@ -2051,6 +2099,7 @@ def _handle_active_region(state: dict, active_region: str,
                         f"    --region {target_region}\n\n"
                         f"Latch is ENGAGED. {active_region} will remain marked unhealthy.\n\n"
                         f"Signals:\n{json.dumps(health['signals'], indent=2, default=str)}"
+                        f"{rca_appendix}"
                     ),
                 )
             else:
@@ -2080,6 +2129,7 @@ def _handle_active_region(state: dict, active_region: str,
                     f"{AURORA_PROMOTION_REMINDER_INTERVAL_MINUTES} minutes until "
                     f"Aurora promotion is detected automatically.\n\n"
                     f"Signals:\n{json.dumps(health['signals'], indent=2, default=str)}"
+                    f"{rca_appendix}"
                 ),
             )
 
