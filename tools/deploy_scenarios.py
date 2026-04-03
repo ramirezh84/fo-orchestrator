@@ -40,13 +40,14 @@ PRIMARY_REGION = "us-west-1"
 SECONDARY_REGION = "us-west-2"
 BOTH_REGIONS = [PRIMARY_REGION, SECONDARY_REGION]
 NETWORK_STACK = "fo-demo-network"
+SHARED_APP_STACK = "fo-demo-app"
 NOTIFICATION_EMAIL = "ranohep@gmail.com"
 
 # Paths relative to this script
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 CFN_DIR = os.path.join(PROJECT_ROOT, "cfn")
-APP_TEMPLATE = os.path.join(CFN_DIR, "app.yaml")
+APP_TEMPLATE = os.path.join(CFN_DIR, "scenario-app.yaml")
 FAILOVER_TEMPLATE = os.path.join(CFN_DIR, "failover.yaml")
 
 # Lambda source files
@@ -797,6 +798,7 @@ def deploy_scenario(env, regions=None):
         params = {
             "Env": env,
             "NetworkStack": NETWORK_STACK,
+            "SharedAppStack": SHARED_APP_STACK,
             "ContainerImage": container_image,
             "AuroraEndpoint": "placeholder",
             "AuroraPort": "5432",
@@ -804,6 +806,7 @@ def deploy_scenario(env, regions=None):
             "AuroraUser": "appuser",
             "AuroraPassword": "changeme",
             "RegionName": region,
+            "DesiredCount": "0",
         }
         deploy_stack(app_stack_name(env), app_template, params, region)
 

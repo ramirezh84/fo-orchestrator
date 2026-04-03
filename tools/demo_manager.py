@@ -166,7 +166,7 @@ SCENARIOS = {
 
 
 def ecs_service_name(env):
-    return "{}-svc".format(env)
+    return "{}-app-svc".format(env)
 
 
 def orchestrator_lambda_name(env):
