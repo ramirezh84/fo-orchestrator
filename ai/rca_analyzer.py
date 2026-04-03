@@ -8,6 +8,8 @@ suitable for SNS notification to operators.
 import json
 import logging
 import os
+import urllib.request
+from typing import Optional
 
 import boto3
 from botocore.exceptions import ClientError
@@ -61,7 +63,7 @@ Produce a structured analysis with these sections:
 Be concise and actionable. Operators are reading this during an incident. No preamble — start directly with the analysis."""
 
 
-def get_api_key(region: str | None = None) -> str:
+def get_api_key(region: Optional[str] = None) -> str:
     """Retrieve Anthropic API key from Secrets Manager."""
     # Allow direct env var override for testing
     key = os.environ.get("ANTHROPIC_API_KEY")
@@ -80,7 +82,7 @@ def get_api_key(region: str | None = None) -> str:
         raise
 
 
-def analyze_incident(incident_context: dict, region: str | None = None) -> str:
+def analyze_incident(incident_context: dict, region: Optional[str] = None) -> str:
     """
     Send incident context to Claude API and return RCA summary.
 
@@ -112,8 +114,6 @@ def analyze_incident(incident_context: dict, region: str | None = None) -> str:
         )
 
         # Use raw HTTP via urllib to avoid adding anthropic SDK as a Lambda dependency
-        import urllib.request
-
         request_body = json.dumps({
             "model": AI_RCA_MODEL,
             "max_tokens": AI_RCA_MAX_TOKENS,

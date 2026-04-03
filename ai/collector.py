@@ -7,6 +7,7 @@ and API Gateway metrics into a structured dict for LLM analysis.
 
 import logging
 from datetime import datetime, timedelta, timezone
+from typing import Optional
 
 import boto3
 from botocore.exceptions import ClientError
@@ -22,9 +23,9 @@ def collect_incident_context(
     ecs_cluster: str,
     ecs_service: str,
     aurora_cluster_id: str,
-    alb_arn: str | None = None,
-    api_gw_id: str | None = None,
-    log_group: str | None = None,
+    alb_arn: Optional[str] = None,
+    api_gw_id: Optional[str] = None,
+    log_group: Optional[str] = None,
 ) -> dict:
     """
     Collect incident context from multiple AWS sources.
