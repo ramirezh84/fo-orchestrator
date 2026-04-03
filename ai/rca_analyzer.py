@@ -60,7 +60,9 @@ Produce a structured analysis with these sections:
 4. **Impact** — What was the user-facing impact
 5. **Recommended Actions** — Immediate steps the operator should take (beyond the automated failover)
 
-Be concise and actionable. Operators are reading this during an incident. No preamble — start directly with the analysis."""
+Be concise and actionable. Operators are reading this during an incident.
+Do NOT add a title or heading — start directly with the Timeline section.
+Use plain text only — no markdown formatting (no **, no #, no tables). Use CAPS for emphasis instead."""
 
 
 def get_api_key(region: Optional[str] = None) -> str:
@@ -152,16 +154,15 @@ def analyze_incident(incident_context: dict, region: Optional[str] = None) -> st
 
 def format_rca_for_sns(rca_text: str, incident_context: dict) -> str:
     """Format the RCA analysis for inclusion in an SNS notification."""
-    header = (
-        "=" * 60 + "\n"
-        "AI ROOT CAUSE ANALYSIS\n"
-        "=" * 60 + "\n\n"
+    separator = "-" * 60
+    return (
+        f"\n{separator}\n"
+        f"AI ROOT CAUSE ANALYSIS\n"
+        f"{separator}\n\n"
+        f"{rca_text}\n\n"
+        f"{separator}\n"
+        f"Model: {AI_RCA_MODEL} | "
+        f"Region: {incident_context.get('region', 'unknown')} | "
+        f"Log window: {incident_context.get('window_minutes', '?')}m\n"
+        f"This is an AI-generated analysis. Verify before acting.\n"
     )
-    footer = (
-        "\n\n" + "-" * 60 + "\n"
-        f"Analysis model: {AI_RCA_MODEL}\n"
-        f"Region: {incident_context.get('region', 'unknown')}\n"
-        f"Log window: {incident_context.get('window_minutes', '?')} minutes\n"
-        "Note: This is an AI-generated analysis. Verify findings before acting.\n"
-    )
-    return header + rca_text + footer

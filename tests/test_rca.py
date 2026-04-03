@@ -392,6 +392,7 @@ class TestRCAAnalyzer:
 
         formatted = format_rca_for_sns("Test analysis text", self.SAMPLE_CONTEXT)
         assert "AI ROOT CAUSE ANALYSIS" in formatted
+        assert formatted.count("AI ROOT CAUSE ANALYSIS") == 1
         assert "Test analysis text" in formatted
         assert "us-east-1" in formatted
         assert "AI-generated analysis" in formatted
