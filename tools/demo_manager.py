@@ -39,7 +39,7 @@ ACCOUNT_ID = "597088043823"
 ECS_CLUSTER = "fo-demo-cluster"
 AURORA_ENGINE = "aurora-postgresql"
 AURORA_ENGINE_VERSION = "16.4"
-AURORA_INSTANCE_CLASS = "db.t3.medium"
+AURORA_INSTANCE_CLASS = "db.r5.large"  # Minimum for Aurora Global Database
 AURORA_MASTER_USER = "appuser"
 AURORA_MASTER_PASSWORD = "changeme"  # Demo only
 AURORA_DB_NAME = "appdb"
@@ -405,42 +405,53 @@ def aurora_instance_status(env, region):
 
 
 def get_aurora_subnet_group(env, region):
-    """Find the Aurora DB subnet group created by the app CFN stack."""
-    # The app stack creates an Aurora SG but the subnet group needs to exist.
-    # Look for one matching the env or the shared demo subnet group.
+    """Find or create the Aurora DB subnet group for this scenario."""
     rds = client("rds", region)
-    # Try env-specific first
-    for name in ["{}-aurora-subnet".format(env), "fo-demo-aurora-subnet", "default"]:
-        try:
-            resp = rds.describe_db_subnet_groups(DBSubnetGroupName=name)
-            if resp.get("DBSubnetGroups"):
-                return name
-        except ClientError:
-            continue
+    name = "{}-aurora-subnet".format(env)
+
+    # Check if it already exists
+    try:
+        resp = rds.describe_db_subnet_groups(DBSubnetGroupName=name)
+        if resp.get("DBSubnetGroups"):
+            return name
+    except ClientError:
+        pass
+
+    # Create it using subnets from the scenario app stack
+    try:
+        cfn = client("cloudformation", region)
+        stack_name = "{}-app".format(env)
+        resp = cfn.describe_stacks(StackName=stack_name)
+        outputs = {o["OutputKey"]: o["OutputValue"] for o in resp["Stacks"][0].get("Outputs", [])}
+        subnet1 = outputs.get("PrivateSubnet1Id")
+        subnet2 = outputs.get("PrivateSubnet2Id")
+        if subnet1 and subnet2:
+            rds.create_db_subnet_group(
+                DBSubnetGroupName=name,
+                DBSubnetGroupDescription="Aurora subnet group for {}".format(env),
+                SubnetIds=[subnet1, subnet2],
+                Tags=[{"Key": "Name", "Value": name}, {"Key": "env", "Value": env}],
+            )
+            print("  Created DB subnet group {}.".format(name))
+            return name
+    except ClientError as e:
+        print("  Warning: failed to create subnet group: {}".format(e))
+
     return None
 
 
 def get_aurora_security_group(env, region):
-    """Find the Aurora security group from the app stack."""
-    ec2 = client("ec2", region)
-    # Look for the Aurora SG by tag name pattern
-    resp = ec2.describe_security_groups(
-        Filters=[
-            {"Name": "tag:Name", "Values": ["{}-aurora-sg".format(env)]},
-        ]
-    )
-    sgs = resp.get("SecurityGroups", [])
-    if sgs:
-        return sgs[0]["GroupId"]
-    # Fall back to a broader search
-    resp = ec2.describe_security_groups(
-        Filters=[
-            {"Name": "tag:Name", "Values": ["fo-*-aurora-sg"]},
-        ]
-    )
-    sgs = resp.get("SecurityGroups", [])
-    if sgs:
-        return sgs[0]["GroupId"]
+    """Find the Aurora security group from the scenario app stack outputs."""
+    try:
+        cfn = client("cloudformation", region)
+        stack_name = "{}-app".format(env)
+        resp = cfn.describe_stacks(StackName=stack_name)
+        outputs = {o["OutputKey"]: o["OutputValue"] for o in resp["Stacks"][0].get("Outputs", [])}
+        sg = outputs.get("AuroraSGId")
+        if sg:
+            return sg
+    except ClientError:
+        pass
     return None
 
 
@@ -515,12 +526,18 @@ def create_aurora_secondary(env):
 
     if not aurora_cluster_exists(env, region):
         print("  Creating Aurora cluster {} in {} (joining global)...".format(cid, region))
+        # Get the default AWS managed RDS KMS key in the secondary region
+        kms = client("kms", region)
+        kms_resp = kms.describe_key(KeyId="alias/aws/rds")
+        kms_key_id = kms_resp["KeyMetadata"]["Arn"]
+
         kwargs = dict(
             DBClusterIdentifier=cid,
             GlobalClusterIdentifier=gid,
             Engine=AURORA_ENGINE,
             EngineVersion=AURORA_ENGINE_VERSION,
             StorageEncrypted=True,
+            KmsKeyId=kms_key_id,
             Tags=[{"Key": "Name", "Value": cid}, {"Key": "env", "Value": env}],
         )
         if subnet_group:
@@ -724,10 +741,10 @@ def reset_dynamo_state(env, state="PRIMARY_ACTIVE", active_region=None):
                 "state": {"S": state},
                 "latch_engaged": {"BOOL": False},
                 "consecutive_failures": {"N": "0"},
-                "last_failover_ts": {"S": ""},
+                "last_failover_ts": {"S": "1970-01-01T00:00:00Z"},
                 "last_updated": {"S": now},
                 "cooldown_reset": {"BOOL": False},
-                "warning_throttle_ts": {"S": ""},
+                "last_warning_notification_ts": {"S": "1970-01-01T00:00:00Z"},
             },
         )
     except ClientError as e:
@@ -747,13 +764,13 @@ def reset_cooldown_in_dynamo(env):
             Key={"pk": {"S": "REGION_STATE"}},
             UpdateExpression=(
                 "SET consecutive_failures = :zero, "
-                "last_failover_ts = :empty, "
+                "last_failover_ts = :epoch, "
                 "cooldown_reset = :t, "
-                "warning_throttle_ts = :empty"
+                "last_warning_notification_ts = :epoch"
             ),
             ExpressionAttributeValues={
                 ":zero": {"N": "0"},
-                ":empty": {"S": ""},
+                ":epoch": {"S": "1970-01-01T00:00:00Z"},
                 ":t": {"BOOL": True},
             },
         )

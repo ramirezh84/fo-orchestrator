@@ -542,6 +542,15 @@ def upload_lambda_code(function_name, zip_path, region):
 
     # Wait for update to complete
     _wait_for_lambda_update(function_name, region)
+
+    # Ensure handler name matches the actual function (not the CFN placeholder)
+    handler = "failover_orchestrator_v3.handler" if "orchestrator" in function_name else "manual_failback_v2.handler"
+    lam.update_function_configuration(
+        FunctionName=function_name,
+        Handler=handler,
+    )
+    _wait_for_lambda_update(function_name, region)
+
     return True
 
 

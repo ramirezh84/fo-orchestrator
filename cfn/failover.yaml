@@ -157,7 +157,7 @@ Resources:
     Properties:
       FunctionName: !Sub '${Env}-orchestrator'
       Runtime: python3.12
-      Handler: failover_orchestrator_v3.lambda_handler
+      Handler: failover_orchestrator_v3.handler
       Role: !GetAtt LambdaRole.Arn
       Timeout: 55
       MemorySize: 256
@@ -209,7 +209,7 @@ Resources:
     Properties:
       FunctionName: !Sub '${Env}-failback'
       Runtime: python3.12
-      Handler: manual_failback_v2.lambda_handler
+      Handler: manual_failback_v2.handler
       Role: !GetAtt LambdaRole.Arn
       Timeout: 120
       MemorySize: 256
