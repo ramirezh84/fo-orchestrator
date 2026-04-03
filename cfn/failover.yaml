@@ -58,11 +58,11 @@ Resources:
   AlertTopic:
     Type: AWS::SNS::Topic
     Properties:
-      TopicName: !Sub 'fo-${Env}-alerts'
+      TopicName: !Sub '${Env}-alerts'
       DisplayName: !Sub 'FO Demo Alerts (${AWS::Region})'
       Tags:
         - Key: Name
-          Value: !Sub 'fo-${Env}-alerts'
+          Value: !Sub '${Env}-alerts'
 
   AlertSubscription:
     Type: AWS::SNS::Subscription
@@ -75,7 +75,7 @@ Resources:
   LambdaRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub 'fo-${Env}-lambda-role-${AWS::Region}'
+      RoleName: !Sub '${Env}-lambda-role-${AWS::Region}'
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -149,15 +149,15 @@ Resources:
                 Resource: '*'
       Tags:
         - Key: Name
-          Value: !Sub 'fo-${Env}-lambda-role'
+          Value: !Sub '${Env}-lambda-role'
 
   # ── Failover Orchestrator Lambda ───────────────────────────────────────────
   OrchestratorLambda:
     Type: AWS::Lambda::Function
     Properties:
-      FunctionName: !Sub 'fo-${Env}-orchestrator'
+      FunctionName: !Sub '${Env}-orchestrator'
       Runtime: python3.12
-      Handler: failover_orchestrator_v3.lambda_handler
+      Handler: failover_orchestrator_v3.handler
       Role: !GetAtt LambdaRole.Arn
       Timeout: 55
       MemorySize: 256
@@ -198,18 +198,18 @@ Resources:
           CONSECUTIVE_FAILURES_THRESHOLD: !Ref ConsecutiveFailuresThreshold
           HEALTH_EVALUATION_WINDOW_MINUTES: '5'
           MIN_HEALTHY_HOST_COUNT: '1'
-          APP_NAME: !Sub 'fo-${Env}'
+          APP_NAME: !Sub '${Env}'
       Tags:
         - Key: Name
-          Value: !Sub 'fo-${Env}-orchestrator'
+          Value: !Sub '${Env}-orchestrator'
 
   # ── Failback Lambda ────────────────────────────────────────────────────────
   FailbackLambda:
     Type: AWS::Lambda::Function
     Properties:
-      FunctionName: !Sub 'fo-${Env}-failback'
+      FunctionName: !Sub '${Env}-failback'
       Runtime: python3.12
-      Handler: manual_failback_v2.lambda_handler
+      Handler: manual_failback_v2.handler
       Role: !GetAtt LambdaRole.Arn
       Timeout: 120
       MemorySize: 256
@@ -241,16 +241,16 @@ Resources:
           AURORA_GLOBAL_CLUSTER_ID: !Ref AuroraGlobalClusterId
           ECS_CLUSTER_NAME: !Ref EcsClusterName
           ECS_SERVICE_NAME: !Ref EcsServiceName
-          APP_NAME: !Sub 'fo-${Env}'
+          APP_NAME: !Sub '${Env}'
       Tags:
         - Key: Name
-          Value: !Sub 'fo-${Env}-failback'
+          Value: !Sub '${Env}-failback'
 
   # ── EventBridge Rule (1-minute schedule) ──────────────────────────────────
   OrchestratorSchedule:
     Type: AWS::Events::Rule
     Properties:
-      Name: !Sub 'fo-${Env}-orchestrator-schedule'
+      Name: !Sub '${Env}-orchestrator-schedule'
       Description: 'Trigger failover orchestrator every minute'
       ScheduleExpression: 'rate(1 minute)'
       State: ENABLED
@@ -271,7 +271,7 @@ Resources:
   RegionActiveAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
-      AlarmName: !Sub 'fo-${Env}-region-inactive-${AWS::Region}'
+      AlarmName: !Sub '${Env}-region-inactive-${AWS::Region}'
       AlarmDescription: !Sub 'Region ${AWS::Region} RegionActiveStatus is 0 or missing'
       Namespace: 'Custom/FoDemo'
       MetricName: 'RegionActiveStatus'
@@ -302,7 +302,7 @@ Resources:
         InsufficientDataHealthStatus: Unhealthy
       HealthCheckTags:
         - Key: Name
-          Value: !Sub 'fo-${Env}-hc-${AWS::Region}'
+          Value: !Sub '${Env}-hc-${AWS::Region}'
         - Key: Region
           Value: !Ref AWS::Region
 
