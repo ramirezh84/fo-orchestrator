@@ -1104,7 +1104,7 @@ def _run_rca_analysis(health_signals: dict) -> str:
             log_group=APP_LOG_GROUP or None,
         )
 
-        logger.info("Calling Claude API for RCA analysis")
+        logger.info("Calling LLM API for RCA analysis")
         rca_text = analyze_incident(context, region=CURRENT_REGION)
         formatted = format_rca_for_sns(rca_text, context)
         logger.info("AI RCA analysis complete")

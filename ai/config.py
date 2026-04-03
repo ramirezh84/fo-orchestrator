@@ -24,7 +24,7 @@ _DEFAULT_MODELS = {
 AI_RCA_MODEL = os.environ.get("AI_RCA_MODEL", _DEFAULT_MODELS.get(AI_RCA_PROVIDER, "claude-haiku-4-5-20251001"))
 
 # Max tokens for the RCA response
-AI_RCA_MAX_TOKENS = int(os.environ.get("AI_RCA_MAX_TOKENS", "1024"))
+AI_RCA_MAX_TOKENS = int(os.environ.get("AI_RCA_MAX_TOKENS", "4096"))
 
 # Timeout for the API call (seconds). RCA must not delay failover.
 AI_RCA_TIMEOUT_SECONDS = int(os.environ.get("AI_RCA_TIMEOUT_SECONDS", "15"))
