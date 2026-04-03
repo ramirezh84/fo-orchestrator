@@ -35,7 +35,7 @@ class TestConfig:
 
             assert ai.config.AI_RCA_ENABLED is False
             assert ai.config.AI_RCA_MODEL == "claude-haiku-4-5-20251001"
-            assert ai.config.AI_RCA_MAX_TOKENS == 1024
+            assert ai.config.AI_RCA_MAX_TOKENS == 4096
             assert ai.config.AI_RCA_TIMEOUT_SECONDS == 15
             assert ai.config.AI_RCA_LOG_WINDOW_MINUTES == 10
             assert ai.config.AI_RCA_MAX_LOG_LINES == 200
