@@ -209,15 +209,15 @@ def aurora_cluster_id(env, region):
 
 
 def orchestrator_lambda_name(env):
-    return "fo-{}-orchestrator".format(env)
+    return "{}-orchestrator".format(env)
 
 
 def failback_lambda_name(env):
-    return "fo-{}-failback".format(env)
+    return "{}-failback".format(env)
 
 
 def eventbridge_rule_name(env):
-    return "fo-{}-orchestrator-schedule".format(env)
+    return "{}-orchestrator-schedule".format(env)
 
 
 # ── Template Reading ──────────────────────────────────────────────────────────
@@ -628,10 +628,8 @@ def disable_eventbridge_rule(env, region):
 
 def scale_ecs_to_zero(env, region):
     """Scale ECS service to 0 tasks."""
-    # The ECS service name from CFN is fo-{env}-app-svc
-    svc_name = "fo-{}-app-svc".format(env)
-    # The cluster name from CFN is fo-{env}-cluster
-    cluster = "fo-{}-cluster".format(env)
+    svc_name = "{}-app-svc".format(env)
+    cluster = "fo-demo-cluster"  # Shared cluster from fo-demo-app stack
 
     try:
         client("ecs", region).update_service(
@@ -852,8 +850,8 @@ def deploy_scenario(env, regions=None):
         outputs = app_outputs.get(region, {})
         alb_dns = outputs.get("InternalAlbDns", "placeholder")
         alb_arn_suffix = extract_alb_arn_suffix(outputs)
-        ecs_cluster = outputs.get("EcsClusterName", "fo-{}-cluster".format(env))
-        ecs_service = outputs.get("EcsServiceName", "fo-{}-app-svc".format(env))
+        ecs_cluster = outputs.get("EcsClusterName", "{}-cluster".format(env))
+        ecs_service = outputs.get("EcsServiceName", "{}-app-svc".format(env))
 
         params = {
             "Env": env,
@@ -891,8 +889,8 @@ def deploy_scenario(env, regions=None):
     try:
         for region in regions:
             # The Lambda names come from the CFN template: fo-{Env}-orchestrator
-            orch_name = "fo-{}-orchestrator".format(env)
-            fb_name = "fo-{}-failback".format(env)
+            orch_name = orchestrator_lambda_name(env)
+            fb_name = failback_lambda_name(env)
 
             upload_lambda_code(orch_name, orchestrator_zip, region)
             upload_lambda_code(fb_name, failback_zip, region)
@@ -924,7 +922,7 @@ def deploy_scenario(env, regions=None):
     extra_env["CW_NAMESPACE"] = "Custom/{}".format(env)
 
     for region in regions:
-        orch_name = "fo-{}-orchestrator".format(env)
+        orch_name = orchestrator_lambda_name(env)
         set_lambda_env_vars(orch_name, extra_env, region)
     print()
 
