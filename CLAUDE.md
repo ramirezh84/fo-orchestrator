@@ -4,9 +4,48 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Multi-region failover orchestrator for AWS infrastructure (Deposits 2.0 platform). Lambda-based system that manages automated failover and manual failback between us-east-1 (primary) and us-east-2 (secondary), with a "latch" mechanism to prevent Route 53 from flip-flopping traffic.
+Multi-region failover orchestrator for AWS infrastructure (Deposits 2.0 platform). Lambda-based system that manages automated failover and manual failback between us-west-1 (primary) and us-west-2 (secondary), with a "latch" mechanism to prevent Route 53 from flip-flopping traffic.
 
 **Core problem solved:** Route 53 failover records are stateless and can flip traffic back and forth rapidly. This system adds a decision layer with consecutive-failure thresholds, cooldowns, and an explicit latch that keeps the old region marked unhealthy until an operator manually runs failback.
+
+## Development Process
+
+All changes to this codebase MUST follow these practices:
+
+### Git Workflow
+- **`main`** branch is stable, tagged releases only (v1.0, v1.1, etc.)
+- **`feature/*`** branches for all new work, merged via PR
+- Every PR must reference a GitHub Issue
+- Never commit directly to `main` without a PR (hotfixes are the only exception)
+
+### Project Tracking
+- **GitHub Project board:** [FO Orchestrator - AI Enhancements](https://github.com/users/ramirezh84/projects/1)
+- Work is organized into **Epics** (labeled `epic`) with **Sub-tasks** (individual issues)
+- Every piece of work needs a GitHub Issue before implementation starts
+- Issues must be added to the project board
+- Close issues via PR merge (use `Closes #N` in PR body)
+
+### Testing Requirements
+- **Run the full test suite before every commit:** `python3 -m pytest tests/ -v`
+- **All tests must pass** before pushing or creating a PR
+- New features require new tests — no untested code reaches `main`
+- Regression test suite (97 tests) covers:
+  - `tests/test_orchestrator.py` — Core orchestrator logic (52 tests)
+  - `tests/test_rca.py` — AI RCA module (32 tests)
+  - `tests/test_state_backend.py` — State backend (13 tests)
+
+### Code Review Checklist
+Before merging any PR:
+1. All tests pass (`python3 -m pytest tests/ -v`)
+2. No regressions in existing functionality
+3. New code has test coverage
+4. CLAUDE.md updated if architecture/config/components change
+5. GitHub Issue linked and will auto-close
+
+### Deployment
+- Package Lambda zips with all required modules
+- Deploy to BOTH regions (us-west-1 and us-west-2)
+- Verify health after deployment (check orchestrator logs)
 
 ## Commands
 
@@ -18,14 +57,19 @@ zip failover_orchestrator_v3.zip failover_orchestrator_v3.py state_backend.py ai
 aws lambda update-function-code \
   --function-name failover-orchestrator-prod \
   --zip-file fileb://failover_orchestrator_v3.zip \
-  --region us-east-1
+  --region us-west-1
+# Repeat for us-west-2
 
 # Package and deploy failback Lambda (include state_backend.py)
 zip manual_failback_v2.zip manual_failback_v2.py state_backend.py
 aws lambda update-function-code \
   --function-name failover-manual-failback-prod \
   --zip-file fileb://manual_failback_v2.zip \
-  --region us-east-1
+  --region us-west-1
+# Repeat for us-west-2
+
+# Run the full test suite (REQUIRED before every commit)
+python3 -m pytest tests/ -v
 
 # Run the interactive CLI operator tool
 python3 failover_cli.py
@@ -47,14 +91,29 @@ Runtime dependencies: `boto3`, `botocore` (provided by Lambda runtime). Dashboar
 | `state_backend.py` | State backend abstraction: DynamoDB Global Table or S3 CRR. |
 | `failover_cli.py` | Interactive CLI for operators: live health monitoring, failure simulation, state inspection. |
 | `failover_dashboard_local.py` | Flask web dashboard reading state from backend. |
-| `ai/config.py` | AI RCA configuration (env vars, model, timeouts). |
+| `ai/config.py` | AI configuration: provider, model, timeouts, feature toggles. |
 | `ai/collector.py` | Collects incident context from ECS, Aurora, ALB, CloudWatch at failover time. |
-| `ai/rca_analyzer.py` | Claude API integration for root cause analysis. |
+| `ai/rca_analyzer.py` | Multi-provider LLM integration (Claude/Gemini) for root cause analysis. |
 | `tools/setup_s3_state_backend.py` | Infrastructure setup script for S3 CRR backend. |
 | `tools/generate_dashboard.py` | CloudWatch dashboard generator. |
+| `tests/test_orchestrator.py` | Regression tests for core orchestrator logic (52 tests). |
 | `tests/test_state_backend.py` | Unit + integration + CRR replication tests for state backends. |
 | `tests/test_e2e_s3_backend.py` | End-to-end scenario tests for S3 backend. |
-| `tests/test_rca.py` | Unit + integration tests for AI RCA module. |
+| `tests/test_rca.py` | Unit + integration tests for AI RCA module (32 tests). |
+| `cfn/network.yaml` | CloudFormation: VPC, subnets, NAT Gateway. |
+| `cfn/app.yaml` | CloudFormation: ECS, ALB, security groups, VPC endpoints. |
+| `cfn/aurora.yaml` | CloudFormation: Aurora Global Database cluster. |
+| `cfn/failover.yaml` | CloudFormation: Orchestrator Lambda, EventBridge, CloudWatch alarms, Route 53 health checks. |
+
+### Deployed Infrastructure
+
+| Stack | us-west-1 (primary) | us-west-2 (secondary) |
+|-------|--------------------|-----------------------|
+| `fo-demo-network` | VPC, subnets, NAT | VPC, subnets, NAT |
+| `fo-demo-app` | ECS cluster, ALB, SGs | ECS cluster, ALB, SGs |
+| `fo-demo-failover` | Orchestrator + Failback Lambdas | Orchestrator + Failback Lambdas |
+| DynamoDB | `fo-demo-state` (Global Table) | `fo-demo-state` (replica) |
+| Aurora | `fo-demo-aurora-w1` (writer) | `fo-demo-aurora-w2` (reader) |
 
 ### Supported Use Cases
 
@@ -72,6 +131,9 @@ EventBridge (1 min) → Orchestrator Lambda
   Passive region: detect stale heartbeat → evaluate own readiness → publish metric
 
 CloudWatch Alarm (TreatMissingData: breaching) → Route 53 Health Check → Route 53 Failover Record → NLB → App
+
+On failover (if AI_RCA_ENABLED=true):
+  Collector gathers ECS/Aurora/ALB/CloudWatch context → LLM analyzes → RCA appended to SNS notification
 ```
 
 ### Health Signal Evaluation
@@ -114,7 +176,7 @@ All configuration is via Lambda environment variables. Key variables:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `PRIMARY_REGION` / `SECONDARY_REGION` | us-east-1 / us-east-2 | Region roles |
+| `PRIMARY_REGION` / `SECONDARY_REGION` | us-west-1 / us-west-2 | Region roles |
 | `STATE_BACKEND` | dynamodb | State backend: `dynamodb` or `s3` |
 | `STATE_TABLE` | failover-state | DynamoDB Global Table name (when `STATE_BACKEND=dynamodb`) |
 | `STATE_BUCKET` | (required if s3) | S3 bucket name for state (when `STATE_BACKEND=s3`) |
@@ -132,11 +194,14 @@ All configuration is via Lambda environment variables. Key variables:
 | `API_GW_5XX_THRESHOLD_PERCENT` | 50.0 | Error rate threshold |
 | `ACTIVE_REGION_STALE_THRESHOLD_MINUTES` | 3 | Heartbeat age to declare region failed |
 | `AI_RCA_ENABLED` | false | Enable AI-powered root cause analysis on failover |
-| `AI_RCA_MODEL` | claude-haiku-4-5-20251001 | Claude model for RCA (haiku or sonnet) |
+| `AI_RCA_PROVIDER` | claude | LLM provider: `claude` or `gemini` |
+| `AI_RCA_MODEL` | (auto per provider) | Claude: `claude-haiku-4-5-20251001`, Gemini: `gemini-2.5-flash` |
+| `AI_RCA_MAX_TOKENS` | 4096 | Max response tokens for RCA |
 | `AI_RCA_TIMEOUT_SECONDS` | 15 | API call timeout (non-blocking) |
 | `APP_LOG_GROUP` | (empty) | CloudWatch log group for app logs (enhances RCA) |
 | `ALB_FULL_ARN` | (empty) | Full ALB ARN for target health collection (enhances RCA) |
-| `ANTHROPIC_API_KEY_SECRET_NAME` | failover-orchestrator/anthropic-api-key | Secrets Manager key name |
+| `ANTHROPIC_API_KEY_SECRET_NAME` | failover-orchestrator/anthropic-api-key | Secrets Manager key for Claude |
+| `GEMINI_API_KEY_SECRET_NAME` | failover-orchestrator/gemini-api-key | Secrets Manager key for Gemini |
 
 ## Key Design Decisions
 
@@ -144,7 +209,9 @@ All configuration is via Lambda environment variables. Key variables:
 - **Aurora promotion is manual by default** (`AURORA_AUTO_PROMOTE=false`): Lambda sends CLI commands via SNS; operator runs `aws rds switchover-global-cluster`. Auto-promotion is available but disabled to prevent accidental data loss on unplanned failovers.
 - **No Step Functions**: Entire orchestration runs inside a single Lambda on a 1-minute EventBridge schedule. Each invocation is stateless; all state is in the configured backend (DynamoDB or S3).
 - **Passive region publishes its own health metric**: Secondary region demonstrates readiness to receive traffic, which is also used during failback validation.
-- **Failback Lambda invoked in target region**: Must be invoked in us-east-1 when failing back to us-east-1, so it can verify Aurora writer status locally.
+- **Failback Lambda invoked in target region**: Must be invoked in us-west-1 when failing back to us-west-1, so it can verify Aurora writer status locally.
+- **AI RCA is non-blocking**: If the LLM API call fails or times out, failover proceeds normally. RCA is fire-and-forget.
+- **Multi-provider LLM support**: Claude and Gemini are both supported via `AI_RCA_PROVIDER`. Uses urllib (no SDK dependency) for both providers.
 
 ## Operational Notes
 
@@ -193,7 +260,13 @@ python3 tools/setup_s3_state_backend.py --teardown
 ### Testing
 
 ```bash
-# Unit tests (no AWS required)
+# Run FULL test suite (REQUIRED before every commit)
+python3 -m pytest tests/ -v
+
+# Orchestrator regression tests only
+python3 -m pytest tests/test_orchestrator.py -v
+
+# State backend unit tests (no AWS required)
 python3 -m pytest tests/test_state_backend.py -v -k "not Integration"
 
 # S3 integration tests (requires AWS credentials)
@@ -208,7 +281,7 @@ CRR_TEST=1 \
 # AI RCA unit tests (no AWS or API key required)
 python3 -m pytest tests/test_rca.py -v
 
-# AI RCA integration test (requires Anthropic API key)
+# AI RCA integration test (requires API key)
 AI_RCA_INTEGRATION_TEST=1 ANTHROPIC_API_KEY=sk-ant-your-key \
   python3 -m pytest tests/test_rca.py -v -k "RCAIntegration"
 ```
