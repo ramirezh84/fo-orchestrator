@@ -612,10 +612,16 @@ def delete_aurora_instance(env, region):
         print(dim("  Aurora instance {} not found, skipping.".format(iid)))
         return
     print("  Deleting Aurora instance {} in {}...".format(iid, region))
-    client("rds", region).delete_db_instance(
-        DBInstanceIdentifier=iid,
-        SkipFinalSnapshot=True,
-    )
+    try:
+        client("rds", region).delete_db_instance(
+            DBInstanceIdentifier=iid,
+            SkipFinalSnapshot=True,
+        )
+    except ClientError as e:
+        if "is already being deleted" in str(e):
+            print(dim("  Instance already being deleted, will wait for completion."))
+        else:
+            raise
 
 
 def wait_aurora_instance_deleted(env, region, timeout_minutes=15):
@@ -689,7 +695,7 @@ def wait_aurora_cluster_deleted(env, region, timeout_minutes=10):
 
 
 def remove_from_global_cluster(env, region):
-    """Remove a regional cluster from the global cluster."""
+    """Remove a regional cluster from the global cluster and wait for detach."""
     cid = aurora_cluster_id(env, region)
     cluster_arn = "arn:aws:rds:{}:{}:cluster:{}".format(region, ACCOUNT_ID, cid)
     gid = aurora_global_cluster_id(env)
@@ -702,8 +708,51 @@ def remove_from_global_cluster(env, region):
     except ClientError as e:
         if "is not a member" in str(e) or "is not found" in str(e):
             print(dim("  Cluster not a member of global, skipping."))
+            return
         else:
             raise
+    # Wait for the cluster to fully detach (status transitions from
+    # "removing-from-global-cluster" back to "available" as standalone)
+    wait_cluster_detached_from_global(env, region)
+
+
+def wait_cluster_detached_from_global(env, region, timeout_minutes=10):
+    """Wait for a cluster to finish detaching from its global cluster."""
+    cid = aurora_cluster_id(env, region)
+    start = time.time()
+    deadline = start + timeout_minutes * 60
+    spinner = ["|", "/", "-", "\\"]
+    tick = 0
+
+    while time.time() < deadline:
+        try:
+            resp = client("rds", region).describe_db_clusters(DBClusterIdentifier=cid)
+            clusters = resp.get("DBClusters", [])
+            if not clusters:
+                print(green("  Cluster {} gone.".format(cid)))
+                return True
+            status = clusters[0].get("Status", "unknown")
+            # Once status is "available" (not "removing-from-global-cluster"), it's detached
+            if status == "available":
+                elapsed = int(time.time() - start)
+                print(green("  Cluster {} detached from global ({:d}s).".format(cid, elapsed)))
+                return True
+            elapsed = int(time.time() - start)
+            sys.stdout.write(
+                "\r  {} Waiting for {} detach ({:d}s) — status: {}   ".format(
+                    spinner[tick % len(spinner)], cid, elapsed, yellow(status)
+                )
+            )
+            sys.stdout.flush()
+        except ClientError:
+            print(green("  Cluster {} gone.".format(cid)))
+            return True
+        time.sleep(10)
+        tick += 1
+
+    sys.stdout.write("\n")
+    print(red("  TIMEOUT waiting for cluster detach."))
+    return False
 
 
 def delete_aurora_global(env):
@@ -1001,36 +1050,33 @@ def cmd_deactivate(args):
         else:
             print(dim("  ECS service not found in {}, skipping.".format(region)))
 
-    # Step 3: Delete Aurora instances
+    # Step 3: Remove secondary from global cluster and tear down secondary Aurora
+    # AWS requires the replica cluster to be fully removed before the master's
+    # last instance can be deleted, so we must handle secondary first end-to-end.
     print()
-    print(bold("[3/5] Deleting Aurora Instances"))
-    for region in [SECONDARY_REGION, PRIMARY_REGION]:
-        delete_aurora_instance(env, region)
-
-    # Wait for instances to be deleted before removing clusters
-    print()
-    print(bold("[4/5] Waiting for Aurora Instance Deletion"))
-    for region in [SECONDARY_REGION, PRIMARY_REGION]:
-        if aurora_instance_exists(env, region):
-            wait_aurora_instance_deleted(env, region)
-
-    # Step 5: Remove from global, delete clusters, delete global
-    print()
-    print(bold("[5/5] Deleting Aurora Clusters & Global"))
-
-    # Remove secondary from global first
+    print(bold("[3/5] Removing Secondary Aurora (replica must go before master)"))
+    if aurora_instance_exists(env, SECONDARY_REGION):
+        delete_aurora_instance(env, SECONDARY_REGION)
+        wait_aurora_instance_deleted(env, SECONDARY_REGION)
     if aurora_cluster_exists(env, SECONDARY_REGION):
         remove_from_global_cluster(env, SECONDARY_REGION)
         delete_aurora_cluster(env, SECONDARY_REGION)
         wait_aurora_cluster_deleted(env, SECONDARY_REGION)
 
-    # Remove primary from global
+    # Step 4: Tear down primary Aurora
+    print()
+    print(bold("[4/5] Removing Primary Aurora"))
+    if aurora_instance_exists(env, PRIMARY_REGION):
+        delete_aurora_instance(env, PRIMARY_REGION)
+        wait_aurora_instance_deleted(env, PRIMARY_REGION)
     if aurora_cluster_exists(env, PRIMARY_REGION):
         remove_from_global_cluster(env, PRIMARY_REGION)
         delete_aurora_cluster(env, PRIMARY_REGION)
         wait_aurora_cluster_deleted(env, PRIMARY_REGION)
 
-    # Delete global cluster
+    # Step 5: Delete global cluster
+    print()
+    print(bold("[5/5] Deleting Aurora Global Cluster"))
     delete_aurora_global(env)
 
     print()
