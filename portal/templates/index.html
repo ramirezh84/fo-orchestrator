@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>SentinelFO Control Portal</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <div class="container">
+    <!-- Header -->
+    <div class="header">
+      <div class="title">SentinelFO <span class="subtitle">Control Portal</span></div>
+      <div class="user-info">{{ username }} <a href="/logout" class="logout-link">[Logout]</a></div>
+    </div>
+
+    <!-- Status Bar -->
+    <div class="status-bar">
+      <div class="status-left">
+        <span class="label">STATUS:</span>
+        <span id="test-status" class="status-idle">IDLE</span>
+        <span id="test-config-display" class="test-config-text"></span>
+      </div>
+      <div class="status-right">
+        <span class="label">Aurora:</span>
+        <span id="aurora-badge" class="badge badge-off">OFF</span>
+        <button id="btn-aurora-toggle" class="btn-sm" onclick="toggleAurora()">Turn ON</button>
+        <span class="sep">|</span>
+        <span class="label">Lock:</span>
+        <span id="lock-status">Free</span>
+      </div>
+    </div>
+
+    <!-- Configuration -->
+    <div class="config-panel">
+      <div class="config-row">
+        <label>Version</label>
+        <select id="sel-version" onchange="onVersionChange()">
+          {% for key, ver in versions.items() %}
+          <option value="{{ key }}">{{ ver.name }}</option>
+          {% endfor %}
+        </select>
+        <div id="version-features" class="feature-list"></div>
+      </div>
+      <div class="config-row">
+        <label>Architecture</label>
+        <select id="sel-architecture">
+          {% for key, arch in architectures.items() %}
+          <option value="{{ key }}">{{ arch.name }} — {{ arch.description }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="config-row">
+        <label>Backend</label>
+        <select id="sel-backend">
+          {% for key, be in backends.items() %}
+          <option value="{{ key }}">{{ be.name }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="config-row" id="provider-row">
+        <label>LLM Provider</label>
+        <select id="sel-provider">
+          {% for key, prov in providers.items() %}
+          <option value="{{ key }}">{{ prov.name }}</option>
+          {% endfor %}
+        </select>
+      </div>
+    </div>
+
+    <!-- Action Buttons -->
+    <div class="actions">
+      <button class="btn btn-start" onclick="startTest()">Start Test</button>
+      <button class="btn btn-stop" onclick="stopTest()">Stop Test</button>
+      <button class="btn btn-trigger" onclick="triggerFailover()">Trigger Failover</button>
+    </div>
+
+    <!-- Live Status -->
+    <div class="live-panel">
+      <div class="panel-title">Live Status <span id="refresh-indicator" class="refresh-dot"></span></div>
+      <div class="status-grid">
+        <div class="region-status">
+          <div class="region-label">Primary (us-west-1)</div>
+          <div>ECS: <span id="ecs-w1">--</span></div>
+          <div>Aurora: <span id="aurora-w1">--</span></div>
+          <div>EventBridge: <span id="eb-w1">--</span></div>
+        </div>
+        <div class="region-status">
+          <div class="region-label">Secondary (us-west-2)</div>
+          <div>ECS: <span id="ecs-w2">--</span></div>
+          <div>Aurora: <span id="aurora-w2">--</span></div>
+          <div>EventBridge: <span id="eb-w2">--</span></div>
+        </div>
+      </div>
+      <div class="state-row">
+        <span>State: <span id="fo-state">--</span></span>
+        <span>Active Region: <span id="fo-active">--</span></span>
+        <span>Latch: <span id="fo-latch">--</span></span>
+        <span>Failures: <span id="fo-failures">--</span></span>
+      </div>
+      <div class="state-row">
+        <span>Lambda: active &rarr; <span id="lambda-version">--</span></span>
+      </div>
+    </div>
+
+    <!-- Message Area -->
+    <div id="message" class="message hidden"></div>
+  </div>
+
+  <script>
+    const VERSIONS = {{ versions | tojson }};
+
+    function onVersionChange() {
+      const ver = document.getElementById('sel-version').value;
+      const config = VERSIONS[ver];
+      const provRow = document.getElementById('provider-row');
+      provRow.style.display = config.supports_provider ? 'flex' : 'none';
+
+      const featureList = document.getElementById('version-features');
+      featureList.innerHTML = config.features.map(f => '<div class="feature-item">' + f + '</div>').join('');
+    }
+
+    function showMessage(text, isError) {
+      const el = document.getElementById('message');
+      el.textContent = text;
+      el.className = 'message ' + (isError ? 'message-error' : 'message-ok');
+      setTimeout(() => el.className = 'message hidden', 5000);
+    }
+
+    async function apiCall(url, method, body) {
+      try {
+        const opts = { method, headers: { 'Content-Type': 'application/json' } };
+        if (body) opts.body = JSON.stringify(body);
+        const resp = await fetch(url, opts);
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data.error || 'Request failed');
+        return data;
+      } catch (e) {
+        showMessage(e.message, true);
+        throw e;
+      }
+    }
+
+    async function startTest() {
+      const data = await apiCall('/api/start', 'POST', {
+        version: document.getElementById('sel-version').value,
+        architecture: document.getElementById('sel-architecture').value,
+        backend: document.getElementById('sel-backend').value,
+        provider: document.getElementById('sel-provider').value,
+      });
+      showMessage(data.message, false);
+      refreshStatus();
+    }
+
+    async function stopTest() {
+      const data = await apiCall('/api/stop', 'POST');
+      showMessage(data.message, false);
+      refreshStatus();
+    }
+
+    async function triggerFailover() {
+      const data = await apiCall('/api/trigger', 'POST');
+      showMessage(data.message, false);
+    }
+
+    async function toggleAurora() {
+      const badge = document.getElementById('aurora-badge');
+      const isOn = badge.textContent === 'ON';
+      const url = isOn ? '/api/aurora/off' : '/api/aurora/on';
+      const data = await apiCall(url, 'POST');
+      showMessage(data.message, false);
+      refreshStatus();
+    }
+
+    async function refreshStatus() {
+      try {
+        const data = await apiCall('/api/status', 'GET');
+        const s = data.status;
+        const l = data.lock;
+
+        // ECS
+        const ecsW1 = s.ecs['us-west-1'];
+        const ecsW2 = s.ecs['us-west-2'];
+        document.getElementById('ecs-w1').textContent = ecsW1.running !== null ? ecsW1.running + '/' + ecsW1.desired : 'N/A';
+        document.getElementById('ecs-w2').textContent = ecsW2.running !== null ? ecsW2.running + '/' + ecsW2.desired : 'N/A';
+
+        // Aurora
+        document.getElementById('aurora-w1').textContent = s.aurora['us-west-1'];
+        document.getElementById('aurora-w2').textContent = s.aurora['us-west-2'];
+        const auroraOn = s.aurora['us-west-1'] === 'available';
+        document.getElementById('aurora-badge').textContent = auroraOn ? 'ON' : 'OFF';
+        document.getElementById('aurora-badge').className = 'badge ' + (auroraOn ? 'badge-on' : 'badge-off');
+        document.getElementById('btn-aurora-toggle').textContent = auroraOn ? 'Turn OFF' : 'Turn ON';
+
+        // EventBridge
+        document.getElementById('eb-w1').textContent = s.eventbridge['us-west-1'];
+        document.getElementById('eb-w2').textContent = s.eventbridge['us-west-2'];
+
+        // State
+        const st = s.state;
+        document.getElementById('fo-state').textContent = st.state || '--';
+        document.getElementById('fo-active').textContent = st.active_region || '--';
+        document.getElementById('fo-latch').textContent = st.latch_engaged !== undefined ? (st.latch_engaged ? 'YES' : 'no') : '--';
+        document.getElementById('fo-failures').textContent = st.consecutive_failures !== undefined ? st.consecutive_failures : '--';
+
+        // Lambda
+        const verName = s.active_alias_name || ('v' + s.active_version);
+        document.getElementById('lambda-version').textContent = verName + ' (version ' + (s.active_version || '?') + ')';
+
+        // Lock
+        if (l.locked) {
+          document.getElementById('lock-status').textContent = 'Held by ' + l.locked_by;
+          document.getElementById('lock-status').className = 'lock-held';
+        } else {
+          document.getElementById('lock-status').textContent = 'Free';
+          document.getElementById('lock-status').className = 'lock-free';
+        }
+
+        // Test status
+        const isActive = ecsW1.desired > 0 || ecsW2.desired > 0;
+        const statusEl = document.getElementById('test-status');
+        const configEl = document.getElementById('test-config-display');
+        if (isActive && l.locked) {
+          statusEl.textContent = 'ACTIVE';
+          statusEl.className = 'status-active';
+          try {
+            const cfg = JSON.parse(l.test_config);
+            configEl.textContent = cfg.version + ' / ' + cfg.architecture + ' / ' + cfg.backend;
+          } catch(e) { configEl.textContent = ''; }
+        } else {
+          statusEl.textContent = 'IDLE';
+          statusEl.className = 'status-idle';
+          configEl.textContent = '';
+        }
+
+        // Refresh indicator
+        document.getElementById('refresh-indicator').classList.add('pulse');
+        setTimeout(() => document.getElementById('refresh-indicator').classList.remove('pulse'), 500);
+      } catch (e) {
+        // Silent refresh failure
+      }
+    }
+
+    // Initialize
+    onVersionChange();
+    refreshStatus();
+    setInterval(refreshStatus, 15000);
+  </script>
+</body>
+</html>
