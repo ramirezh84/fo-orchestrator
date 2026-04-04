@@ -223,7 +223,8 @@ def build_orchestrator_zip(version):
         zf.write(ORCHESTRATOR_SRC, "failover_orchestrator_v3.py")
         zf.write(STATE_BACKEND_SRC, "state_backend.py")
 
-        if version == "v1.1" and os.path.isdir(AI_DIR):
+        # Include AI module — orchestrator imports ai.config unconditionally
+        if os.path.isdir(AI_DIR):
             for root, _dirs, files in os.walk(AI_DIR):
                 for fname in files:
                     if fname.endswith(".py"):
@@ -234,7 +235,7 @@ def build_orchestrator_zip(version):
     return tmp.name
 
 
-def build_failback_zip():
+def build_failback_zip(version="v1.0"):
     """Build the failback Lambda deployment zip."""
     tmp = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
     tmp.close()
@@ -242,6 +243,15 @@ def build_failback_zip():
     with zipfile.ZipFile(tmp.name, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.write(FAILBACK_SRC, "manual_failback_v2.py")
         zf.write(STATE_BACKEND_SRC, "state_backend.py")
+
+        # Include AI module — failback imports ai.config unconditionally
+        if os.path.isdir(AI_DIR):
+            for root, _dirs, files in os.walk(AI_DIR):
+                for fname in files:
+                    if fname.endswith(".py"):
+                        full_path = os.path.join(root, fname)
+                        arc_name = os.path.relpath(full_path, PROJECT_ROOT)
+                        zf.write(full_path, arc_name)
 
     return tmp.name
 
@@ -871,7 +881,7 @@ def deploy_scenario(env, regions=None):
     version = scen["version"]
 
     orchestrator_zip = build_orchestrator_zip(version)
-    failback_zip = build_failback_zip()
+    failback_zip = build_failback_zip(version=scen["version"])
 
     try:
         for region in regions:
