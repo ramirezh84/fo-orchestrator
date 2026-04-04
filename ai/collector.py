@@ -57,7 +57,7 @@ def collect_incident_context(
 
 
 def _collect_ecs_events(region: str, cluster: str, service: str) -> dict:
-    """Collect recent ECS service events (deployments, task failures)."""
+    """Collect recent ECS service events (deployments, task failures, stopped reasons)."""
     try:
         ecs = boto3.client("ecs", region_name=region)
         resp = ecs.describe_services(cluster=cluster, services=[service])
@@ -65,7 +65,7 @@ def _collect_ecs_events(region: str, cluster: str, service: str) -> dict:
             return {"error": f"Service {service} not found in cluster {cluster}"}
 
         svc = resp["services"][0]
-        return {
+        result = {
             "status": svc.get("status"),
             "running_count": svc.get("runningCount"),
             "desired_count": svc.get("desiredCount"),
@@ -84,6 +84,31 @@ def _collect_ecs_events(region: str, cluster: str, service: str) -> dict:
                 for d in svc.get("deployments", [])
             ],
         }
+
+        # Collect recently stopped tasks with their stop reasons
+        try:
+            stopped = ecs.list_tasks(
+                cluster=cluster, serviceName=service,
+                desiredStatus="STOPPED", maxResults=10,
+            )
+            task_arns = stopped.get("taskArns", [])
+            if task_arns:
+                desc = ecs.describe_tasks(cluster=cluster, tasks=task_arns)
+                result["stopped_tasks"] = [
+                    {
+                        "stopped_at": t.get("stoppedAt", "").isoformat() if hasattr(t.get("stoppedAt", ""), "isoformat") else str(t.get("stoppedAt", "")),
+                        "stopped_reason": t.get("stoppedReason", ""),
+                        "stop_code": t.get("stopCode", ""),
+                        "last_status": t.get("lastStatus", ""),
+                    }
+                    for t in desc.get("tasks", [])
+                ]
+            else:
+                result["stopped_tasks"] = []
+        except (ClientError, Exception) as e:
+            result["stopped_tasks_error"] = str(e)
+
+        return result
     except (ClientError, Exception) as e:
         logger.warning(f"Failed to collect ECS events: {e}")
         return {"error": str(e)}
