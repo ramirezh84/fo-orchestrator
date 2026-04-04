@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>SentinelFO — Login</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #0d1117; color: #c9d1d9; font-family: 'JetBrains Mono', 'Fira Code', monospace; display: flex; justify-content: center; align-items: center; min-height: 100vh; }
+  .login-box { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 40px; width: 360px; }
+  h1 { color: #58a6ff; font-size: 20px; margin-bottom: 8px; }
+  .subtitle { color: #8b949e; font-size: 12px; margin-bottom: 24px; }
+  label { display: block; color: #8b949e; font-size: 12px; margin-bottom: 4px; }
+  input[type=text], input[type=password] { width: 100%; background: #0d1117; border: 1px solid #30363d; color: #c9d1d9; padding: 10px 12px; border-radius: 4px; font-family: inherit; font-size: 14px; margin-bottom: 16px; }
+  input:focus { outline: none; border-color: #58a6ff; }
+  button { width: 100%; background: #238636; color: #fff; border: none; padding: 10px; border-radius: 4px; font-family: inherit; font-size: 14px; cursor: pointer; }
+  button:hover { background: #2ea043; }
+  .error { color: #f85149; font-size: 12px; margin-bottom: 16px; }
+</style>
+</head>
+<body>
+  <div class="login-box">
+    <h1>SentinelFO</h1>
+    <div class="subtitle">AI-Enhanced Failover Orchestration</div>
+    {% if error %}<div class="error">{{ error }}</div>{% endif %}
+    <form method="post">
+      <label>Username</label>
+      <input type="text" name="username" autofocus>
+      <label>Password</label>
+      <input type="password" name="password">
+      <button type="submit">Sign In</button>
+    </form>
+  </div>
+</body>
+</html>
