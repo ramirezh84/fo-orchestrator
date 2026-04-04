@@ -1,0 +1,57 @@
+name: Deploy
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      alias_name:
+        description: 'Alias name (e.g., v1.0, v1.1, v1.2)'
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        region: [us-west-1, us-west-2]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install boto3 botocore
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::597088043823:role/fo-demo-github-actions
+          aws-region: ${{ matrix.region }}
+
+      - name: Determine alias name
+        id: alias
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "name=${{ inputs.alias_name }}" >> $GITHUB_OUTPUT
+          else
+            # Extract from tag (v1.2 from refs/tags/v1.2)
+            TAG="${GITHUB_REF#refs/tags/}"
+            echo "name=$TAG" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run tests
+        run: python3 -m pytest tests/ -v
+
+      - name: Publish Lambda version
+        run: |
+          python3 tools/publish_version.py \
+            --alias "${{ steps.alias.outputs.name }}" \
+            --region "${{ matrix.region }}"

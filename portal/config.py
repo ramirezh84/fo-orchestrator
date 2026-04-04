@@ -32,9 +32,14 @@ SECRET_KEY = "sentinelfo-portal-session-key-2026"
 
 # ── Version Definitions ─────���─────────────────────────────────────────────────
 
+# Lambda alias names can't contain dots (AWS restriction).
+# Use v1-0, v1-1, v1-2 as alias names; display as v1.0, v1.1, v1.2.
+VERSION_TO_ALIAS = {"v1.0": "v1-0", "v1.1": "v1-1", "v1.2": "v1-2"}
+
 VERSIONS = {
     "v1.0": {
         "name": "v1.0 — Core Failover",
+        "alias": "v1-0",
         "description": "Automated DNS failover with latch, anti-flip-flop, manual failback",
         "features": [
             "5-signal health evaluation (HTTP, ALB, ECS, API GW, Aurora)",
@@ -52,6 +57,7 @@ VERSIONS = {
     },
     "v1.1": {
         "name": "v1.1 — AI Insights",
+        "alias": "v1-1",
         "description": "AI root cause analysis on failover (Claude or Gemini)",
         "features": [
             "Everything in v1.0",
@@ -69,6 +75,7 @@ VERSIONS = {
     },
     "v1.2": {
         "name": "v1.2 — AI Safety",
+        "alias": "v1-2",
         "description": "Failback readiness assessment + progressive Aurora promotion advisor",
         "features": [
             "Everything in v1.1",

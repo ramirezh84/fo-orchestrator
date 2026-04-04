@@ -297,6 +297,9 @@ def configure_test(version, architecture, backend, provider):
         # Set in the per-region loop below
         pass
 
+    # Resolve alias name (v1.0 -> v1-0)
+    ver_alias = ver_config.get("alias", version.replace(".", "-"))
+
     for region in BOTH_REGIONS:
         region_vars = dict(env_vars)
         if backend == "s3":
@@ -308,7 +311,7 @@ def configure_test(version, architecture, backend, provider):
                 region_vars["REMOTE_STATE_BUCKET"] = S3_STATE_BUCKET_W1
 
         update_lambda_env(region_vars, region)
-        switch_active_alias(version, region)
+        switch_active_alias(ver_alias, region)
 
 
 def start_test(version, architecture, backend, provider):
