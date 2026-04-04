@@ -760,11 +760,26 @@ def wait_cluster_detached_from_global(env, region, timeout_minutes=10):
                 print(green("  Cluster {} gone.".format(cid)))
                 return True
             status = clusters[0].get("Status", "unknown")
-            # Once status is "available" (not "removing-from-global-cluster"), it's detached
+            # Once status is "available" (not "removing-from-global-cluster"), verify
+            # it's actually gone from the global cluster members list
             if status == "available":
-                elapsed = int(time.time() - start)
-                print(green("  Cluster {} detached from global ({:d}s).".format(cid, elapsed)))
-                return True
+                # Double-check: verify cluster is no longer in global cluster
+                gid = aurora_global_cluster_id(env)
+                still_member = False
+                try:
+                    g_resp = client("rds", PRIMARY_REGION).describe_global_clusters(
+                        GlobalClusterIdentifier=gid
+                    )
+                    for gc in g_resp.get("GlobalClusters", []):
+                        for m in gc.get("GlobalClusterMembers", []):
+                            if cid in m.get("DBClusterArn", ""):
+                                still_member = True
+                except ClientError:
+                    pass  # Global cluster might not exist anymore
+                if not still_member:
+                    elapsed = int(time.time() - start)
+                    print(green("  Cluster {} detached from global ({:d}s).".format(cid, elapsed)))
+                    return True
             elapsed = int(time.time() - start)
             sys.stdout.write(
                 "\r  {} Waiting for {} detach ({:d}s) — status: {}   ".format(
