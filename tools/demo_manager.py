@@ -190,8 +190,10 @@ def aurora_instance_id(env, region):
 
 
 def state_bucket_name(env, region):
-    """S3 state bucket name for S3-backed scenarios."""
-    return "{}-state-{}-{}".format(env, REGION_SUFFIX[region], ACCOUNT_ID)
+    """S3 state bucket name for S3-backed scenarios.
+    Matches the naming from setup_s3_state_backend.py: {prefix}-{region}-{account}
+    """
+    return "{}-state-{}-{}".format(env, region, ACCOUNT_ID)
 
 
 def state_bucket_prefix():

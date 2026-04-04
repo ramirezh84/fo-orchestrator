@@ -931,8 +931,8 @@ def deploy_scenario(env, regions=None):
             suffix = REGION_SUFFIX[region]
             other_region = SECONDARY_REGION if region == PRIMARY_REGION else PRIMARY_REGION
             other_suffix = REGION_SUFFIX[other_region]
-            region_env["STATE_BUCKET"] = "{}-state-{}-{}".format(env, suffix, ACCOUNT_ID)
-            region_env["REMOTE_STATE_BUCKET"] = "{}-state-{}-{}".format(env, other_suffix, ACCOUNT_ID)
+            region_env["STATE_BUCKET"] = "{}-state-{}-{}".format(env, region, ACCOUNT_ID)
+            region_env["REMOTE_STATE_BUCKET"] = "{}-state-{}-{}".format(env, other_region, ACCOUNT_ID)
 
         orch_name = orchestrator_lambda_name(env)
         set_lambda_env_vars(orch_name, region_env, region)
