@@ -42,6 +42,7 @@ BOTH_REGIONS = [PRIMARY_REGION, SECONDARY_REGION]
 NETWORK_STACK = "fo-demo-network"
 SHARED_APP_STACK = "fo-demo-app"
 NOTIFICATION_EMAIL = "ranohep@gmail.com"
+ACCOUNT_ID = "597088043823"
 
 # Paths relative to this script
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -63,79 +64,56 @@ REGION_SUFFIX = {
 
 # ── Scenario Definitions (mirrored from demo_manager.py) ─────────────────────
 
+_DEFAULTS = {
+    "state_backend": "dynamodb",
+    "ai_failback_readiness_enabled": False,
+    "ai_aurora_advisor_mode": "disabled",
+}
+
+
+def _scen(description, version, routing_mode, passive_publish_zero=False,
+          ai_rca_enabled=False, ai_rca_provider=None, **overrides):
+    s = dict(_DEFAULTS)
+    s.update(
+        description=description, version=version, routing_mode=routing_mode,
+        passive_publish_zero=passive_publish_zero,
+        ai_rca_enabled=ai_rca_enabled, ai_rca_provider=ai_rca_provider,
+    )
+    s.update(overrides)
+    return s
+
+
 SCENARIOS = {
-    "fo-v10-s1": {
-        "description": "v1.0 - Active/Passive",
-        "version": "v1.0",
-        "routing_mode": "failover",
-        "passive_publish_zero": False,
-        "ai_rca_enabled": False,
-        "ai_rca_provider": None,
-    },
-    "fo-v10-s2": {
-        "description": "v1.0 - Active/Passive Zero-Container",
-        "version": "v1.0",
-        "routing_mode": "failover",
-        "passive_publish_zero": True,
-        "ai_rca_enabled": False,
-        "ai_rca_provider": None,
-    },
-    "fo-v10-s3": {
-        "description": "v1.0 - Active/Active",
-        "version": "v1.0",
-        "routing_mode": "active-active",
-        "passive_publish_zero": False,
-        "ai_rca_enabled": False,
-        "ai_rca_provider": None,
-    },
-    "fo-v11c-s1": {
-        "description": "v1.1 Claude - Active/Passive",
-        "version": "v1.1",
-        "routing_mode": "failover",
-        "passive_publish_zero": False,
-        "ai_rca_enabled": True,
-        "ai_rca_provider": "claude",
-    },
-    "fo-v11c-s2": {
-        "description": "v1.1 Claude - Active/Passive Zero-Container",
-        "version": "v1.1",
-        "routing_mode": "failover",
-        "passive_publish_zero": True,
-        "ai_rca_enabled": True,
-        "ai_rca_provider": "claude",
-    },
-    "fo-v11c-s3": {
-        "description": "v1.1 Claude - Active/Active",
-        "version": "v1.1",
-        "routing_mode": "active-active",
-        "passive_publish_zero": False,
-        "ai_rca_enabled": True,
-        "ai_rca_provider": "claude",
-    },
-    "fo-v11g-s1": {
-        "description": "v1.1 Gemini - Active/Passive",
-        "version": "v1.1",
-        "routing_mode": "failover",
-        "passive_publish_zero": False,
-        "ai_rca_enabled": True,
-        "ai_rca_provider": "gemini",
-    },
-    "fo-v11g-s2": {
-        "description": "v1.1 Gemini - Active/Passive Zero-Container",
-        "version": "v1.1",
-        "routing_mode": "failover",
-        "passive_publish_zero": True,
-        "ai_rca_enabled": True,
-        "ai_rca_provider": "gemini",
-    },
-    "fo-v11g-s3": {
-        "description": "v1.1 Gemini - Active/Active",
-        "version": "v1.1",
-        "routing_mode": "active-active",
-        "passive_publish_zero": False,
-        "ai_rca_enabled": True,
-        "ai_rca_provider": "gemini",
-    },
+    # v1.0 DynamoDB
+    "fo-v10-s1": _scen("v1.0 - Active/Passive", "v1.0", "failover"),
+    "fo-v10-s2": _scen("v1.0 - A/P Zero-Container", "v1.0", "failover", passive_publish_zero=True),
+    "fo-v10-s3": _scen("v1.0 - Active/Active", "v1.0", "active-active"),
+    # v1.0 S3
+    "fo-v10x-s1": _scen("v1.0 S3 - Active/Passive", "v1.0", "failover", state_backend="s3"),
+    "fo-v10x-s2": _scen("v1.0 S3 - A/P Zero-Container", "v1.0", "failover", passive_publish_zero=True, state_backend="s3"),
+    "fo-v10x-s3": _scen("v1.0 S3 - Active/Active", "v1.0", "active-active", state_backend="s3"),
+    # v1.1 Claude DynamoDB
+    "fo-v11c-s1": _scen("v1.1 Claude - Active/Passive", "v1.1", "failover", ai_rca_enabled=True, ai_rca_provider="claude"),
+    "fo-v11c-s2": _scen("v1.1 Claude - A/P Zero-Container", "v1.1", "failover", passive_publish_zero=True, ai_rca_enabled=True, ai_rca_provider="claude"),
+    "fo-v11c-s3": _scen("v1.1 Claude - Active/Active", "v1.1", "active-active", ai_rca_enabled=True, ai_rca_provider="claude"),
+    # v1.1 Claude S3
+    "fo-v11cx-s1": _scen("v1.1 Claude S3 - Active/Passive", "v1.1", "failover", ai_rca_enabled=True, ai_rca_provider="claude", state_backend="s3"),
+    # v1.1 Gemini DynamoDB
+    "fo-v11g-s1": _scen("v1.1 Gemini - Active/Passive", "v1.1", "failover", ai_rca_enabled=True, ai_rca_provider="gemini"),
+    "fo-v11g-s2": _scen("v1.1 Gemini - A/P Zero-Container", "v1.1", "failover", passive_publish_zero=True, ai_rca_enabled=True, ai_rca_provider="gemini"),
+    "fo-v11g-s3": _scen("v1.1 Gemini - Active/Active", "v1.1", "active-active", ai_rca_enabled=True, ai_rca_provider="gemini"),
+    # v1.1 Gemini S3
+    "fo-v11gx-s1": _scen("v1.1 Gemini S3 - Active/Passive", "v1.1", "failover", ai_rca_enabled=True, ai_rca_provider="gemini", state_backend="s3"),
+    # v1.2 Claude DynamoDB (full AI)
+    "fo-v12c-s1": _scen("v1.2 Claude - Active/Passive", "v1.2", "failover", ai_rca_enabled=True, ai_rca_provider="claude", ai_failback_readiness_enabled=True, ai_aurora_advisor_mode="advisory"),
+    "fo-v12c-s2": _scen("v1.2 Claude - A/P Zero-Container", "v1.2", "failover", passive_publish_zero=True, ai_rca_enabled=True, ai_rca_provider="claude", ai_failback_readiness_enabled=True, ai_aurora_advisor_mode="advisory"),
+    "fo-v12c-s3": _scen("v1.2 Claude - Active/Active", "v1.2", "active-active", ai_rca_enabled=True, ai_rca_provider="claude", ai_failback_readiness_enabled=True, ai_aurora_advisor_mode="advisory"),
+    # v1.2 Claude S3 (full AI)
+    "fo-v12cx-s1": _scen("v1.2 Claude S3 - Active/Passive", "v1.2", "failover", ai_rca_enabled=True, ai_rca_provider="claude", state_backend="s3", ai_failback_readiness_enabled=True, ai_aurora_advisor_mode="advisory"),
+    # v1.2 Gemini DynamoDB (full AI)
+    "fo-v12g-s1": _scen("v1.2 Gemini - Active/Passive", "v1.2", "failover", ai_rca_enabled=True, ai_rca_provider="gemini", ai_failback_readiness_enabled=True, ai_aurora_advisor_mode="advisory"),
+    # v1.2 Gemini S3 (full AI)
+    "fo-v12gx-s1": _scen("v1.2 Gemini S3 - Active/Passive", "v1.2", "failover", ai_rca_enabled=True, ai_rca_provider="gemini", state_backend="s3", ai_failback_readiness_enabled=True, ai_aurora_advisor_mode="advisory"),
 }
 
 # ── ANSI Color Helpers ────────────────────────────────────────────────────────
@@ -927,12 +905,41 @@ def deploy_scenario(env, regions=None):
     else:
         extra_env["AI_RCA_ENABLED"] = "false"
 
+    # AI failback readiness
+    if scen.get("ai_failback_readiness_enabled"):
+        extra_env["AI_FAILBACK_READINESS_ENABLED"] = "true"
+
+    # AI Aurora advisor
+    advisor_mode = scen.get("ai_aurora_advisor_mode", "disabled")
+    if advisor_mode != "disabled":
+        extra_env["AI_AURORA_ADVISOR_MODE"] = advisor_mode
+
+    # State backend
+    backend = scen.get("state_backend", "dynamodb")
+    extra_env["STATE_BACKEND"] = backend
+    if backend == "s3":
+        # Per-region bucket names set in the region loop below
+        extra_env["STATE_PREFIX"] = "failover-state/"
+
     # Set CW_NAMESPACE to scenario-specific namespace
     extra_env["CW_NAMESPACE"] = "Custom/{}".format(env)
 
     for region in regions:
+        region_env = dict(extra_env)
+        # S3 backend: set per-region bucket names
+        if backend == "s3":
+            suffix = REGION_SUFFIX[region]
+            other_region = SECONDARY_REGION if region == PRIMARY_REGION else PRIMARY_REGION
+            other_suffix = REGION_SUFFIX[other_region]
+            region_env["STATE_BUCKET"] = "{}-state-{}-{}".format(env, region, ACCOUNT_ID)
+            region_env["REMOTE_STATE_BUCKET"] = "{}-state-{}-{}".format(env, other_region, ACCOUNT_ID)
+
         orch_name = orchestrator_lambda_name(env)
-        set_lambda_env_vars(orch_name, extra_env, region)
+        set_lambda_env_vars(orch_name, region_env, region)
+
+        # Also set env vars on the failback Lambda
+        fb_name = failback_lambda_name(env)
+        set_lambda_env_vars(fb_name, region_env, region)
     print()
 
     # Park the scenario: disable EventBridge, scale ECS to 0

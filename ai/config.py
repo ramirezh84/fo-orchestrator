@@ -1,6 +1,8 @@
-"""Configuration for AI-powered RCA analysis."""
+"""Configuration for AI-powered enhancements: RCA, failback readiness, aurora advisor."""
 
 import os
+
+# ── RCA Configuration ──────────────────────────────────────────────────────────
 
 # Feature toggle — must be explicitly enabled
 AI_RCA_ENABLED = os.environ.get("AI_RCA_ENABLED", "false").lower() == "true"
@@ -34,3 +36,35 @@ AI_RCA_LOG_WINDOW_MINUTES = int(os.environ.get("AI_RCA_LOG_WINDOW_MINUTES", "10"
 
 # Maximum log lines to include in the prompt (controls token usage)
 AI_RCA_MAX_LOG_LINES = int(os.environ.get("AI_RCA_MAX_LOG_LINES", "200"))
+
+# ── Failback Readiness Configuration ──────────────────────────────────────────
+
+# Feature toggle for AI failback readiness assessment
+AI_FAILBACK_READINESS_ENABLED = os.environ.get(
+    "AI_FAILBACK_READINESS_ENABLED", "false"
+).lower() == "true"
+
+# How far back to look at stability trends (minutes)
+AI_FAILBACK_STABILITY_WINDOW_MINUTES = int(
+    os.environ.get("AI_FAILBACK_STABILITY_WINDOW_MINUTES", "15")
+)
+
+# ── Aurora Promotion Advisor Configuration ────────────────────────────────────
+
+# Mode: disabled | advisory | guided | autonomous
+AI_AURORA_ADVISOR_MODE = os.environ.get("AI_AURORA_ADVISOR_MODE", "disabled").lower()
+
+# Minimum LLM confidence (0-100) for guided mode to auto-execute
+AI_AURORA_ADVISOR_CONFIDENCE_THRESHOLD = int(
+    os.environ.get("AI_AURORA_ADVISOR_CONFIDENCE_THRESHOLD", "90")
+)
+
+# Hard guardrail: max acceptable replication lag in ms (autonomous mode)
+AI_AURORA_ADVISOR_MAX_LAG_MS = int(
+    os.environ.get("AI_AURORA_ADVISOR_MAX_LAG_MS", "100")
+)
+
+# How far back to look at Aurora stability metrics (minutes)
+AI_AURORA_STABILITY_WINDOW_MINUTES = int(
+    os.environ.get("AI_AURORA_STABILITY_WINDOW_MINUTES", "10")
+)
