@@ -118,11 +118,17 @@ def api_start():
     if backend not in BACKENDS:
         return jsonify({"error": f"Invalid backend: {backend}"}), 400
 
-    # Check Aurora
+    # Check Aurora — both regions must have available instances
     aurora = aws_ops.get_aurora_status()
-    has_aurora = all(s not in ("not-found",) for s in aurora.values())
-    if not has_aurora:
-        return jsonify({"error": "Aurora instances not running. Turn on Aurora first."}), 400
+    w1_ok = aurora.get(aws_ops.PRIMARY_REGION) == "available"
+    w2_ok = aurora.get(aws_ops.SECONDARY_REGION) == "available"
+    if not (w1_ok and w2_ok):
+        missing = []
+        if not w1_ok:
+            missing.append(f"us-west-1: {aurora.get(aws_ops.PRIMARY_REGION, 'unknown')}")
+        if not w2_ok:
+            missing.append(f"us-west-2: {aurora.get(aws_ops.SECONDARY_REGION, 'unknown')}")
+        return jsonify({"error": f"Aurora not ready in both regions. Turn on Aurora first. Status: {', '.join(missing)}"}), 400
 
     # Acquire lock
     config_str = json.dumps({"version": version, "architecture": architecture, "backend": backend, "provider": provider})

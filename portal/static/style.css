@@ -36,6 +36,7 @@ body {
 .badge { padding: 2px 8px; border-radius: 3px; font-size: 11px; font-weight: bold; }
 .badge-on { background: #238636; color: #fff; }
 .badge-off { background: #30363d; color: #8b949e; }
+.badge-warn { background: #d29922; color: #000; }
 .btn-sm { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; padding: 2px 8px; border-radius: 3px; cursor: pointer; font-family: inherit; font-size: 11px; }
 .btn-sm:hover { background: #30363d; }
 .sep { color: #30363d; }

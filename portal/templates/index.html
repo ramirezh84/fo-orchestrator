@@ -163,7 +163,9 @@
 
     async function toggleAurora() {
       const badge = document.getElementById('aurora-badge');
-      const isOn = badge.textContent === 'ON';
+      const state = badge.textContent;
+      if (state === 'STARTING') { showMessage('Aurora is starting, please wait...', true); return; }
+      const isOn = state === 'ON' || state === 'PARTIAL';
       const url = isOn ? '/api/aurora/off' : '/api/aurora/on';
       const data = await apiCall(url, 'POST');
       showMessage(data.message, false);
@@ -182,13 +184,21 @@
         document.getElementById('ecs-w1').textContent = ecsW1.running !== null ? ecsW1.running + '/' + ecsW1.desired : 'N/A';
         document.getElementById('ecs-w2').textContent = ecsW2.running !== null ? ecsW2.running + '/' + ecsW2.desired : 'N/A';
 
-        // Aurora
-        document.getElementById('aurora-w1').textContent = s.aurora['us-west-1'];
-        document.getElementById('aurora-w2').textContent = s.aurora['us-west-2'];
-        const auroraOn = s.aurora['us-west-1'] === 'available';
-        document.getElementById('aurora-badge').textContent = auroraOn ? 'ON' : 'OFF';
-        document.getElementById('aurora-badge').className = 'badge ' + (auroraOn ? 'badge-on' : 'badge-off');
-        document.getElementById('btn-aurora-toggle').textContent = auroraOn ? 'Turn OFF' : 'Turn ON';
+        // Aurora — both regions must be available for "ON"
+        const aw1 = s.aurora['us-west-1'];
+        const aw2 = s.aurora['us-west-2'];
+        document.getElementById('aurora-w1').textContent = aw1;
+        document.getElementById('aurora-w2').textContent = aw2;
+        const bothAvailable = aw1 === 'available' && aw2 === 'available';
+        const anyRunning = aw1 !== 'not-found' || aw2 !== 'not-found';
+        const creating = aw1 === 'creating' || aw2 === 'creating';
+        let badgeText = 'OFF', badgeClass = 'badge-off', btnText = 'Turn ON';
+        if (bothAvailable) { badgeText = 'ON'; badgeClass = 'badge-on'; btnText = 'Turn OFF'; }
+        else if (creating) { badgeText = 'STARTING'; badgeClass = 'badge-warn'; btnText = 'Wait...'; }
+        else if (anyRunning) { badgeText = 'PARTIAL'; badgeClass = 'badge-warn'; btnText = 'Turn OFF'; }
+        document.getElementById('aurora-badge').textContent = badgeText;
+        document.getElementById('aurora-badge').className = 'badge ' + badgeClass;
+        document.getElementById('btn-aurora-toggle').textContent = btnText;
 
         // EventBridge
         document.getElementById('eb-w1').textContent = s.eventbridge['us-west-1'];
