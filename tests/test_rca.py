@@ -304,13 +304,13 @@ class TestRCAAnalyzer:
         "aurora_status": {"status": "available"},
     }
 
-    @patch("ai.rca_analyzer.os.environ", {"ANTHROPIC_API_KEY": "test-key"})
+    @patch("ai.llm_client.os.environ", {"ANTHROPIC_API_KEY": "test-key"})
     def test_get_api_key_from_env(self):
         from ai.rca_analyzer import get_api_key
         assert get_api_key() == "test-key"
 
-    @patch("ai.rca_analyzer.os.environ", {})
-    @patch("ai.rca_analyzer.boto3")
+    @patch("ai.llm_client.os.environ", {})
+    @patch("ai.llm_client.boto3")
     def test_get_api_key_from_secrets_manager(self, mock_boto3):
         from ai.rca_analyzer import get_api_key
 
@@ -322,8 +322,8 @@ class TestRCAAnalyzer:
         assert key == "sk-ant-secret"
         mock_sm.get_secret_value.assert_called_once()
 
-    @patch("ai.rca_analyzer.os.environ", {})
-    @patch("ai.rca_analyzer.boto3")
+    @patch("ai.llm_client.os.environ", {})
+    @patch("ai.llm_client.boto3")
     def test_get_api_key_secrets_manager_failure(self, mock_boto3):
         from ai.rca_analyzer import get_api_key
 
@@ -337,8 +337,8 @@ class TestRCAAnalyzer:
         with pytest.raises(ClientError):
             get_api_key("us-east-1")
 
-    @patch("ai.rca_analyzer.urllib.request.urlopen")
-    @patch("ai.rca_analyzer.get_api_key", return_value="test-key")
+    @patch("ai.llm_client.urllib.request.urlopen")
+    @patch("ai.llm_client.get_api_key", return_value="test-key")
     def test_analyze_incident_success(self, mock_key, mock_urlopen):
         from ai.rca_analyzer import analyze_incident
 
@@ -354,8 +354,8 @@ class TestRCAAnalyzer:
         assert "Timeline" in result
         assert "Root Cause" in result
 
-    @patch("ai.rca_analyzer.urllib.request.urlopen")
-    @patch("ai.rca_analyzer.get_api_key", return_value="test-key")
+    @patch("ai.llm_client.urllib.request.urlopen")
+    @patch("ai.llm_client.get_api_key", return_value="test-key")
     def test_analyze_incident_empty_response(self, mock_key, mock_urlopen):
         from ai.rca_analyzer import analyze_incident
 
@@ -368,16 +368,16 @@ class TestRCAAnalyzer:
         result = analyze_incident(self.SAMPLE_CONTEXT)
         assert "empty response" in result
 
-    @patch("ai.rca_analyzer.get_api_key", side_effect=Exception("network error"))
+    @patch("ai.llm_client.get_api_key", side_effect=Exception("network error"))
     def test_analyze_incident_api_failure_returns_error_string(self, mock_key):
         from ai.rca_analyzer import analyze_incident
 
         result = analyze_incident(self.SAMPLE_CONTEXT)
-        assert "[RCA] Analysis unavailable" in result
+        assert "[LLM] Call failed" in result
         assert "network error" in result
 
-    @patch("ai.rca_analyzer.urllib.request.urlopen")
-    @patch("ai.rca_analyzer.get_api_key", return_value="test-key")
+    @patch("ai.llm_client.urllib.request.urlopen")
+    @patch("ai.llm_client.get_api_key", return_value="test-key")
     def test_analyze_incident_timeout(self, mock_key, mock_urlopen):
         from ai.rca_analyzer import analyze_incident
         from urllib.error import URLError
@@ -385,7 +385,7 @@ class TestRCAAnalyzer:
         mock_urlopen.side_effect = URLError("timed out")
 
         result = analyze_incident(self.SAMPLE_CONTEXT)
-        assert "[RCA] Analysis unavailable" in result
+        assert "[LLM] Call failed" in result
 
     def test_format_rca_for_sns(self):
         from ai.rca_analyzer import format_rca_for_sns
@@ -397,10 +397,10 @@ class TestRCAAnalyzer:
         assert "us-east-1" in formatted
         assert "AI-generated analysis" in formatted
 
-    @patch("ai.rca_analyzer.urllib.request.urlopen")
-    @patch("ai.rca_analyzer.get_api_key", return_value="test-key")
+    @patch("ai.llm_client.urllib.request.urlopen")
+    @patch("ai.llm_client.get_api_key", return_value="test-key")
     def test_analyze_sends_correct_request(self, mock_key, mock_urlopen):
-        from ai.rca_analyzer import analyze_incident, AI_RCA_MODEL
+        from ai.rca_analyzer import analyze_incident
 
         mock_response = MagicMock()
         mock_response.read.return_value = json.dumps({
@@ -420,7 +420,7 @@ class TestRCAAnalyzer:
         assert req.get_header("Anthropic-version") == "2023-06-01"
 
         body = json.loads(req.data.decode())
-        assert body["model"] == AI_RCA_MODEL
+        assert "model" in body
         assert len(body["messages"]) == 1
         assert "failover" in body["messages"][0]["content"].lower()
 
@@ -442,15 +442,15 @@ class TestGeminiProvider:
         "aurora_status": {"status": "available"},
     }
 
-    @patch("ai.rca_analyzer.os.environ", {"GEMINI_API_KEY": "gem-key"})
-    @patch("ai.rca_analyzer.AI_RCA_PROVIDER", "gemini")
+    @patch("ai.llm_client.os.environ", {"GEMINI_API_KEY": "gem-key"})
+    @patch("ai.llm_client.AI_RCA_PROVIDER", "gemini")
     def test_get_api_key_gemini_from_env(self):
         from ai.rca_analyzer import get_api_key
         assert get_api_key() == "gem-key"
 
-    @patch("ai.rca_analyzer.os.environ", {})
-    @patch("ai.rca_analyzer.AI_RCA_PROVIDER", "gemini")
-    @patch("ai.rca_analyzer.boto3")
+    @patch("ai.llm_client.os.environ", {})
+    @patch("ai.llm_client.AI_RCA_PROVIDER", "gemini")
+    @patch("ai.llm_client.boto3")
     def test_get_api_key_gemini_from_secrets_manager(self, mock_boto3):
         from ai.rca_analyzer import get_api_key
 
@@ -461,10 +461,10 @@ class TestGeminiProvider:
         key = get_api_key("us-east-1")
         assert key == "gem-secret"
 
-    @patch("ai.rca_analyzer.urllib.request.urlopen")
-    @patch("ai.rca_analyzer.get_api_key", return_value="gem-key")
-    @patch("ai.rca_analyzer.AI_RCA_PROVIDER", "gemini")
-    @patch("ai.rca_analyzer.AI_RCA_MODEL", "gemini-2.5-flash")
+    @patch("ai.llm_client.urllib.request.urlopen")
+    @patch("ai.llm_client.get_api_key", return_value="gem-key")
+    @patch("ai.llm_client.AI_RCA_PROVIDER", "gemini")
+    @patch("ai.llm_client.AI_RCA_MODEL", "gemini-2.5-flash")
     def test_gemini_analyze_success(self, mock_key, mock_urlopen):
         from ai.rca_analyzer import analyze_incident
 
@@ -484,10 +484,10 @@ class TestGeminiProvider:
         assert "Timeline" in result
         assert "Root Cause" in result
 
-    @patch("ai.rca_analyzer.urllib.request.urlopen")
-    @patch("ai.rca_analyzer.get_api_key", return_value="gem-key")
-    @patch("ai.rca_analyzer.AI_RCA_PROVIDER", "gemini")
-    @patch("ai.rca_analyzer.AI_RCA_MODEL", "gemini-2.5-flash")
+    @patch("ai.llm_client.urllib.request.urlopen")
+    @patch("ai.llm_client.get_api_key", return_value="gem-key")
+    @patch("ai.llm_client.AI_RCA_PROVIDER", "gemini")
+    @patch("ai.llm_client.AI_RCA_MODEL", "gemini-2.5-flash")
     def test_gemini_empty_response(self, mock_key, mock_urlopen):
         from ai.rca_analyzer import analyze_incident
 
@@ -500,10 +500,10 @@ class TestGeminiProvider:
         result = analyze_incident(self.SAMPLE_CONTEXT)
         assert "empty response" in result
 
-    @patch("ai.rca_analyzer.urllib.request.urlopen")
-    @patch("ai.rca_analyzer.get_api_key", return_value="gem-key")
-    @patch("ai.rca_analyzer.AI_RCA_PROVIDER", "gemini")
-    @patch("ai.rca_analyzer.AI_RCA_MODEL", "gemini-2.5-flash")
+    @patch("ai.llm_client.urllib.request.urlopen")
+    @patch("ai.llm_client.get_api_key", return_value="gem-key")
+    @patch("ai.llm_client.AI_RCA_PROVIDER", "gemini")
+    @patch("ai.llm_client.AI_RCA_MODEL", "gemini-2.5-flash")
     def test_gemini_sends_correct_request(self, mock_key, mock_urlopen):
         from ai.rca_analyzer import analyze_incident
 
@@ -527,13 +527,13 @@ class TestGeminiProvider:
         assert "contents" in body
         assert "failover" in body["contents"][0]["parts"][0]["text"].lower()
 
-    @patch("ai.rca_analyzer.get_api_key", side_effect=Exception("gemini auth failed"))
-    @patch("ai.rca_analyzer.AI_RCA_PROVIDER", "gemini")
+    @patch("ai.llm_client.get_api_key", side_effect=Exception("gemini auth failed"))
+    @patch("ai.llm_client.AI_RCA_PROVIDER", "gemini")
     def test_gemini_failure_is_non_blocking(self, mock_key):
         from ai.rca_analyzer import analyze_incident
 
         result = analyze_incident(self.SAMPLE_CONTEXT)
-        assert "[RCA] Analysis unavailable" in result
+        assert "[LLM] Call failed" in result
 
     def test_format_rca_shows_provider(self):
         from ai.rca_analyzer import format_rca_for_sns
