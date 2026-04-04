@@ -324,7 +324,7 @@ def _collect_ecs_task_stability(
 def _collect_alb_error_trend(
     region: str, alb_arn_suffix: str, window_minutes: int
 ) -> dict:
-    """Collect ALB 5xx error rate trend from CloudWatch."""
+    """Collect ALB error rate and target health trends from CloudWatch."""
     try:
         errors_5xx = _collect_cloudwatch_metric_series(
             region=region,
@@ -346,9 +346,31 @@ def _collect_alb_error_trend(
             window_minutes=window_minutes,
         )
 
+        healthy_hosts = _collect_cloudwatch_metric_series(
+            region=region,
+            namespace="AWS/ApplicationELB",
+            metric_name="HealthyHostCount",
+            dimensions=[{"Name": "LoadBalancer", "Value": alb_arn_suffix}],
+            stat="Average",
+            period=60,
+            window_minutes=window_minutes,
+        )
+
+        unhealthy_hosts = _collect_cloudwatch_metric_series(
+            region=region,
+            namespace="AWS/ApplicationELB",
+            metric_name="UnHealthyHostCount",
+            dimensions=[{"Name": "LoadBalancer", "Value": alb_arn_suffix}],
+            stat="Average",
+            period=60,
+            window_minutes=window_minutes,
+        )
+
         return {
             "5xx_count": errors_5xx,
             "request_count": request_count,
+            "healthy_host_count": healthy_hosts,
+            "unhealthy_host_count": unhealthy_hosts,
         }
     except (ClientError, Exception) as e:
         logger.warning(f"Failed to collect ALB error trend: {e}")
