@@ -46,6 +46,10 @@ from botocore.exceptions import ClientError
 
 from state_backend import create_backend, S3StateBackend
 
+from ai.config import AI_FAILBACK_READINESS_ENABLED, AI_FAILBACK_STABILITY_WINDOW_MINUTES
+from ai.stability_collector import collect_stability_context
+from ai.failback_readiness import assess_failback_readiness, format_readiness_for_sns
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -487,6 +491,49 @@ def handler(event, context):
         return {"statusCode": 400, "body": msg}
     logger.info("Aurora confirmed by operator")
 
+    # Step 2.5: AI Failback Readiness Assessment (non-blocking)
+    readiness_appendix = ""
+    skip_readiness_check = event.get("skip_readiness_check", False)
+    if AI_FAILBACK_READINESS_ENABLED and not skip_readiness_check:
+        logger.info("Step 2.5: Running AI failback readiness assessment...")
+        try:
+            stability = collect_stability_context(
+                region=target_region,
+                aurora_cluster_id=AURORA_CLUSTER_ID,
+                aurora_global_cluster_id=AURORA_GLOBAL_CLUSTER_ID,
+                ecs_cluster=ECS_CLUSTER_NAME,
+                ecs_service=ECS_SERVICE_NAME,
+                window_minutes=AI_FAILBACK_STABILITY_WINDOW_MINUTES,
+            )
+            assessment = assess_failback_readiness(stability, region=target_region)
+            readiness_appendix = "\n\n" + format_readiness_for_sns(assessment, stability)
+
+            verdict = assessment.get("verdict", "CAUTION")
+            logger.info(
+                f"Readiness verdict: {verdict}, "
+                f"confidence: {assessment.get('confidence')}"
+            )
+
+            if verdict == "NO_GO":
+                msg = (
+                    f"AI readiness assessment: NO GO (confidence: {assessment.get('confidence')}%)\n\n"
+                    f"Reasoning: {assessment.get('reasoning', 'N/A')}\n\n"
+                    f"Risks:\n"
+                    + "\n".join(f"  - {r}" for r in assessment.get("risks", []))
+                    + "\n\nTo override, set skip_readiness_check=true in the payload."
+                )
+                logger.warning(f"Failback blocked by AI readiness: {verdict}")
+                send_notification(
+                    f"FAILBACK BLOCKED: AI readiness assessment says NO GO",
+                    msg + readiness_appendix,
+                )
+                return {"statusCode": 400, "body": msg}
+        except Exception as e:
+            logger.error(f"AI readiness assessment failed (non-blocking): {e}")
+            # Continue with failback — AI failure should not block
+    elif skip_readiness_check:
+        logger.warning("Step 2.5: AI readiness check SKIPPED (skip_readiness_check=true)")
+
     # Step 3: Validate target region health (unless skipped)
     if not skip_health_check:
         logger.info("Step 3: Validating target region health...")
@@ -560,7 +607,7 @@ def handler(event, context):
             f"Latch has been RELEASED. Automated health monitoring is active.\n"
             f"The orchestrator Lambda will resume normal health evaluation."
         )
-        send_notification(f"FAILBACK COMPLETE: -> {target_region}", msg)
+        send_notification(f"FAILBACK COMPLETE: -> {target_region}", msg + readiness_appendix)
 
         logger.info(f"FAILBACK COMPLETE: {active_region} -> {target_region}")
         return {"statusCode": 200, "body": msg}

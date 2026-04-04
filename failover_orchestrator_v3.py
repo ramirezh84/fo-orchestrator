@@ -55,9 +55,11 @@ from botocore.exceptions import ClientError
 
 from state_backend import create_backend, ConditionalCheckFailedError
 
-from ai.config import AI_RCA_ENABLED
+from ai.config import AI_RCA_ENABLED, AI_AURORA_ADVISOR_MODE
 from ai.collector import collect_incident_context
 from ai.rca_analyzer import analyze_incident, format_rca_for_sns
+from ai.stability_collector import collect_stability_context
+from ai.aurora_advisor import advise_aurora_promotion, format_advisor_for_sns
 
 # ---------------------------------------------------------------------------
 # Configuration - set as Lambda environment variables
@@ -1114,6 +1116,45 @@ def _run_rca_analysis(health_signals: dict) -> str:
         return ""
 
 
+def _run_aurora_advisor(scenario: str) -> tuple:
+    """
+    Run AI-powered Aurora promotion advisor if enabled.
+
+    Returns (appendix_str, recommendation_dict).
+    appendix_str: formatted text for SNS, or empty string.
+    recommendation_dict: full advisor output, or None.
+    Never raises.
+    """
+    if AI_AURORA_ADVISOR_MODE == "disabled":
+        return "", None
+
+    try:
+        logger.info(f"Aurora advisor enabled (mode={AI_AURORA_ADVISOR_MODE}) — collecting stability data")
+        stability = collect_stability_context(
+            region=CURRENT_REGION,
+            aurora_cluster_id=AURORA_CLUSTER_ID,
+            aurora_global_cluster_id=AURORA_GLOBAL_CLUSTER_ID,
+            ecs_cluster=ECS_CLUSTER_NAME,
+            ecs_service=ECS_SERVICE_NAME,
+            alb_arn_suffix=ALB_FULL_ARN.split("loadbalancer/")[-1] if ALB_FULL_ARN else "",
+        )
+
+        logger.info("Calling LLM API for Aurora advisor")
+        recommendation = advise_aurora_promotion(
+            stability, scenario, region=CURRENT_REGION
+        )
+        formatted = format_advisor_for_sns(recommendation, stability)
+        logger.info(
+            f"Aurora advisor complete: method={recommendation.get('recommended_method')}, "
+            f"confidence={recommendation.get('confidence')}, "
+            f"auto_execute={recommendation.get('should_auto_execute')}"
+        )
+        return f"\n\n{formatted}", recommendation
+    except Exception as e:
+        logger.error(f"Aurora advisor failed (non-blocking): {type(e).__name__}: {e}")
+        return "", None
+
+
 # ===========================================================================
 # Active-Active Handler
 # ===========================================================================
@@ -1781,6 +1822,9 @@ def _handle_passive_region(state: dict, active_region: str) -> dict:
             },
         )
 
+        # Run AI Aurora advisor (non-blocking)
+        advisor_appendix, advisor_rec = _run_aurora_advisor("region_failure")
+
         try:
 
             # Publish our region (the new active) as healthy for Route 53.
@@ -1790,9 +1834,37 @@ def _handle_passive_region(state: dict, active_region: str) -> dict:
             # call to a dead region would fail and crash the Lambda.
             publish_region_health_metric(target_region, True)
 
-            # Attempt automated Aurora promotion if enabled
+            # Attempt automated Aurora promotion
             aurora_handled = False
-            if AURORA_AUTO_PROMOTE:
+
+            if advisor_rec and advisor_rec.get("should_auto_execute"):
+                aurora_result = _auto_promote_aurora(target_region, "region_failure")
+                if aurora_result["success"]:
+                    aurora_handled = True
+                    send_notification(
+                        subject=f"REGION FAILURE: DNS moved to {target_region} - Aurora {aurora_result['method']} initiated (AI-advised)",
+                        message=(
+                            f"REGION-LEVEL FAILURE DETECTED.\n\n"
+                            f"The active region {active_region} has stopped responding.\n"
+                            f"DNS has been moved to {target_region}.\n\n"
+                            f"Aurora {aurora_result['method']} has been initiated AUTOMATICALLY "
+                            f"(AI advisor confidence: {advisor_rec.get('confidence')}%).\n"
+                            f"Monitor progress with:\n\n"
+                            f"  aws rds describe-db-clusters \\\n"
+                            f"    --db-cluster-identifier {AURORA_CLUSTER_ID} \\\n"
+                            f"    --query 'DBClusters[0].{{Status:Status,ReplicationSource:ReplicationSourceIdentifier}}' \\\n"
+                            f"    --region {target_region}\n\n"
+                            f"Time: {now.isoformat()}\n"
+                            f"Detection: {staleness['reason']}"
+                            f"{advisor_appendix}"
+                        ),
+                    )
+                else:
+                    logger.warning(
+                        f"AI-advised Aurora promotion failed: {aurora_result['error']}. "
+                        f"Falling back to manual notification."
+                    )
+            elif AURORA_AUTO_PROMOTE:
                 aurora_result = _auto_promote_aurora(target_region, "region_failure")
                 if aurora_result["success"]:
                     aurora_handled = True
@@ -1810,6 +1882,7 @@ def _handle_passive_region(state: dict, active_region: str) -> dict:
                             f"    --region {target_region}\n\n"
                             f"Time: {now.isoformat()}\n"
                             f"Detection: {staleness['reason']}"
+                            f"{advisor_appendix}"
                         ),
                     )
                 else:
@@ -1838,6 +1911,7 @@ def _handle_passive_region(state: dict, active_region: str) -> dict:
                         f"You will receive reminders every "
                         f"{AURORA_PROMOTION_REMINDER_INTERVAL_MINUTES} minutes until "
                         f"Aurora promotion is detected automatically."
+                        f"{advisor_appendix}"
                     ),
                 )
 
@@ -2068,17 +2142,58 @@ def _handle_active_region(state: dict, active_region: str,
         },
     )
 
-    # Run AI RCA analysis (non-blocking — returns "" on failure or if disabled)
+    # Run AI analyses (non-blocking — return "" on failure or if disabled)
     rca_appendix = _run_rca_analysis(health.get("signals", {}))
+    advisor_appendix, advisor_rec = _run_aurora_advisor("app_failure")
+    ai_appendix = rca_appendix + advisor_appendix
 
     try:
 
         # Move DNS by publishing unhealthy for this region
         publish_region_health_metric(CURRENT_REGION, False)
 
-        # Attempt automated Aurora promotion if enabled
+        # Attempt automated Aurora promotion
+        # Priority: advisor recommendation > AURORA_AUTO_PROMOTE toggle
         aurora_handled = False
-        if AURORA_AUTO_PROMOTE:
+
+        if advisor_rec and advisor_rec.get("should_auto_execute"):
+            # Aurora advisor (guided/autonomous) decided to auto-execute
+            method = advisor_rec.get("recommended_method", "switchover")
+            logger.info(
+                f"Aurora advisor recommends auto-execute: method={method}, "
+                f"confidence={advisor_rec.get('confidence')}"
+            )
+            aurora_result = _auto_promote_aurora(target_region, "app_failure")
+            if aurora_result["success"]:
+                aurora_handled = True
+                send_notification(
+                    subject=f"FAILOVER: DNS moved to {target_region} - Aurora {aurora_result['method']} initiated (AI-advised)",
+                    message=(
+                        f"Automated DNS failover triggered.\n\n"
+                        f"From: {active_region}\n"
+                        f"To: {target_region}\n"
+                        f"Time: {now.isoformat()}\n"
+                        f"Decision: {health.get('decision_reason', 'N/A')}\n\n"
+                        f"DNS has been moved. Route 53 is now routing traffic to {target_region}.\n\n"
+                        f"Aurora {aurora_result['method']} has been initiated AUTOMATICALLY "
+                        f"(AI advisor confidence: {advisor_rec.get('confidence')}%).\n"
+                        f"Monitor progress with:\n\n"
+                        f"  aws rds describe-db-clusters \\\n"
+                        f"    --db-cluster-identifier {AURORA_CLUSTER_ID} \\\n"
+                        f"    --query 'DBClusters[0].{{Status:Status,ReplicationSource:ReplicationSourceIdentifier}}' \\\n"
+                        f"    --region {target_region}\n\n"
+                        f"Latch is ENGAGED. {active_region} will remain marked unhealthy.\n\n"
+                        f"Signals:\n{json.dumps(health['signals'], indent=2, default=str)}"
+                        f"{ai_appendix}"
+                    ),
+                )
+            else:
+                logger.warning(
+                    f"AI-advised Aurora promotion failed: {aurora_result['error']}. "
+                    f"Falling back to manual notification."
+                )
+        elif AURORA_AUTO_PROMOTE:
+            # Legacy toggle — blind auto-promote without advisor
             aurora_result = _auto_promote_aurora(target_region, "app_failure")
             if aurora_result["success"]:
                 aurora_handled = True
@@ -2099,7 +2214,7 @@ def _handle_active_region(state: dict, active_region: str,
                         f"    --region {target_region}\n\n"
                         f"Latch is ENGAGED. {active_region} will remain marked unhealthy.\n\n"
                         f"Signals:\n{json.dumps(health['signals'], indent=2, default=str)}"
-                        f"{rca_appendix}"
+                        f"{ai_appendix}"
                     ),
                 )
             else:
@@ -2129,7 +2244,7 @@ def _handle_active_region(state: dict, active_region: str,
                     f"{AURORA_PROMOTION_REMINDER_INTERVAL_MINUTES} minutes until "
                     f"Aurora promotion is detected automatically.\n\n"
                     f"Signals:\n{json.dumps(health['signals'], indent=2, default=str)}"
-                    f"{rca_appendix}"
+                    f"{ai_appendix}"
                 ),
             )
 
