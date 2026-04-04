@@ -87,79 +87,71 @@ def dim(t):
 
 # ── Scenario Definitions ───────────────────────────────────────────────────────
 
+# Base scenario fields:
+#   description, version, routing_mode, passive_publish_zero,
+#   ai_rca_enabled, ai_rca_provider, state_backend (dynamodb|s3),
+#   ai_failback_readiness_enabled, ai_aurora_advisor_mode
+
+_DEFAULTS = {
+    "state_backend": "dynamodb",
+    "ai_failback_readiness_enabled": False,
+    "ai_aurora_advisor_mode": "disabled",
+}
+
+
+def _scen(description, version, routing_mode, passive_publish_zero=False,
+          ai_rca_enabled=False, ai_rca_provider=None, **overrides):
+    """Build a scenario dict with defaults."""
+    s = dict(_DEFAULTS)
+    s.update(
+        description=description, version=version, routing_mode=routing_mode,
+        passive_publish_zero=passive_publish_zero,
+        ai_rca_enabled=ai_rca_enabled, ai_rca_provider=ai_rca_provider,
+    )
+    s.update(overrides)
+    return s
+
+
 SCENARIOS = {
-    "fo-v10-s1": {
-        "description": "v1.0 - Active/Passive",
-        "version": "v1.0",
-        "routing_mode": "failover",
-        "passive_publish_zero": False,
-        "ai_rca_enabled": False,
-        "ai_rca_provider": None,
-    },
-    "fo-v10-s2": {
-        "description": "v1.0 - Active/Passive Zero-Container",
-        "version": "v1.0",
-        "routing_mode": "failover",
-        "passive_publish_zero": True,
-        "ai_rca_enabled": False,
-        "ai_rca_provider": None,
-    },
-    "fo-v10-s3": {
-        "description": "v1.0 - Active/Active",
-        "version": "v1.0",
-        "routing_mode": "active-active",
-        "passive_publish_zero": False,
-        "ai_rca_enabled": False,
-        "ai_rca_provider": None,
-    },
-    "fo-v11c-s1": {
-        "description": "v1.1 Claude - Active/Passive",
-        "version": "v1.1",
-        "routing_mode": "failover",
-        "passive_publish_zero": False,
-        "ai_rca_enabled": True,
-        "ai_rca_provider": "claude",
-    },
-    "fo-v11c-s2": {
-        "description": "v1.1 Claude - Active/Passive Zero-Container",
-        "version": "v1.1",
-        "routing_mode": "failover",
-        "passive_publish_zero": True,
-        "ai_rca_enabled": True,
-        "ai_rca_provider": "claude",
-    },
-    "fo-v11c-s3": {
-        "description": "v1.1 Claude - Active/Active",
-        "version": "v1.1",
-        "routing_mode": "active-active",
-        "passive_publish_zero": False,
-        "ai_rca_enabled": True,
-        "ai_rca_provider": "claude",
-    },
-    "fo-v11g-s1": {
-        "description": "v1.1 Gemini - Active/Passive",
-        "version": "v1.1",
-        "routing_mode": "failover",
-        "passive_publish_zero": False,
-        "ai_rca_enabled": True,
-        "ai_rca_provider": "gemini",
-    },
-    "fo-v11g-s2": {
-        "description": "v1.1 Gemini - Active/Passive Zero-Container",
-        "version": "v1.1",
-        "routing_mode": "failover",
-        "passive_publish_zero": True,
-        "ai_rca_enabled": True,
-        "ai_rca_provider": "gemini",
-    },
-    "fo-v11g-s3": {
-        "description": "v1.1 Gemini - Active/Active",
-        "version": "v1.1",
-        "routing_mode": "active-active",
-        "passive_publish_zero": False,
-        "ai_rca_enabled": True,
-        "ai_rca_provider": "gemini",
-    },
+    # ── v1.0 DynamoDB ──────────────────────────────────────────────────────
+    "fo-v10-s1": _scen("v1.0 - Active/Passive", "v1.0", "failover"),
+    "fo-v10-s2": _scen("v1.0 - A/P Zero-Container", "v1.0", "failover", passive_publish_zero=True),
+    "fo-v10-s3": _scen("v1.0 - Active/Active", "v1.0", "active-active"),
+
+    # ── v1.0 S3 ───────────────────────────────────────────────────────────
+    "fo-v10x-s1": _scen("v1.0 S3 - Active/Passive", "v1.0", "failover", state_backend="s3"),
+    "fo-v10x-s2": _scen("v1.0 S3 - A/P Zero-Container", "v1.0", "failover", passive_publish_zero=True, state_backend="s3"),
+    "fo-v10x-s3": _scen("v1.0 S3 - Active/Active", "v1.0", "active-active", state_backend="s3"),
+
+    # ── v1.1 Claude DynamoDB ───────────────────────────────────────────────
+    "fo-v11c-s1": _scen("v1.1 Claude - Active/Passive", "v1.1", "failover", ai_rca_enabled=True, ai_rca_provider="claude"),
+    "fo-v11c-s2": _scen("v1.1 Claude - A/P Zero-Container", "v1.1", "failover", passive_publish_zero=True, ai_rca_enabled=True, ai_rca_provider="claude"),
+    "fo-v11c-s3": _scen("v1.1 Claude - Active/Active", "v1.1", "active-active", ai_rca_enabled=True, ai_rca_provider="claude"),
+
+    # ── v1.1 Claude S3 ───────────────────────────────────────────────────
+    "fo-v11cx-s1": _scen("v1.1 Claude S3 - Active/Passive", "v1.1", "failover", ai_rca_enabled=True, ai_rca_provider="claude", state_backend="s3"),
+
+    # ── v1.1 Gemini DynamoDB ──────────────────────────────────────────────
+    "fo-v11g-s1": _scen("v1.1 Gemini - Active/Passive", "v1.1", "failover", ai_rca_enabled=True, ai_rca_provider="gemini"),
+    "fo-v11g-s2": _scen("v1.1 Gemini - A/P Zero-Container", "v1.1", "failover", passive_publish_zero=True, ai_rca_enabled=True, ai_rca_provider="gemini"),
+    "fo-v11g-s3": _scen("v1.1 Gemini - Active/Active", "v1.1", "active-active", ai_rca_enabled=True, ai_rca_provider="gemini"),
+
+    # ── v1.1 Gemini S3 ──────────────────────────────────────────────────
+    "fo-v11gx-s1": _scen("v1.1 Gemini S3 - Active/Passive", "v1.1", "failover", ai_rca_enabled=True, ai_rca_provider="gemini", state_backend="s3"),
+
+    # ── v1.2 Claude DynamoDB (full AI) ────────────────────────────────────
+    "fo-v12c-s1": _scen("v1.2 Claude - Active/Passive", "v1.2", "failover", ai_rca_enabled=True, ai_rca_provider="claude", ai_failback_readiness_enabled=True, ai_aurora_advisor_mode="advisory"),
+    "fo-v12c-s2": _scen("v1.2 Claude - A/P Zero-Container", "v1.2", "failover", passive_publish_zero=True, ai_rca_enabled=True, ai_rca_provider="claude", ai_failback_readiness_enabled=True, ai_aurora_advisor_mode="advisory"),
+    "fo-v12c-s3": _scen("v1.2 Claude - Active/Active", "v1.2", "active-active", ai_rca_enabled=True, ai_rca_provider="claude", ai_failback_readiness_enabled=True, ai_aurora_advisor_mode="advisory"),
+
+    # ── v1.2 Claude S3 (full AI) ─────────────────────────────────────────
+    "fo-v12cx-s1": _scen("v1.2 Claude S3 - Active/Passive", "v1.2", "failover", ai_rca_enabled=True, ai_rca_provider="claude", state_backend="s3", ai_failback_readiness_enabled=True, ai_aurora_advisor_mode="advisory"),
+
+    # ── v1.2 Gemini DynamoDB (full AI) ────────────────────────────────────
+    "fo-v12g-s1": _scen("v1.2 Gemini - Active/Passive", "v1.2", "failover", ai_rca_enabled=True, ai_rca_provider="gemini", ai_failback_readiness_enabled=True, ai_aurora_advisor_mode="advisory"),
+
+    # ── v1.2 Gemini S3 (full AI) ─────────────────────────────────────────
+    "fo-v12gx-s1": _scen("v1.2 Gemini S3 - Active/Passive", "v1.2", "failover", ai_rca_enabled=True, ai_rca_provider="gemini", state_backend="s3", ai_failback_readiness_enabled=True, ai_aurora_advisor_mode="advisory"),
 }
 
 # ── Resource Naming ─────────────────────────────────────────────────────────────
@@ -197,6 +189,15 @@ def aurora_instance_id(env, region):
     return "{}-aurora-{}-inst".format(env, REGION_SUFFIX[region])
 
 
+def state_bucket_name(env, region):
+    """S3 state bucket name for S3-backed scenarios."""
+    return "{}-state-{}-{}".format(env, REGION_SUFFIX[region], ACCOUNT_ID)
+
+
+def state_bucket_prefix():
+    return "failover-state/"
+
+
 def cw_namespace(env):
     return "Custom/{}".format(env)
 
@@ -224,7 +225,32 @@ def client(service, region=PRIMARY_REGION):
     return _clients[key]
 
 
-# ── Helper: Get DynamoDB State ──────────────────────────────────────────────────
+# ── Helper: Get State (DynamoDB or S3) ────────────────────────────────────────
+
+
+def get_scenario_state(env):
+    """Read the failover state for a scenario, using the correct backend."""
+    scen = SCENARIOS.get(env, {})
+    if scen.get("state_backend") == "s3":
+        return get_s3_state(env)
+    return get_dynamo_state(env)
+
+
+def get_s3_state(env):
+    """Read the failover state from S3. Returns dict or None."""
+    bucket = state_bucket_name(env, PRIMARY_REGION)
+    key = state_bucket_prefix() + "REGION_STATE.json"
+    try:
+        resp = client("s3", PRIMARY_REGION).get_object(Bucket=bucket, Key=key)
+        body = resp["Body"].read().decode("utf-8")
+        return json.loads(body)
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        if code in ("NoSuchKey", "NoSuchBucket", "AccessDenied"):
+            return None
+        raise
+    except Exception:
+        return None
 
 
 def get_dynamo_state(env):
@@ -830,11 +856,87 @@ def reset_cooldown_in_dynamo(env):
             raise
 
 
+# ── Helper: S3 State Management ──────────────────────────────────────────────
+
+
+def reset_s3_state(env, state="PRIMARY_ACTIVE", active_region=None):
+    """Reset S3 state for S3-backed scenarios."""
+    from datetime import datetime, timezone
+    if active_region is None:
+        active_region = PRIMARY_REGION
+    now = datetime.now(timezone.utc).isoformat()
+    bucket = state_bucket_name(env, PRIMARY_REGION)
+    key = state_bucket_prefix() + "REGION_STATE.json"
+    data = {
+        "active_region": active_region,
+        "state": state,
+        "latch_engaged": False,
+        "consecutive_failures": 0,
+        "last_failover_ts": "1970-01-01T00:00:00Z",
+        "last_updated": now,
+        "cooldown_reset": False,
+        "last_warning_notification_ts": "1970-01-01T00:00:00Z",
+    }
+    print("  Resetting S3 state in s3://{}/{}...".format(bucket, key))
+    try:
+        client("s3", PRIMARY_REGION).put_object(
+            Bucket=bucket, Key=key,
+            Body=json.dumps(data).encode("utf-8"),
+            ContentType="application/json",
+        )
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        if code in ("NoSuchBucket",):
+            print(yellow("  S3 bucket {} does not exist, skipping state reset.".format(bucket)))
+        else:
+            raise
+
+
+def reset_cooldown_in_s3(env):
+    """Reset cooldown in S3 state."""
+    state = get_s3_state(env)
+    if not state:
+        print(yellow("  S3 state not found, skipping cooldown reset."))
+        return
+    state["consecutive_failures"] = 0
+    state["last_failover_ts"] = "1970-01-01T00:00:00Z"
+    state["cooldown_reset"] = True
+    state["last_warning_notification_ts"] = "1970-01-01T00:00:00Z"
+    bucket = state_bucket_name(env, PRIMARY_REGION)
+    key = state_bucket_prefix() + "REGION_STATE.json"
+    client("s3", PRIMARY_REGION).put_object(
+        Bucket=bucket, Key=key,
+        Body=json.dumps(state).encode("utf-8"),
+        ContentType="application/json",
+    )
+
+
+# ── Helper: Unified State Reset ──────────────────────────────────────────────
+
+
+def reset_scenario_state(env, state="PRIMARY_ACTIVE", active_region=None):
+    """Reset state using the correct backend for this scenario."""
+    scen = SCENARIOS.get(env, {})
+    if scen.get("state_backend") == "s3":
+        reset_s3_state(env, state, active_region)
+    else:
+        reset_dynamo_state(env, state, active_region)
+
+
+def reset_scenario_cooldown(env):
+    """Reset cooldown using the correct backend for this scenario."""
+    scen = SCENARIOS.get(env, {})
+    if scen.get("state_backend") == "s3":
+        reset_cooldown_in_s3(env)
+    else:
+        reset_cooldown_in_dynamo(env)
+
+
 # ── Command: status ─────────────────────────────────────────────────────────────
 
 
 def cmd_status(args):
-    """Show status table for all 9 scenarios."""
+    """Show status table for all scenarios."""
     print()
     print(bold("Failover Orchestrator Demo Environments"))
     print(bold("=" * 95))
@@ -866,8 +968,8 @@ def cmd_status(args):
                 active_region = dim("N/A")
                 ecs_str = dim("N/A")
         else:
-            # Read DynamoDB state
-            ddb = get_dynamo_state(env)
+            # Read state from configured backend
+            ddb = get_scenario_state(env)
             if ddb:
                 active_region = ddb.get("active_region", "N/A")
                 ddb_state = ddb.get("state", "UNKNOWN")
@@ -1012,7 +1114,7 @@ def cmd_activate(args):
         else:
             print(yellow("  EventBridge rule not found in {}. Deploy CFN stack first.".format(region)))
 
-    reset_dynamo_state(env)
+    reset_scenario_state(env)
 
     print()
     print(green("Scenario {} activated successfully.".format(bold(env))))
@@ -1108,7 +1210,7 @@ def cmd_trigger(args):
 
     # Reset cooldown so failover fires immediately
     print()
-    reset_cooldown_in_dynamo(env)
+    reset_scenario_cooldown(env)
 
     # Scale ECS to 0 in primary
     print()
@@ -1237,12 +1339,12 @@ def cmd_reset(args):
             print("  Failback invoked (HTTP {})".format(status_code))
     except ClientError as e:
         print(yellow("  Could not invoke failback Lambda: {}".format(e)))
-        print(yellow("  Proceeding with DynamoDB reset."))
+        print(yellow("  Proceeding with state reset."))
 
-    # Step 4: Reset DynamoDB state
+    # Step 4: Reset state
     print()
-    print(bold("[4/4] Resetting DynamoDB state"))
-    reset_dynamo_state(env)
+    print(bold("[4/4] Resetting state"))
+    reset_scenario_state(env)
 
     print()
     print(green("Scenario {} reset to PRIMARY_ACTIVE.".format(bold(env))))
