@@ -29,7 +29,7 @@ All changes to this codebase MUST follow these practices:
 - **Run the full test suite before every commit:** `python3 -m pytest tests/ -v`
 - **All tests must pass** before pushing or creating a PR
 - New features require new tests — no untested code reaches `main`
-- Regression test suite (97 tests) covers:
+- Regression test suite (180 tests) covers:
   - `tests/test_orchestrator.py` — Core orchestrator logic (52 tests)
   - `tests/test_rca.py` — AI RCA module (32 tests)
   - `tests/test_state_backend.py` — State backend (13 tests)
@@ -53,7 +53,7 @@ No build system. Deployment is manual via AWS CLI:
 
 ```bash
 # Package and deploy orchestrator Lambda (include state_backend.py + ai module)
-zip failover_orchestrator_v3.zip failover_orchestrator_v3.py state_backend.py ai/__init__.py ai/config.py ai/collector.py ai/rca_analyzer.py
+zip failover_orchestrator_v3.zip failover_orchestrator_v3.py state_backend.py ai/__init__.py ai/config.py ai/llm_client.py ai/collector.py ai/rca_analyzer.py ai/stability_collector.py ai/aurora_advisor.py
 aws lambda update-function-code \
   --function-name failover-orchestrator-prod \
   --zip-file fileb://failover_orchestrator_v3.zip \
@@ -61,7 +61,7 @@ aws lambda update-function-code \
 # Repeat for us-west-2
 
 # Package and deploy failback Lambda (include state_backend.py)
-zip manual_failback_v2.zip manual_failback_v2.py state_backend.py
+zip manual_failback_v2.zip manual_failback_v2.py state_backend.py ai/__init__.py ai/config.py ai/llm_client.py ai/stability_collector.py ai/failback_readiness.py
 aws lambda update-function-code \
   --function-name failover-manual-failback-prod \
   --zip-file fileb://manual_failback_v2.zip \
@@ -93,13 +93,21 @@ Runtime dependencies: `boto3`, `botocore` (provided by Lambda runtime). Dashboar
 | `failover_dashboard_local.py` | Flask web dashboard reading state from backend. |
 | `ai/config.py` | AI configuration: provider, model, timeouts, feature toggles. |
 | `ai/collector.py` | Collects incident context from ECS, Aurora, ALB, CloudWatch at failover time. |
+| `ai/llm_client.py` | Shared LLM client: API key retrieval, Claude/Gemini HTTP calls, unified `call_llm()`. |
 | `ai/rca_analyzer.py` | Multi-provider LLM integration (Claude/Gemini) for root cause analysis. |
+| `ai/stability_collector.py` | Time-series stability data: Aurora replication lag, ECS task trends, ALB error rates. |
+| `ai/failback_readiness.py` | LLM-powered GO/NO-GO/CAUTION assessment before failback. |
+| `ai/aurora_advisor.py` | Progressive Aurora promotion advisor: advisory → guided → autonomous modes. |
 | `tools/setup_s3_state_backend.py` | Infrastructure setup script for S3 CRR backend. |
 | `tools/generate_dashboard.py` | CloudWatch dashboard generator. |
 | `tests/test_orchestrator.py` | Regression tests for core orchestrator logic (52 tests). |
 | `tests/test_state_backend.py` | Unit + integration + CRR replication tests for state backends. |
 | `tests/test_e2e_s3_backend.py` | End-to-end scenario tests for S3 backend. |
 | `tests/test_rca.py` | Unit + integration tests for AI RCA module (32 tests). |
+| `tests/test_llm_client.py` | Unit tests for shared LLM client (14 tests). |
+| `tests/test_stability_collector.py` | Unit tests for stability data collection (19 tests). |
+| `tests/test_failback_readiness.py` | Unit tests for failback readiness assessment (18 tests). |
+| `tests/test_aurora_advisor.py` | Unit tests for Aurora promotion advisor, all phases (32 tests). |
 | `cfn/network.yaml` | CloudFormation: VPC, subnets, NAT Gateway. |
 | `cfn/app.yaml` | CloudFormation: ECS, ALB, security groups, VPC endpoints. |
 | `cfn/aurora.yaml` | CloudFormation: Aurora Global Database cluster. |
@@ -134,6 +142,14 @@ CloudWatch Alarm (TreatMissingData: breaching) → Route 53 Health Check → Rou
 
 On failover (if AI_RCA_ENABLED=true):
   Collector gathers ECS/Aurora/ALB/CloudWatch context → LLM analyzes → RCA appended to SNS notification
+
+On failover (if AI_AURORA_ADVISOR_MODE != disabled):
+  Stability collector gathers Aurora replication lag/topology/events → LLM advises promotion method →
+  advisory: recommendation in SNS | guided: auto-execute if confident switchover | autonomous: auto-execute with guardrails
+
+On failback (if AI_FAILBACK_READINESS_ENABLED=true):
+  Stability collector gathers trends → LLM produces GO/NO-GO/CAUTION verdict →
+  NO_GO blocks failback | CAUTION proceeds with warnings | GO proceeds normally
 ```
 
 ### Health Signal Evaluation
@@ -202,6 +218,12 @@ All configuration is via Lambda environment variables. Key variables:
 | `ALB_FULL_ARN` | (empty) | Full ALB ARN for target health collection (enhances RCA) |
 | `ANTHROPIC_API_KEY_SECRET_NAME` | failover-orchestrator/anthropic-api-key | Secrets Manager key for Claude |
 | `GEMINI_API_KEY_SECRET_NAME` | failover-orchestrator/gemini-api-key | Secrets Manager key for Gemini |
+| `AI_FAILBACK_READINESS_ENABLED` | false | Enable AI failback readiness assessment (GO/NO-GO) |
+| `AI_FAILBACK_STABILITY_WINDOW_MINUTES` | 15 | How far back to look at stability trends for failback |
+| `AI_AURORA_ADVISOR_MODE` | disabled | Aurora advisor: `disabled`, `advisory`, `guided`, `autonomous` |
+| `AI_AURORA_ADVISOR_CONFIDENCE_THRESHOLD` | 90 | Min LLM confidence for guided auto-execute |
+| `AI_AURORA_ADVISOR_MAX_LAG_MS` | 100 | Hard guardrail: max acceptable replication lag (ms) |
+| `AI_AURORA_STABILITY_WINDOW_MINUTES` | 10 | How far back to look at Aurora stability metrics |
 
 ## Key Design Decisions
 
@@ -212,6 +234,8 @@ All configuration is via Lambda environment variables. Key variables:
 - **Failback Lambda invoked in target region**: Must be invoked in us-west-1 when failing back to us-west-1, so it can verify Aurora writer status locally.
 - **AI RCA is non-blocking**: If the LLM API call fails or times out, failover proceeds normally. RCA is fire-and-forget.
 - **Multi-provider LLM support**: Claude and Gemini are both supported via `AI_RCA_PROVIDER`. Uses urllib (no SDK dependency) for both providers.
+- **Progressive Aurora automation**: Aurora promotion advisor has three modes (advisory → guided → autonomous) so operators can build trust incrementally. Hard guardrails (replication lag, sync status, cluster/instance state) run before the LLM call and cannot be overridden — deterministic safety beats AI confidence.
+- **AI failback readiness is blocking**: Unlike RCA (fire-and-forget), the failback readiness assessment can block a failback with a NO_GO verdict. Operators can override with `skip_readiness_check=true`.
 
 ## Operational Notes
 
@@ -237,7 +261,7 @@ python3 tools/setup_s3_state_backend.py
 
 # 3. Include state_backend.py in the Lambda deployment zip:
 zip failover_orchestrator_v3.zip failover_orchestrator_v3.py state_backend.py
-zip manual_failback_v2.zip manual_failback_v2.py state_backend.py
+zip manual_failback_v2.zip manual_failback_v2.py state_backend.py ai/__init__.py ai/config.py ai/llm_client.py ai/stability_collector.py ai/failback_readiness.py
 ```
 
 ### Trade-offs vs DynamoDB
@@ -278,8 +302,8 @@ CRR_TEST=1 \
   CRR_SECONDARY_BUCKET=<secondary-bucket> \
   python3 -m pytest tests/test_state_backend.py -v -k "CRR"
 
-# AI RCA unit tests (no AWS or API key required)
-python3 -m pytest tests/test_rca.py -v
+# AI module unit tests (no AWS or API key required)
+python3 -m pytest tests/test_rca.py tests/test_llm_client.py tests/test_stability_collector.py tests/test_failback_readiness.py tests/test_aurora_advisor.py -v
 
 # AI RCA integration test (requires API key)
 AI_RCA_INTEGRATION_TEST=1 ANTHROPIC_API_KEY=sk-ant-your-key \
