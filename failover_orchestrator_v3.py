@@ -1448,7 +1448,7 @@ def _execute_manual_failover() -> dict:
         publish_region_health_metric(CURRENT_REGION, False)
 
         # Attempt automated Aurora promotion if enabled
-        if AURORA_AUTO_PROMOTE:
+        if os.environ.get("AURORA_AUTO_PROMOTE", "false").lower() == "true":
             aurora_result = _auto_promote_aurora(target_region, "app_failure")
             if aurora_result["success"]:
                 send_notification(
@@ -1870,7 +1870,7 @@ def _handle_passive_region(state: dict, active_region: str) -> dict:
                         f"AI-advised Aurora promotion failed: {aurora_result['error']}. "
                         f"Falling back to manual notification."
                     )
-            elif AURORA_AUTO_PROMOTE:
+            elif os.environ.get("AURORA_AUTO_PROMOTE", "false").lower() == "true":
                 aurora_result = _auto_promote_aurora(target_region, "region_failure")
                 if aurora_result["success"]:
                     aurora_handled = True
@@ -2198,7 +2198,7 @@ def _handle_active_region(state: dict, active_region: str,
                     f"AI-advised Aurora promotion failed: {aurora_result['error']}. "
                     f"Falling back to manual notification."
                 )
-        elif AURORA_AUTO_PROMOTE:
+        elif os.environ.get("AURORA_AUTO_PROMOTE", "false").lower() == "true":
             # Legacy toggle — blind auto-promote without advisor
             aurora_result = _auto_promote_aurora(target_region, "app_failure")
             if aurora_result["success"]:
