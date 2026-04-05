@@ -133,6 +133,18 @@ function initAdminPage(VERSIONS) {
       });
   });
 
+  // Reset everything
+  document.getElementById('btn-reset').addEventListener('click', function() {
+    const btn = this;
+    if (!confirm('Reset everything? This will stop the test, switchover Aurora to primary if needed, and reset all state.')) return;
+    btnAction(btn, async () => {
+      clearMessage(msgEl);
+      const data = await apiCall('/api/reset', 'POST');
+      showMessage(msgEl, data.message, false);
+      refreshAdminStatus();
+    });
+  });
+
   // Auto-promote toggle
   document.getElementById('auto-promote-toggle').addEventListener('click', function() {
     const track = this;

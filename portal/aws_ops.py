@@ -629,25 +629,41 @@ def trigger_failover():
 
 
 def promote_aurora():
-    """Trigger Aurora switchover to secondary region."""
+    """Promote Aurora to the non-writer region (switchover to wherever the reader is)."""
+    # Determine current writer
+    aurora = get_aurora_status()
+    w1_role = aurora.get(PRIMARY_REGION, {}).get("role", "unknown") if isinstance(aurora.get(PRIMARY_REGION), dict) else "unknown"
+    w2_role = aurora.get(SECONDARY_REGION, {}).get("role", "unknown") if isinstance(aurora.get(SECONDARY_REGION), dict) else "unknown"
+
+    # Target is the reader (the one that needs to become writer)
+    if w2_role == "reader":
+        target_region = SECONDARY_REGION
+        target_cluster = AURORA_CLUSTER_W2
+        target_name = "us-west-2"
+    elif w1_role == "reader":
+        target_region = PRIMARY_REGION
+        target_cluster = AURORA_CLUSTER_W1
+        target_name = "us-west-1"
+    else:
+        return {"ok": False, "error": f"Cannot determine reader. w1={w1_role}, w2={w2_role}"}
+
+    target_arn = f"arn:aws:rds:{target_region}:{ACCOUNT_ID}:cluster:{target_cluster}"
+
     try:
-        target_arn = f"arn:aws:rds:{SECONDARY_REGION}:{ACCOUNT_ID}:cluster:{AURORA_CLUSTER_W2}"
         _client("rds", PRIMARY_REGION).switchover_global_cluster(
             GlobalClusterIdentifier=AURORA_GLOBAL_CLUSTER,
             TargetDbClusterIdentifier=target_arn,
         )
-        return {"ok": True, "message": "Aurora switchover initiated to us-west-2"}
+        return {"ok": True, "message": f"Aurora switchover initiated to {target_name}"}
     except ClientError as e:
         if "InvalidGlobalClusterStateFault" in str(e):
-            # Try unplanned failover
             try:
-                target_arn = f"arn:aws:rds:{SECONDARY_REGION}:{ACCOUNT_ID}:cluster:{AURORA_CLUSTER_W2}"
-                _client("rds", SECONDARY_REGION).failover_global_cluster(
+                _client("rds", target_region).failover_global_cluster(
                     GlobalClusterIdentifier=AURORA_GLOBAL_CLUSTER,
                     TargetDbClusterIdentifier=target_arn,
                     AllowDataLoss=True,
                 )
-                return {"ok": True, "message": "Aurora failover initiated (unplanned) to us-west-2"}
+                return {"ok": True, "message": f"Aurora failover (unplanned) initiated to {target_name}"}
             except ClientError as e2:
                 return {"ok": False, "error": str(e2)}
         return {"ok": False, "error": str(e)}
@@ -672,6 +688,58 @@ def invoke_failback(operator):
         return {"ok": True, "message": "Failback completed", "result": result}
     except ClientError as e:
         return {"ok": False, "error": str(e)}
+
+
+def full_reset():
+    """Full reset: switchover Aurora to primary if needed, stop test, reset state."""
+    import time
+    messages = []
+
+    # Stop test first
+    stop_test()
+    messages.append("Test stopped")
+
+    # Check if Aurora writer needs to switch back to primary
+    aurora = get_aurora_status()
+    w1_role = aurora.get(PRIMARY_REGION, {}).get("role", "unknown") if isinstance(aurora.get(PRIMARY_REGION), dict) else "unknown"
+
+    if w1_role == "reader":
+        # Need to switchover Aurora back to primary
+        try:
+            target_arn = f"arn:aws:rds:{PRIMARY_REGION}:{ACCOUNT_ID}:cluster:{AURORA_CLUSTER_W1}"
+            _client("rds", PRIMARY_REGION).switchover_global_cluster(
+                GlobalClusterIdentifier=AURORA_GLOBAL_CLUSTER,
+                TargetDbClusterIdentifier=target_arn,
+            )
+            messages.append("Aurora switchover to primary initiated")
+
+            # Wait for switchover
+            for _ in range(30):
+                try:
+                    g_resp = _client("rds", PRIMARY_REGION).describe_global_clusters(
+                        GlobalClusterIdentifier=AURORA_GLOBAL_CLUSTER
+                    )
+                    w1_is_writer = any(
+                        m["IsWriter"] and AURORA_CLUSTER_W1 in m["DBClusterArn"]
+                        for m in g_resp["GlobalClusters"][0].get("GlobalClusterMembers", [])
+                    )
+                    if w1_is_writer:
+                        messages.append("Aurora writer restored to primary")
+                        break
+                except ClientError:
+                    pass
+                time.sleep(10)
+        except ClientError as e:
+            messages.append(f"Aurora switchover error: {e}")
+    else:
+        messages.append("Aurora writer already in primary")
+
+    # Reset state in both backends
+    reset_state("dynamodb")
+    reset_state("s3")
+    messages.append("State reset to PRIMARY_ACTIVE")
+
+    return {"ok": True, "message": "; ".join(messages)}
 
 
 def get_full_status():

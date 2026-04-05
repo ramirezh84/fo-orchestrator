@@ -209,6 +209,19 @@ def api_trigger():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/reset", methods=["POST"])
+@login_required
+def api_reset():
+    """Full reset: switchover Aurora to primary if needed, stop test, reset state."""
+    try:
+        result = aws_ops.full_reset()
+        lock.release_lock()
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"Reset error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/auto-promote", methods=["POST"])
 @login_required
 def api_auto_promote():
