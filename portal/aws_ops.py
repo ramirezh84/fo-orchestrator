@@ -86,25 +86,29 @@ def switch_active_alias(version_alias, region):
 
 
 def update_lambda_env(env_vars, region):
-    """Update environment variables on both Lambdas and force cold start."""
+    """Update environment variables on both Lambdas."""
+    import time
     lam = _client("lambda", region)
     for func in [ORCHESTRATOR_LAMBDA, FAILBACK_LAMBDA]:
         try:
-            resp = lam.get_function_configuration(FunctionName=func)
-            existing = resp.get("Environment", {}).get("Variables", {})
-            existing.update(env_vars)
-
-            # Wait for any pending update
-            waiter = lam.get_waiter("function_updated_v2")
-            waiter.wait(FunctionName=func, WaiterConfig={"Delay": 2, "MaxAttempts": 30})
-
-            # Update env vars — this forces a new Lambda execution environment
-            # (cold start), ensuring config changes take effect immediately
-            lam.update_function_configuration(
-                FunctionName=func, Environment={"Variables": existing}
-            )
-
-            waiter.wait(FunctionName=func, WaiterConfig={"Delay": 2, "MaxAttempts": 30})
+            # Retry loop for "function is being updated" conflicts
+            for attempt in range(5):
+                try:
+                    resp = lam.get_function_configuration(FunctionName=func)
+                    if resp.get("LastUpdateStatus") == "InProgress":
+                        time.sleep(2)
+                        continue
+                    existing = resp.get("Environment", {}).get("Variables", {})
+                    existing.update(env_vars)
+                    lam.update_function_configuration(
+                        FunctionName=func, Environment={"Variables": existing}
+                    )
+                    break
+                except ClientError as e:
+                    if "ResourceConflictException" in str(e):
+                        time.sleep(2)
+                    else:
+                        raise
         except ClientError as e:
             logger.warning(f"Failed to update env on {func} in {region}: {e}")
 

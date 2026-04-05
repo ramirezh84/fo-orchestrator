@@ -155,17 +155,8 @@ def api_start():
         return jsonify({"error": f"Test locked by {lock_info.get('locked_by', 'unknown')}"}), 409
 
     try:
-        import threading
-        def _do_start():
-            try:
-                aws_ops.start_test(version, architecture, backend, provider)
-                logger.info(f"Test started: {version} / {architecture} / {backend}")
-            except Exception as e:
-                logger.error(f"Background start error: {e}")
-                lock.release_lock()
-
-        threading.Thread(target=_do_start, daemon=True).start()
-        return jsonify({"ok": True, "message": f"Starting test: {version} / {ARCHITECTURES[architecture]['name']} / {BACKENDS[backend]['name']}. ECS scaling up..."})
+        aws_ops.start_test(version, architecture, backend, provider)
+        return jsonify({"ok": True, "message": f"Test started: {version} / {ARCHITECTURES[architecture]['name']} / {BACKENDS[backend]['name']}"})
     except Exception as e:
         lock.release_lock()
         logger.error(f"Start error: {e}")
@@ -176,15 +167,9 @@ def api_start():
 @login_required
 def api_stop():
     try:
-        import threading
-        def _do_stop():
-            try:
-                aws_ops.stop_test()
-                lock.release_lock()
-            except Exception as e:
-                logger.error(f"Background stop error: {e}")
-        threading.Thread(target=_do_stop, daemon=True).start()
-        return jsonify({"ok": True, "message": "Stopping test..."})
+        aws_ops.stop_test()
+        lock.release_lock()
+        return jsonify({"ok": True, "message": "Test stopped"})
     except Exception as e:
         logger.error(f"Stop error: {e}")
         return jsonify({"error": str(e)}), 500
@@ -229,16 +214,9 @@ def api_trigger():
 def api_reset():
     """Full reset: switchover Aurora to primary if needed, stop test, reset state."""
     try:
-        import threading
-        def _do_reset():
-            try:
-                aws_ops.full_reset()
-                lock.release_lock()
-                logger.info("Full reset complete")
-            except Exception as e:
-                logger.error(f"Background reset error: {e}")
-        threading.Thread(target=_do_reset, daemon=True).start()
-        return jsonify({"ok": True, "message": "Resetting... Aurora switchover may take ~60s. Watch status for updates."})
+        result = aws_ops.full_reset()
+        lock.release_lock()
+        return jsonify(result)
     except Exception as e:
         logger.error(f"Reset error: {e}")
         return jsonify({"error": str(e)}), 500
