@@ -455,10 +455,11 @@ def start_test(version, architecture, backend, provider):
 
 
 def stop_test():
-    """Full test deactivation: disable EventBridge, scale ECS to 0."""
+    """Full test deactivation: disable EventBridge, scale ECS to 0, reset state."""
     for region in BOTH_REGIONS:
         disable_eventbridge(region)
         scale_ecs(0, region)
+    reset_state("dynamodb")
 
 
 def trigger_failover():
