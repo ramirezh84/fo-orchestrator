@@ -389,13 +389,30 @@ def _get_aurora_cluster_arn_in_region(target_region: str) -> Optional[str]:
     """
     Return the Aurora cluster ARN for the target region.
 
-    Constructs the ARN from AURORA_CLUSTER_ID and the account ID extracted
-    from SNS_TOPIC_ARN. If the primary and secondary clusters have different
-    identifiers, set AURORA_CLUSTER_ID per-region in each Lambda's env vars.
+    Queries the global cluster to find the correct member ARN for the target
+    region. This handles the case where primary and secondary clusters have
+    different identifiers (e.g., fo-demo-aurora-w1 vs fo-demo-aurora-w2).
     """
-    if not AURORA_CLUSTER_ID or not _AWS_ACCOUNT_ID:
-        return None
-    return f"arn:aws:rds:{target_region}:{_AWS_ACCOUNT_ID}:cluster:{AURORA_CLUSTER_ID}"
+    if not AURORA_GLOBAL_CLUSTER_ID:
+        # Fallback: construct from local AURORA_CLUSTER_ID (only works if same name in both regions)
+        if not AURORA_CLUSTER_ID or not _AWS_ACCOUNT_ID:
+            return None
+        return f"arn:aws:rds:{target_region}:{_AWS_ACCOUNT_ID}:cluster:{AURORA_CLUSTER_ID}"
+
+    try:
+        resp = rds.describe_global_clusters(GlobalClusterIdentifier=AURORA_GLOBAL_CLUSTER_ID)
+        for gc in resp.get("GlobalClusters", []):
+            for member in gc.get("GlobalClusterMembers", []):
+                arn = member.get("DBClusterArn", "")
+                if f":{target_region}:" in arn:
+                    return arn
+    except Exception as e:
+        logger.warning(f"Failed to look up Aurora cluster in {target_region}: {e}")
+
+    # Fallback
+    if AURORA_CLUSTER_ID and _AWS_ACCOUNT_ID:
+        return f"arn:aws:rds:{target_region}:{_AWS_ACCOUNT_ID}:cluster:{AURORA_CLUSTER_ID}"
+    return None
 
 
 # ===========================================================================
