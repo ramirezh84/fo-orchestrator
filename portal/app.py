@@ -17,6 +17,15 @@ from functools import wraps
 
 from flask import Flask, Response, redirect, render_template, request, session, url_for, jsonify
 
+import os
+import sys
+
+# Allow running from project root or from portal/ directory
+_dir = os.path.dirname(os.path.abspath(__file__))
+_root = os.path.dirname(_dir)
+if _root not in sys.path:
+    sys.path.insert(0, _root)
+
 from portal.config import (
     PORTAL_USERNAME, PORTAL_PASSWORD, SECRET_KEY,
     VERSIONS, ARCHITECTURES, BACKENDS, PROVIDERS,
