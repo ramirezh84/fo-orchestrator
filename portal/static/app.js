@@ -173,12 +173,16 @@ function initAdminPage(VERSIONS) {
       // Aurora
       const aw1 = s.aurora['us-west-1'];
       const aw2 = s.aurora['us-west-2'];
-      setText('aurora-w1', aw1);
-      setText('aurora-w2', aw2);
+      const aw1Status = typeof aw1 === 'object' ? aw1.status : aw1;
+      const aw2Status = typeof aw2 === 'object' ? aw2.status : aw2;
+      const aw1Role = typeof aw1 === 'object' ? aw1.role : 'unknown';
+      const aw2Role = typeof aw2 === 'object' ? aw2.role : 'unknown';
+      setText('aurora-w1', aw1Status + (aw1Role !== 'unknown' ? ' (' + aw1Role + ')' : ''));
+      setText('aurora-w2', aw2Status + (aw2Role !== 'unknown' ? ' (' + aw2Role + ')' : ''));
 
-      const bothAvailable = aw1 === 'available' && aw2 === 'available';
-      const anyRunning = aw1 !== 'not-found' || aw2 !== 'not-found';
-      const creating = aw1 === 'creating' || aw2 === 'creating';
+      const bothAvailable = aw1Status === 'available' && aw2Status === 'available';
+      const anyRunning = aw1Status !== 'not-found' || aw2Status !== 'not-found';
+      const creating = aw1Status === 'creating' || aw2Status === 'creating';
 
       const toggle = document.getElementById('aurora-toggle');
       const auroraText = document.getElementById('aurora-status-text');
@@ -404,15 +408,24 @@ function initDemoPage() {
     // ECS
     const ecsW1 = s.ecs['us-west-1'];
     const ecsW2 = s.ecs['us-west-2'];
+    const auroraW1 = typeof s.aurora['us-west-1'] === 'object' ? s.aurora['us-west-1'] : {status: s.aurora['us-west-1'], role: 'unknown'};
+    const auroraW2 = typeof s.aurora['us-west-2'] === 'object' ? s.aurora['us-west-2'] : {status: s.aurora['us-west-2'], role: 'unknown'};
+
     updateServiceNode('svc-r53-w1', 'R53', true, '');
     updateServiceNode('svc-alb-w1', 'ALB', ecsW1.running > 0, '');
     updateServiceNode('svc-ecs-w1', 'ECS', ecsW1.running > 0, ecsW1.running !== null ? ecsW1.running + '/' + ecsW1.desired : '--');
-    updateServiceNode('svc-aurora-w1', 'RDS', s.aurora['us-west-1'] === 'available', s.aurora['us-west-1']);
+    updateServiceNode('svc-aurora-w1', 'RDS', auroraW1.status === 'available', auroraW1.status);
 
     updateServiceNode('svc-r53-w2', 'R53', true, '');
     updateServiceNode('svc-alb-w2', 'ALB', ecsW2.running > 0, '');
     updateServiceNode('svc-ecs-w2', 'ECS', ecsW2.running > 0, ecsW2.running !== null ? ecsW2.running + '/' + ecsW2.desired : '--');
-    updateServiceNode('svc-aurora-w2', 'RDS', s.aurora['us-west-2'] === 'available', s.aurora['us-west-2']);
+    updateServiceNode('svc-aurora-w2', 'RDS', auroraW2.status === 'available', auroraW2.status);
+
+    // Dynamic Aurora writer/reader labels
+    const labelW1 = document.getElementById('aurora-label-w1');
+    const labelW2 = document.getElementById('aurora-label-w2');
+    if (labelW1) labelW1.textContent = 'Aurora' + (auroraW1.role === 'writer' ? ' (Writer)' : auroraW1.role === 'reader' ? ' (Reader)' : '');
+    if (labelW2) labelW2.textContent = 'Aurora' + (auroraW2.role === 'writer' ? ' (Writer)' : auroraW2.role === 'reader' ? ' (Reader)' : '');
 
     // Region states
     w1Box.className = 'region-box';

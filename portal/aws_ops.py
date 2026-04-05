@@ -137,17 +137,33 @@ def scale_ecs(desired, region):
 
 
 def get_aurora_status():
-    """Get Aurora instance status in both regions."""
+    """Get Aurora instance status and writer/reader role in both regions."""
     result = {}
-    for region, inst_id in [(PRIMARY_REGION, AURORA_INSTANCE_W1), (SECONDARY_REGION, AURORA_INSTANCE_W2)]:
+    for region, inst_id, cluster_id in [
+        (PRIMARY_REGION, AURORA_INSTANCE_W1, AURORA_CLUSTER_W1),
+        (SECONDARY_REGION, AURORA_INSTANCE_W2, AURORA_CLUSTER_W2),
+    ]:
         try:
             resp = _client("rds", region).describe_db_instances(DBInstanceIdentifier=inst_id)
             if resp.get("DBInstances"):
-                result[region] = resp["DBInstances"][0].get("DBInstanceStatus", "unknown")
+                status = resp["DBInstances"][0].get("DBInstanceStatus", "unknown")
             else:
-                result[region] = "not-found"
+                status = "not-found"
         except ClientError:
-            result[region] = "not-found"
+            status = "not-found"
+
+        # Determine writer/reader role from cluster's ReplicationSourceIdentifier
+        role = "unknown"
+        if status not in ("not-found",):
+            try:
+                c_resp = _client("rds", region).describe_db_clusters(DBClusterIdentifier=cluster_id)
+                if c_resp.get("DBClusters"):
+                    repl_src = c_resp["DBClusters"][0].get("ReplicationSourceIdentifier", "")
+                    role = "reader" if repl_src else "writer"
+            except ClientError:
+                pass
+
+        result[region] = {"status": status, "role": role}
     return result
 
 
