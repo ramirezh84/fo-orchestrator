@@ -268,7 +268,34 @@ def reset_state(backend="dynamodb"):
 
 
 def start_test(version, architecture, backend, provider):
-    """Configure Lambda env vars, switch alias, enable EventBridge, reset state."""
+    """Configure Lambda, reset state, then enable EventBridge.
+
+    Order matters: disable EB first → reset state �� configure Lambda → enable EB.
+    This prevents the orchestrator from writing stale state during configuration.
+    """
+    # Step 1: Ensure EventBridge is OFF (prevent race condition)
+    for region in BOTH_REGIONS:
+        disable_eventbridge(region)
+
+    # Step 2: Verify Aurora writer is in primary
+    aurora = get_aurora_status()
+    w1_role = aurora.get(PRIMARY_REGION, {}).get("role", "unknown")
+    if w1_role != "writer":
+        raise RuntimeError(
+            f"Aurora writer is in {SECONDARY_REGION}, not primary. "
+            f"Click Reset Everything first to switchover Aurora back."
+        )
+
+    # Step 3: Verify ECS is running in both regions
+    for region in BOTH_REGIONS:
+        ecs = get_ecs_status(region)
+        if ecs["desired"] == 0:
+            scale_ecs(2, region)
+
+    # Step 4: Reset state BEFORE enabling EventBridge
+    reset_state(backend)
+
+    # Step 5: Configure Lambda env vars + alias
     env_vars = {}
     ver_config = VERSIONS.get(version, {})
     env_vars.update(ver_config.get("env_overrides", {}))
@@ -291,9 +318,10 @@ def start_test(version, architecture, backend, provider):
                 region_vars["REMOTE_STATE_BUCKET"] = S3_STATE_BUCKET_W1
         set_lambda_env(region_vars, region)
         switch_alias(ver_alias, region)
-        enable_eventbridge(region)
 
-    reset_state(backend)
+    # Step 6: Enable EventBridge LAST (state is clean, Lambda is configured)
+    for region in BOTH_REGIONS:
+        enable_eventbridge(region)
 
 
 def stop_test():
