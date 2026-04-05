@@ -420,6 +420,21 @@ STEP 3: Then run this Lambda IN THE TARGET REGION with aurora_confirmed=true:
 """
 
 
+def _reload_dynamic_config():
+    """Re-read config that the portal may change between invocations."""
+    global _state_backend, _remote_state_backend, _REMOTE_STATE_BUCKET
+    _state_backend = create_backend(region=CURRENT_REGION, client_config=_client_config)
+    _REMOTE_STATE_BUCKET = os.environ.get("REMOTE_STATE_BUCKET", "")
+    _remote_state_backend = None
+    if _REMOTE_STATE_BUCKET and os.environ.get("STATE_BACKEND", "dynamodb").lower() == "s3":
+        _remote_region = SECONDARY_REGION if CURRENT_REGION == PRIMARY_REGION else PRIMARY_REGION
+        _remote_state_backend = S3StateBackend(
+            bucket=_REMOTE_STATE_BUCKET, region=_remote_region,
+            prefix=os.environ.get("STATE_PREFIX", "failover-state/"),
+            client_config=_client_config,
+        )
+
+
 def handler(event, context):
     """
     Manual failback handler.
@@ -432,6 +447,8 @@ def handler(event, context):
         "aurora_confirmed": true    <-- REQUIRED: operator confirms Aurora is switched
     }
     """
+    _reload_dynamic_config()
+
     target_region = event.get("target_region", PRIMARY_REGION)
     skip_health_check = event.get("skip_health_check", False)
     operator = event.get("operator", "unknown")

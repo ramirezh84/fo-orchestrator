@@ -1323,6 +1323,42 @@ def _handle_active_active(state: dict) -> dict:
 # Main Handler
 # ===========================================================================
 
+def _reload_dynamic_config():
+    """Re-read config values that the portal may change between invocations.
+
+    Called at the start of every handler() invocation. This allows the portal
+    to change env vars (STATE_BACKEND, ROUTING_MODE, etc.) and have them
+    take effect on the next 1-minute EventBridge cycle without requiring
+    a Lambda cold start.
+
+    Static values (regions, SNS topic, cluster names, health check URLs)
+    are read once at module import time and don't change.
+    """
+    global ROUTING_MODE, PASSIVE_PUBLISH_ZERO, FAILOVER_MODE
+    global _state_backend, _remote_state_backend, _REMOTE_STATE_BUCKET
+    global AURORA_AUTO_PROMOTE
+
+    ROUTING_MODE = os.environ.get("ROUTING_MODE", "failover").lower()
+    PASSIVE_PUBLISH_ZERO = os.environ.get("PASSIVE_PUBLISH_ZERO", "false").lower() == "true"
+    FAILOVER_MODE = os.environ.get("FAILOVER_MODE", "auto").lower()
+    AURORA_AUTO_PROMOTE = os.environ.get("AURORA_AUTO_PROMOTE", "false").lower() == "true"
+
+    # Reinitialize state backend (DynamoDB or S3)
+    _state_backend = create_backend(region=CURRENT_REGION, client_config=_client_config)
+
+    # Reinitialize remote state backend for S3 CRR
+    _REMOTE_STATE_BUCKET = os.environ.get("REMOTE_STATE_BUCKET", "")
+    _remote_state_backend = None
+    if _REMOTE_STATE_BUCKET and os.environ.get("STATE_BACKEND", "dynamodb").lower() == "s3":
+        from state_backend import S3StateBackend
+        _remote_region = SECONDARY_REGION if CURRENT_REGION == PRIMARY_REGION else PRIMARY_REGION
+        _remote_state_backend = S3StateBackend(
+            bucket=_REMOTE_STATE_BUCKET, region=_remote_region,
+            prefix=os.environ.get("STATE_PREFIX", "failover-state/"),
+            client_config=_client_config,
+        )
+
+
 def handler(event, context):
     """
     Main Lambda handler — runs every 1 minute via EventBridge in BOTH regions.
@@ -1335,6 +1371,9 @@ def handler(event, context):
       {"execute_failover": true}  — trigger failover when FAILOVER_MODE=manual
       {"reset_state": true}       — reset state to PRIMARY_ACTIVE
     """
+    # Re-read dynamic config (portal may have changed env vars)
+    _reload_dynamic_config()
+
     logger.info(
         f"Failover Orchestrator running in {CURRENT_REGION}, "
         f"mode={FAILOVER_MODE}, routing={ROUTING_MODE}"

@@ -671,14 +671,14 @@ class TestHandlerRouting:
     @patch.object(orch, "_handle_active_active", return_value={"statusCode": 200, "body": "aa"})
     @patch.object(orch, "get_failover_state", return_value=_make_state())
     def test_active_active_mode_routes_correctly(self, mock_state, mock_aa):
-        with patch.object(orch, "ROUTING_MODE", "active-active"):
+        with patch.dict(os.environ, {"ROUTING_MODE": "active-active"}):
             result = orch.handler({}, None)
         mock_aa.assert_called_once()
 
     @patch.object(orch, "_execute_manual_failover", return_value={"statusCode": 200, "body": "ok"})
     @patch.object(orch, "get_failover_state", return_value=_make_state())
     def test_execute_failover_event(self, mock_state, mock_exec):
-        with patch.object(orch, "ROUTING_MODE", "failover"):
+        with patch.dict(os.environ, {"ROUTING_MODE": "failover"}):
             result = orch.handler({"execute_failover": True}, None)
         mock_exec.assert_called_once()
 
