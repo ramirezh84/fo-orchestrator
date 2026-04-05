@@ -25,10 +25,16 @@ _clients = {}
 
 
 def _client(service, region=PRIMARY_REGION):
+    """Get a cached boto3 client. Clears cache on credential errors."""
     key = (service, region)
     if key not in _clients:
         _clients[key] = boto3.client(service, region_name=region)
     return _clients[key]
+
+
+def _clear_client_cache():
+    """Clear cached clients (e.g., after credential refresh)."""
+    _clients.clear()
 
 
 # ── Lambda Operations ──────────────────────────────────────────────────────────
@@ -138,50 +144,65 @@ def get_aurora_status():
 
 
 def create_aurora_instances():
-    """Create Aurora instances in both regions (~5 min each).
+    """Create Aurora instances in both regions (~10 min total).
 
-    If the secondary cluster was detached from the global (by delete_aurora_instances),
-    rejoins it first. Creates primary instance first (required before secondary can join).
+    Order: create primary instance → wait → ensure secondary cluster in global → create secondary instance.
+    Primary must have a running instance before secondary cluster can join the global.
     """
     errors = []
 
-    # Ensure secondary cluster exists and is part of the global cluster
-    _ensure_secondary_cluster_in_global()
-
-    # Create primary instance first (must exist before secondary instance)
-    for region, cluster_id, inst_id in [
-        (PRIMARY_REGION, AURORA_CLUSTER_W1, AURORA_INSTANCE_W1),
-        (SECONDARY_REGION, AURORA_CLUSTER_W2, AURORA_INSTANCE_W2),
-    ]:
+    # Step 1: Create primary instance
+    try:
+        resp = _client("rds", PRIMARY_REGION).describe_db_instances(DBInstanceIdentifier=AURORA_INSTANCE_W1)
+        status = resp["DBInstances"][0].get("DBInstanceStatus", "") if resp.get("DBInstances") else ""
+        if status in ("", "deleting"):
+            raise ClientError({"Error": {"Code": "DBInstanceNotFound"}}, "")
+        logger.info(f"Primary instance already exists: {status}")
+    except ClientError:
         try:
-            resp = _client("rds", region).describe_db_instances(DBInstanceIdentifier=inst_id)
-            status = resp["DBInstances"][0].get("DBInstanceStatus", "") if resp.get("DBInstances") else ""
-            if status not in ("", "deleting"):
-                continue  # Already exists and not being deleted
-        except ClientError:
-            pass
-
-        try:
-            _client("rds", region).create_db_instance(
-                DBInstanceIdentifier=inst_id,
-                DBClusterIdentifier=cluster_id,
+            _client("rds", PRIMARY_REGION).create_db_instance(
+                DBInstanceIdentifier=AURORA_INSTANCE_W1,
+                DBClusterIdentifier=AURORA_CLUSTER_W1,
                 DBInstanceClass="db.r6g.large",
                 Engine="aurora-postgresql",
             )
-            logger.info(f"Creating Aurora instance {inst_id} in {region}")
-
-            # For primary: wait until available before creating secondary
-            if region == PRIMARY_REGION:
-                try:
-                    waiter = _client("rds", region).get_waiter("db_instance_available")
-                    waiter.wait(DBInstanceIdentifier=inst_id,
-                                WaiterConfig={"Delay": 15, "MaxAttempts": 40})
-                except Exception as e:
-                    logger.warning(f"Waiter timeout for {inst_id}: {e}")
-
+            logger.info("Creating primary Aurora instance...")
         except ClientError as e:
             if "DBInstanceAlreadyExists" not in str(e):
-                errors.append(f"{region}: {e}")
+                errors.append(f"primary: {e}")
+                return errors
+
+    # Step 2: Wait for primary to be available
+    logger.info("Waiting for primary instance...")
+    try:
+        waiter = _client("rds", PRIMARY_REGION).get_waiter("db_instance_available")
+        waiter.wait(DBInstanceIdentifier=AURORA_INSTANCE_W1,
+                    WaiterConfig={"Delay": 15, "MaxAttempts": 40})
+    except Exception as e:
+        logger.warning(f"Primary waiter: {e}")
+
+    # Step 3: Ensure secondary cluster exists in global (needs primary instance running)
+    _ensure_secondary_cluster_in_global()
+
+    # Step 4: Create secondary instance
+    try:
+        resp = _client("rds", SECONDARY_REGION).describe_db_instances(DBInstanceIdentifier=AURORA_INSTANCE_W2)
+        status = resp["DBInstances"][0].get("DBInstanceStatus", "") if resp.get("DBInstances") else ""
+        if status in ("", "deleting"):
+            raise ClientError({"Error": {"Code": "DBInstanceNotFound"}}, "")
+        logger.info(f"Secondary instance already exists: {status}")
+    except ClientError:
+        try:
+            _client("rds", SECONDARY_REGION).create_db_instance(
+                DBInstanceIdentifier=AURORA_INSTANCE_W2,
+                DBClusterIdentifier=AURORA_CLUSTER_W2,
+                DBInstanceClass="db.r6g.large",
+                Engine="aurora-postgresql",
+            )
+            logger.info("Creating secondary Aurora instance...")
+        except ClientError as e:
+            if "DBInstanceAlreadyExists" not in str(e):
+                errors.append(f"secondary: {e}")
 
     return errors
 
@@ -339,8 +360,8 @@ def _ensure_secondary_cluster_in_global():
         kwargs["VpcSecurityGroupIds"] = [sg_id]
     _client("rds", SECONDARY_REGION).create_db_cluster(**kwargs)
 
-    # Wait for it to be available
-    for _ in range(30):
+    # Wait for it to be available (can take a few minutes)
+    for _ in range(60):
         try:
             resp = _client("rds", SECONDARY_REGION).describe_db_clusters(
                 DBClusterIdentifier=AURORA_CLUSTER_W2
@@ -351,7 +372,7 @@ def _ensure_secondary_cluster_in_global():
         except ClientError:
             pass
         time.sleep(10)
-    logger.warning("Timeout waiting for secondary cluster")
+    logger.warning("Timeout waiting for secondary cluster — it may still be creating")
 
 
 # ── EventBridge Operations ────────────────────────────────────────────────────
