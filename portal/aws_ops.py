@@ -250,8 +250,8 @@ def delete_aurora_instances():
         logger.info("Deleting primary Aurora instance...")
     except ClientError as e:
         if "Cannot delete the last instance of the master cluster" in str(e):
-            # Need to detach secondary cluster first
-            logger.info("Detaching secondary cluster from global to allow primary deletion...")
+            # Need to detach AND delete secondary cluster first
+            logger.info("Detaching secondary cluster from global...")
             try:
                 cluster_arn = f"arn:aws:rds:{SECONDARY_REGION}:{ACCOUNT_ID}:cluster:{AURORA_CLUSTER_W2}"
                 _client("rds", SECONDARY_REGION).remove_from_global_cluster(
@@ -270,11 +270,29 @@ def delete_aurora_instances():
                     except ClientError:
                         break
                     time.sleep(5)
-                # Retry primary deletion
+
+                # Delete the now-standalone secondary cluster
+                logger.info("Deleting standalone secondary cluster...")
+                try:
+                    _client("rds", SECONDARY_REGION).delete_db_cluster(
+                        DBClusterIdentifier=AURORA_CLUSTER_W2, SkipFinalSnapshot=True
+                    )
+                    for _ in range(40):
+                        try:
+                            _client("rds", SECONDARY_REGION).describe_db_clusters(
+                                DBClusterIdentifier=AURORA_CLUSTER_W2
+                            )
+                            time.sleep(5)
+                        except ClientError:
+                            break
+                except ClientError:
+                    pass
+
+                # Now retry primary deletion
                 _client("rds", PRIMARY_REGION).delete_db_instance(
                     DBInstanceIdentifier=AURORA_INSTANCE_W1, SkipFinalSnapshot=True
                 )
-                logger.info("Primary instance deleting after detach...")
+                logger.info("Primary instance deleting after detach+delete...")
             except ClientError as e2:
                 errors.append(f"primary instance (after detach): {e2}")
         elif "DBInstanceNotFound" not in str(e) and "is already being deleted" not in str(e):
