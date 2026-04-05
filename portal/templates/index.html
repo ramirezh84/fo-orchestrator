@@ -98,6 +98,7 @@
       </div>
       <div class="state-row">
         <span>Lambda: active &rarr; <span id="lambda-version">--</span></span>
+        <span>Backend: <span id="active-backend">--</span></span>
       </div>
     </div>
 
@@ -211,9 +212,10 @@
         document.getElementById('fo-latch').textContent = st.latch_engaged !== undefined ? (st.latch_engaged ? 'YES' : 'no') : '--';
         document.getElementById('fo-failures').textContent = st.consecutive_failures !== undefined ? st.consecutive_failures : '--';
 
-        // Lambda
+        // Lambda + Backend
         const verName = s.active_alias_name || ('v' + s.active_version);
         document.getElementById('lambda-version').textContent = verName + ' (version ' + (s.active_version || '?') + ')';
+        document.getElementById('active-backend').textContent = s.active_backend || 'dynamodb';
 
         // Lock
         if (l.locked) {

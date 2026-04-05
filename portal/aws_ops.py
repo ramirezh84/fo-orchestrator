@@ -337,8 +337,32 @@ def disable_eventbridge(region):
 # ── State Operations ──────────────────────────────────────────────────────────
 
 
-def get_failover_state():
-    """Read the current failover state from DynamoDB."""
+def get_failover_state(backend=None):
+    """Read the current failover state from the active backend."""
+    if backend is None:
+        backend = _get_active_backend()
+
+    if backend == "s3":
+        return _get_state_from_s3()
+    return _get_state_from_dynamodb()
+
+
+def _get_active_backend():
+    """Determine the active backend from the lock's test config."""
+    try:
+        from portal.lock import get_lock_status
+        lock_info = get_lock_status()
+        if lock_info.get("locked") and lock_info.get("test_config"):
+            import json
+            cfg = json.loads(lock_info["test_config"])
+            return cfg.get("backend", "dynamodb")
+    except Exception:
+        pass
+    return "dynamodb"
+
+
+def _get_state_from_dynamodb():
+    """Read state from DynamoDB."""
     try:
         resp = _client("dynamodb", PRIMARY_REGION).get_item(
             TableName=STATE_TABLE,
@@ -357,6 +381,19 @@ def get_failover_state():
             elif "BOOL" in v:
                 result[k] = v["BOOL"]
         return result
+    except ClientError:
+        return {}
+
+
+def _get_state_from_s3():
+    """Read state from S3."""
+    try:
+        resp = _client("s3", PRIMARY_REGION).get_object(
+            Bucket=S3_STATE_BUCKET_W1,
+            Key="failover-state/REGION_STATE.json",
+        )
+        import json
+        return json.loads(resp["Body"].read().decode("utf-8"))
     except ClientError:
         return {}
 
@@ -456,10 +493,11 @@ def start_test(version, architecture, backend, provider):
 
 def stop_test():
     """Full test deactivation: disable EventBridge, scale ECS to 0, reset state."""
+    backend = _get_active_backend()
     for region in BOTH_REGIONS:
         disable_eventbridge(region)
         scale_ecs(0, region)
-    reset_state("dynamodb")
+    reset_state(backend)
 
 
 def trigger_failover():
@@ -494,10 +532,13 @@ def get_full_status():
             active_alias_name = name
             break
 
+    active_backend = _get_active_backend()
+
     return {
         "lambda_aliases": aliases,
         "active_version": active_version,
         "active_alias_name": active_alias_name,
+        "active_backend": active_backend,
         "ecs": {
             PRIMARY_REGION: get_ecs_status(PRIMARY_REGION),
             SECONDARY_REGION: get_ecs_status(SECONDARY_REGION),
@@ -507,5 +548,5 @@ def get_full_status():
             PRIMARY_REGION: get_eventbridge_state(PRIMARY_REGION),
             SECONDARY_REGION: get_eventbridge_state(SECONDARY_REGION),
         },
-        "state": get_failover_state(),
+        "state": get_failover_state(active_backend),
     }
