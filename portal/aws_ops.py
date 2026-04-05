@@ -66,12 +66,16 @@ def get_active_alias_version(region=PRIMARY_REGION):
 def switch_active_alias(version_alias, region):
     """Point 'active' alias to the same version as the given alias."""
     lam = _client("lambda", region)
-    # Get version from the source alias
-    resp = lam.get_alias(FunctionName=ORCHESTRATOR_LAMBDA, Name=version_alias)
-    version = resp["FunctionVersion"]
 
-    # Update 'active' on both Lambdas
+    # Update 'active' on both Lambdas — resolve version per-function
     for func in [ORCHESTRATOR_LAMBDA, FAILBACK_LAMBDA]:
+        try:
+            resp = lam.get_alias(FunctionName=func, Name=version_alias)
+            version = resp["FunctionVersion"]
+        except ClientError:
+            # Alias doesn't exist on this function — use $LATEST
+            version = "$LATEST"
+
         try:
             lam.update_alias(FunctionName=func, Name="active", FunctionVersion=version)
         except ClientError as e:
