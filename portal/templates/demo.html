@@ -7,7 +7,6 @@
   <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
 <body>
-  <!-- Top Bar -->
   <div class="topbar">
     <div class="topbar-left">
       <a href="/" class="topbar-brand">Sentinel<span>FO</span></a>
@@ -58,12 +57,18 @@
             <span class="service-detail">--</span>
           </div>
         </div>
+
+        <!-- Simulated traffic indicator -->
+        <div id="traffic-w1" class="traffic-indicator traffic-active">
+          <div class="traffic-bar"></div>
+          <span class="traffic-label">Traffic flowing</span>
+        </div>
       </div>
 
       <!-- Traffic flow arrow -->
       <div class="traffic-flow">
-        <span id="flow-arrow" class="flow-arrow">&rarr;</span>
-        <span id="flow-label" class="flow-label">standby</span>
+        <div id="flow-arrow" class="flow-arrow">&rarr;</div>
+        <div id="flow-label" class="flow-label">standby</div>
       </div>
 
       <!-- us-west-2 -->
@@ -97,28 +102,47 @@
             <span class="service-detail">--</span>
           </div>
         </div>
+
+        <div id="traffic-w2" class="traffic-indicator traffic-none">
+          <div class="traffic-bar"></div>
+          <span class="traffic-label">No traffic</span>
+        </div>
       </div>
 
+    </div>
+
+    <!-- Timers -->
+    <div class="timers-bar">
+      <div class="timer-box">
+        <div class="timer-label">Detection Time</div>
+        <div id="timer-detection" class="timer-value">--</div>
+        <div class="timer-desc">Failure → DNS failover</div>
+      </div>
+      <div class="timer-box">
+        <div class="timer-label">DB Promotion</div>
+        <div id="timer-db" class="timer-value">--</div>
+        <div class="timer-desc">Failover → Aurora writer available</div>
+      </div>
+      <div class="timer-box">
+        <div class="timer-label">Total Customer Impact</div>
+        <div id="timer-impact" class="timer-value timer-impact">--</div>
+        <div class="timer-desc">Failure → App fully serving</div>
+      </div>
     </div>
 
     <!-- Timeline -->
     <div class="timeline-section">
       <div class="timeline-header">
         <span class="timeline-title">Event Timeline</span>
-        <div style="display:flex; gap:32px; align-items:baseline;">
-          <span><span class="elapsed-label">Detection</span><span id="impact-timer" class="elapsed-timer" style="font-size:16px;">00:00</span></span>
-          <span><span class="elapsed-label">Total Impact</span><span id="elapsed-timer" class="elapsed-timer">00:00</span></span>
-        </div>
+        <span id="state-badge" class="state-badge state-unknown">--</span>
       </div>
       <div id="timeline-events" class="timeline-events">
-        <div class="timeline-empty">Waiting for events...</div>
+        <div class="timeline-empty">Start a test from the Admin page, then click Inject Failure below.</div>
       </div>
     </div>
 
     <!-- Control Bar -->
     <div class="control-bar">
-      <span id="state-badge" class="state-badge state-unknown">--</span>
-      <span class="control-sep"></span>
       <button id="btn-inject" class="btn btn-sm btn-danger">
         <span class="spinner"></span>
         <span class="btn-text">Inject Failure</span>
@@ -132,7 +156,7 @@
         <span class="btn-text">Failback</span>
       </button>
       <button id="btn-clear" class="btn btn-sm" style="margin-left:auto;">
-        <span class="btn-text">Clear Timeline</span>
+        <span class="btn-text">Clear</span>
       </button>
     </div>
 

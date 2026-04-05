@@ -281,292 +281,254 @@ function initAdminPage(VERSIONS) {
 // ── Demo Page ───────────────────────────────────────────────────────────────
 
 function initDemoPage() {
-  // Restore state from sessionStorage (survives page navigation)
-  let events = JSON.parse(sessionStorage.getItem('sentinelfo_events') || '[]');
-  let lastState = sessionStorage.getItem('sentinelfo_lastState') || null;
-  let failureInjectedAt = Number(sessionStorage.getItem('sentinelfo_failureAt')) || null;
+  // Persistent state (survives page navigation)
+  let events = JSON.parse(sessionStorage.getItem('sfo_events') || '[]');
+  let lastState = sessionStorage.getItem('sfo_lastState') || null;
+  let lastFailures = Number(sessionStorage.getItem('sfo_lastFailures') || '0');
+  let failureAt = Number(sessionStorage.getItem('sfo_failureAt')) || 0;
+  let failoverAt = Number(sessionStorage.getItem('sfo_failoverAt')) || 0;
+  let auroraAt = Number(sessionStorage.getItem('sfo_auroraAt')) || 0;
+  let resolvedAt = Number(sessionStorage.getItem('sfo_resolvedAt')) || 0;
   let timerInterval = null;
-  let failoverDetectedAt = Number(sessionStorage.getItem('sentinelfo_failoverAt')) || null;
-  let impactResolvedAt = Number(sessionStorage.getItem('sentinelfo_impactResolved')) || null;
 
-  const eventsContainer = document.getElementById('timeline-events');
-  const timerEl = document.getElementById('elapsed-timer');
+  const eventsEl = document.getElementById('timeline-events');
   const stateBadge = document.getElementById('state-badge');
 
-  // Button handlers
+  function save() {
+    sessionStorage.setItem('sfo_events', JSON.stringify(events));
+    sessionStorage.setItem('sfo_lastState', lastState || '');
+    sessionStorage.setItem('sfo_lastFailures', lastFailures);
+    sessionStorage.setItem('sfo_failureAt', failureAt);
+    sessionStorage.setItem('sfo_failoverAt', failoverAt);
+    sessionStorage.setItem('sfo_auroraAt', auroraAt);
+    sessionStorage.setItem('sfo_resolvedAt', resolvedAt);
+  }
+
+  function fmt(s) {
+    if (!s || s < 0) return '--';
+    const m = Math.floor(s / 60), sec = s % 60;
+    return String(m).padStart(2, '0') + ':' + String(sec).padStart(2, '0');
+  }
+
+  function addEvent(text, type) {
+    const now = new Date();
+    const time = now.toLocaleTimeString('en-US', { hour12: false });
+    let elapsed = '';
+    if (failureAt) elapsed = '+' + fmt(Math.floor((Date.now() - failureAt) / 1000));
+    events.push({ time, text, type: type || 'info', elapsed });
+    save();
+    renderEvents();
+  }
+
+  function renderEvents() {
+    if (!events.length) {
+      eventsEl.innerHTML = '<div class="timeline-empty">Start a test from Admin, then click Inject Failure.</div>';
+      return;
+    }
+    eventsEl.innerHTML = events.map(e =>
+      '<div class="timeline-event">' +
+      '<span class="event-time">' + e.time + '</span>' +
+      '<span class="event-dot dot-' + e.type + '"></span>' +
+      '<span class="event-text">' + e.text + '</span>' +
+      (e.elapsed ? '<span class="event-elapsed">' + e.elapsed + '</span>' : '') +
+      '</div>'
+    ).join('');
+    eventsEl.scrollTop = eventsEl.scrollHeight;
+  }
+
+  // Timers
+  function updateTimers() {
+    const now = Date.now();
+    if (failureAt && failoverAt) {
+      document.getElementById('timer-detection').textContent = fmt(Math.floor((failoverAt - failureAt) / 1000));
+    }
+    if (failoverAt && auroraAt) {
+      document.getElementById('timer-db').textContent = fmt(Math.floor((auroraAt - failoverAt) / 1000));
+    }
+    if (failureAt) {
+      const end = resolvedAt || now;
+      document.getElementById('timer-impact').textContent = fmt(Math.floor((end - failureAt) / 1000));
+    }
+  }
+
+  function startTimer() {
+    stopTimer();
+    timerInterval = setInterval(updateTimers, 1000);
+  }
+
+  function stopTimer() {
+    if (timerInterval) { clearInterval(timerInterval); timerInterval = null; }
+  }
+
+  // Buttons
   document.getElementById('btn-inject').addEventListener('click', function() {
-    const btn = this;
-    btnAction(btn, async () => {
-      const data = await apiCall('/api/trigger', 'POST');
-      addEvent('Failure injected — ECS scaled to 0 in primary', 'error');
-      failureInjectedAt = Date.now();
-      sessionStorage.setItem('sentinelfo_failureAt', failureInjectedAt);
-      impactResolvedAt = null;
-      sessionStorage.removeItem('sentinelfo_impactResolved');
+    btnAction(this, async () => {
+      await apiCall('/api/trigger', 'POST');
+      failureAt = Date.now(); failoverAt = 0; auroraAt = 0; resolvedAt = 0;
+      addEvent('Failure injected — ECS scaling to 0 in primary', 'error');
+      addEvent('Health checks will detect failure in ~60-120s (3 consecutive)', 'warn');
       startTimer();
     });
   });
 
   document.getElementById('btn-promote').addEventListener('click', function() {
-    const btn = this;
-    btnAction(btn, async () => {
+    btnAction(this, async () => {
       const data = await apiCall('/api/aurora/promote', 'POST');
-      addEvent('Aurora promotion initiated — ' + (data.message || ''), 'info');
+      addEvent('Aurora promotion initiated: ' + (data.message || ''), 'info');
     });
   });
 
   document.getElementById('btn-failback').addEventListener('click', function() {
-    const btn = this;
-    btnAction(btn, async () => {
+    btnAction(this, async () => {
       const data = await apiCall('/api/failback', 'POST');
-      addEvent('Failback initiated — restoring primary', 'info');
+      addEvent('Failback initiated', 'info');
     });
   });
 
   document.getElementById('btn-clear').addEventListener('click', function() {
-    events = [];
-    lastState = null;
-    failureInjectedAt = null;
-    failoverDetectedAt = null;
-    impactResolvedAt = null;
-    sessionStorage.removeItem('sentinelfo_events');
-    sessionStorage.removeItem('sentinelfo_lastState');
-    sessionStorage.removeItem('sentinelfo_failureAt');
-    sessionStorage.removeItem('sentinelfo_failoverAt');
-    sessionStorage.removeItem('sentinelfo_impactResolved');
-    stopTimer();
-    timerEl.textContent = '00:00';
-    if (document.getElementById('impact-timer')) document.getElementById('impact-timer').textContent = '00:00';
+    events = []; lastState = null; lastFailures = 0;
+    failureAt = 0; failoverAt = 0; auroraAt = 0; resolvedAt = 0;
+    save(); stopTimer();
+    document.getElementById('timer-detection').textContent = '--';
+    document.getElementById('timer-db').textContent = '--';
+    document.getElementById('timer-impact').textContent = '--';
     renderEvents();
   });
 
-  function addEvent(text, type) {
-    const now = new Date();
-    const timeStr = now.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
-    let elapsed = '';
-    if (failureInjectedAt) {
-      const diff = Math.floor((now.getTime() - failureInjectedAt) / 1000);
-      elapsed = '+' + formatSeconds(diff);
-    }
-    events.push({ time: timeStr, text, type: type || 'info', elapsed });
-    sessionStorage.setItem('sentinelfo_events', JSON.stringify(events));
-    renderEvents();
-  }
-
-  function renderEvents() {
-    if (events.length === 0) {
-      eventsContainer.innerHTML = '<div class="timeline-empty">Waiting for events...</div>';
-      return;
-    }
-    eventsContainer.innerHTML = events.map(e => {
-      const dotClass = 'dot-' + (e.type || 'info');
-      return '<div class="timeline-event">' +
-        '<span class="event-time">' + e.time + '</span>' +
-        '<span class="event-dot ' + dotClass + '"></span>' +
-        '<span class="event-text">' + e.text + '</span>' +
-        (e.elapsed ? '<span class="event-elapsed">' + e.elapsed + '</span>' : '') +
-        '</div>';
-    }).join('');
-    eventsContainer.scrollTop = eventsContainer.scrollHeight;
-  }
-
-  function formatSeconds(s) {
-    const m = Math.floor(s / 60);
-    const sec = s % 60;
-    return String(m).padStart(2, '0') + ':' + String(sec).padStart(2, '0');
-  }
-
-  function startTimer() {
-    stopTimer();
-    timerInterval = setInterval(() => {
-      if (failureInjectedAt) {
-        const endTime = impactResolvedAt || Date.now();
-        const diff = Math.floor((endTime - failureInjectedAt) / 1000);
-        timerEl.textContent = formatSeconds(diff);
-        // Show detection time separately if we have it
-        const impactEl = document.getElementById('impact-timer');
-        if (impactEl && failoverDetectedAt) {
-          const detDiff = Math.floor((failoverDetectedAt - failureInjectedAt) / 1000);
-          impactEl.textContent = formatSeconds(detDiff);
-        }
-      }
-    }, 1000);
-  }
-
-  function stopTimer() {
-    if (timerInterval) {
-      clearInterval(timerInterval);
-      timerInterval = null;
-    }
-  }
-
-  // Update diagram from status
-  function updateDiagram(s, l) {
+  // Update diagram + detect transitions
+  function update(s) {
     const st = s.state;
-    const currentState = st.state || 'UNKNOWN';
-    const activeRegion = st.active_region || 'us-west-1';
-
-    // State badge
-    updateStateBadge(currentState);
-
-    // Region boxes
-    const w1Box = document.getElementById('region-w1');
-    const w2Box = document.getElementById('region-w2');
-    const w1Role = document.getElementById('role-w1');
-    const w2Role = document.getElementById('role-w2');
-    const flowArrow = document.getElementById('flow-arrow');
-    const flowLabel = document.getElementById('flow-label');
-
-    // ECS
+    const state = st.state || 'UNKNOWN';
+    const active = st.active_region || 'us-west-1';
+    const failures = st.consecutive_failures || 0;
     const ecsW1 = s.ecs['us-west-1'];
     const ecsW2 = s.ecs['us-west-2'];
-    const auroraW1 = typeof s.aurora['us-west-1'] === 'object' ? s.aurora['us-west-1'] : {status: s.aurora['us-west-1'], role: 'unknown'};
-    const auroraW2 = typeof s.aurora['us-west-2'] === 'object' ? s.aurora['us-west-2'] : {status: s.aurora['us-west-2'], role: 'unknown'};
+    const aw1 = typeof s.aurora['us-west-1'] === 'object' ? s.aurora['us-west-1'] : {status: s.aurora['us-west-1'], role: 'unknown'};
+    const aw2 = typeof s.aurora['us-west-2'] === 'object' ? s.aurora['us-west-2'] : {status: s.aurora['us-west-2'], role: 'unknown'};
 
-    updateServiceNode('svc-r53-w1', 'R53', true, '');
-    updateServiceNode('svc-alb-w1', 'ALB', ecsW1.running > 0, '');
-    updateServiceNode('svc-ecs-w1', 'ECS', ecsW1.running > 0, ecsW1.running !== null ? ecsW1.running + '/' + ecsW1.desired : '--');
-    updateServiceNode('svc-aurora-w1', 'RDS', auroraW1.status === 'available', auroraW1.status);
+    // State badge
+    const stateClasses = { PRIMARY_ACTIVE: 'state-primary-active', WAITING_AURORA_PROMOTION: 'state-waiting', SECONDARY_ACTIVE: 'state-secondary-active', FAILBACK_IN_PROGRESS: 'state-failback' };
+    stateBadge.textContent = state.replace(/_/g, ' ');
+    stateBadge.className = 'state-badge ' + (stateClasses[state] || 'state-unknown');
 
-    updateServiceNode('svc-r53-w2', 'R53', true, '');
-    updateServiceNode('svc-alb-w2', 'ALB', ecsW2.running > 0, '');
-    updateServiceNode('svc-ecs-w2', 'ECS', ecsW2.running > 0, ecsW2.running !== null ? ecsW2.running + '/' + ecsW2.desired : '--');
-    updateServiceNode('svc-aurora-w2', 'RDS', auroraW2.status === 'available', auroraW2.status);
+    // Service nodes
+    updateNode('svc-ecs-w1', ecsW1.running > 0, ecsW1.running + '/' + ecsW1.desired);
+    updateNode('svc-ecs-w2', ecsW2.running > 0, ecsW2.running + '/' + ecsW2.desired);
+    updateNode('svc-alb-w1', ecsW1.running > 0, '');
+    updateNode('svc-alb-w2', ecsW2.running > 0, '');
+    updateNode('svc-aurora-w1', aw1.status === 'available', aw1.status);
+    updateNode('svc-aurora-w2', aw2.status === 'available', aw2.status);
 
-    // Dynamic Aurora writer/reader labels
-    const labelW1 = document.getElementById('aurora-label-w1');
-    const labelW2 = document.getElementById('aurora-label-w2');
-    if (labelW1) labelW1.textContent = 'Aurora' + (auroraW1.role === 'writer' ? ' (Writer)' : auroraW1.role === 'reader' ? ' (Reader)' : '');
-    if (labelW2) labelW2.textContent = 'Aurora' + (auroraW2.role === 'writer' ? ' (Writer)' : auroraW2.role === 'reader' ? ' (Reader)' : '');
+    // Aurora labels
+    const lw1 = document.getElementById('aurora-label-w1');
+    const lw2 = document.getElementById('aurora-label-w2');
+    if (lw1) lw1.textContent = 'Aurora' + (aw1.role === 'writer' ? ' (Writer)' : aw1.role === 'reader' ? ' (Reader)' : '');
+    if (lw2) lw2.textContent = 'Aurora' + (aw2.role === 'writer' ? ' (Writer)' : aw2.role === 'reader' ? ' (Reader)' : '');
 
-    // Region states
-    w1Box.className = 'region-box';
-    w2Box.className = 'region-box';
+    // Region boxes
+    const w1 = document.getElementById('region-w1');
+    const w2 = document.getElementById('region-w2');
+    const r1 = document.getElementById('role-w1');
+    const r2 = document.getElementById('role-w2');
+    const fa = document.getElementById('flow-arrow');
+    const fl = document.getElementById('flow-label');
+    const tw1 = document.getElementById('traffic-w1');
+    const tw2 = document.getElementById('traffic-w2');
 
-    if (activeRegion === 'us-west-1') {
-      w1Box.classList.add('active');
-      w2Box.classList.add('standby');
-      w1Role.textContent = 'Active';
-      w1Role.className = 'region-role role-active';
-      w2Role.textContent = 'Standby';
-      w2Role.className = 'region-role role-secondary';
-      flowArrow.innerHTML = '&#8594;';
-      flowLabel.textContent = 'standby';
-      flowArrow.className = 'flow-arrow';
-    } else {
-      w2Box.classList.add('active');
-      w2Role.textContent = 'Active';
-      w2Role.className = 'region-role role-active';
-      flowArrow.innerHTML = '&#8592;';
-      flowLabel.textContent = 'failover';
-      flowArrow.className = 'flow-arrow active-flow';
+    w1.className = 'region-box'; w2.className = 'region-box';
 
-      if (ecsW1.running === 0 || ecsW1.running === null) {
-        w1Box.classList.add('failed');
-        w1Role.textContent = 'Failed';
-        w1Role.className = 'region-role role-failed';
+    if (active === 'us-west-1') {
+      w1.classList.add('active'); w2.classList.add('standby');
+      r1.textContent = 'Active'; r1.className = 'region-role role-active';
+      r2.textContent = 'Standby'; r2.className = 'region-role role-secondary';
+      fa.innerHTML = '&rarr;'; fl.textContent = 'standby'; fa.className = 'flow-arrow';
+      // Traffic
+      if (ecsW1.running > 0) {
+        tw1.className = 'traffic-indicator traffic-active';
+        tw1.querySelector('.traffic-label').textContent = 'Traffic flowing';
       } else {
-        w1Box.classList.add('standby');
-        w1Role.textContent = 'Recovering';
-        w1Role.className = 'region-role role-secondary';
+        tw1.className = 'traffic-indicator traffic-errors';
+        tw1.querySelector('.traffic-label').textContent = 'Requests failing (503)';
       }
-    }
-
-    if (currentState === 'WAITING_AURORA_PROMOTION') {
-      flowArrow.className = 'flow-arrow active-flow';
-    }
-
-    // Detect state transitions
-    if (lastState && lastState !== currentState) {
-      onStateTransition(lastState, currentState, s);
+      tw2.className = 'traffic-indicator traffic-none';
+      tw2.querySelector('.traffic-label').textContent = 'No traffic';
+    } else {
+      w2.classList.add('active'); r2.textContent = 'Active'; r2.className = 'region-role role-active';
+      fa.innerHTML = '&larr;'; fl.textContent = 'failover'; fa.className = 'flow-arrow active-flow';
+      if (ecsW1.running === 0) {
+        w1.classList.add('failed'); r1.textContent = 'Failed'; r1.className = 'region-role role-failed';
+      } else {
+        w1.classList.add('standby'); r1.textContent = 'Standby'; r1.className = 'region-role role-secondary';
+      }
+      tw1.className = 'traffic-indicator traffic-none';
+      tw1.querySelector('.traffic-label').textContent = ecsW1.running === 0 ? 'Region down' : 'No traffic';
+      if (state === 'WAITING_AURORA_PROMOTION' && aw2.role !== 'writer') {
+        tw2.className = 'traffic-indicator traffic-errors';
+        tw2.querySelector('.traffic-label').textContent = 'Writes failing (no Aurora writer)';
+      } else {
+        tw2.className = 'traffic-indicator traffic-active';
+        tw2.querySelector('.traffic-label').textContent = 'Traffic flowing';
+      }
     }
 
     // Detect consecutive failure changes
-    if (lastState === currentState && currentState === 'PRIMARY_ACTIVE') {
-      const failures = st.consecutive_failures || 0;
-      if (failures > 0 && failureInjectedAt) {
-        // Check if we already logged this failure count
-        const failText = 'Detecting failure (' + failures + '/3)';
-        const alreadyLogged = events.some(e => e.text === failText);
-        if (!alreadyLogged) {
-          addEvent(failText, 'warn');
-        }
+    if (state === 'PRIMARY_ACTIVE' && failureAt && failures > lastFailures && failures > 0) {
+      addEvent('Orchestrator detected failure (' + failures + '/3)', 'warn');
+    }
+    lastFailures = failures;
+
+    // State transitions
+    if (lastState && lastState !== state) {
+      if (lastState === 'PRIMARY_ACTIVE' && state === 'WAITING_AURORA_PROMOTION') {
+        failoverAt = Date.now();
+        const det = failureAt ? fmt(Math.floor((failoverAt - failureAt) / 1000)) : '?';
+        addEvent('FAILOVER — DNS moved to us-west-2 (detection: ' + det + ')', 'error');
+        addEvent('Waiting for Aurora promotion...', 'warn');
+      } else if (state === 'SECONDARY_ACTIVE' && lastState === 'WAITING_AURORA_PROMOTION') {
+        resolvedAt = Date.now();
+        auroraAt = auroraAt || resolvedAt;
+        const total = failureAt ? fmt(Math.floor((resolvedAt - failureAt) / 1000)) : '?';
+        addEvent('App fully operational in us-west-2 (total impact: ' + total + ')', 'success');
+        stopTimer();
+      } else if (state === 'PRIMARY_ACTIVE' && lastState !== 'PRIMARY_ACTIVE') {
+        addEvent('Failback complete — primary active', 'success');
+        stopTimer();
+      } else {
+        addEvent('State: ' + lastState + ' → ' + state, 'info');
       }
     }
 
-    lastState = currentState;
-    sessionStorage.setItem('sentinelfo_lastState', currentState);
-  }
-
-  function onStateTransition(from, to, s) {
-    if (from === 'PRIMARY_ACTIVE' && to === 'WAITING_AURORA_PROMOTION') {
-      failoverDetectedAt = Date.now();
-      sessionStorage.setItem('sentinelfo_failoverAt', failoverDetectedAt);
-      let detectionTime = '';
-      if (failureInjectedAt) {
-        const diff = Math.floor((failoverDetectedAt - failureInjectedAt) / 1000);
-        detectionTime = ' (detected in ' + formatSeconds(diff) + ')';
-      }
-      addEvent('FAILOVER TRIGGERED' + detectionTime + ' — DNS switched to us-west-2', 'error');
-      addEvent('Waiting for Aurora promotion...', 'warn');
-    } else if (from === 'WAITING_AURORA_PROMOTION' && to === 'SECONDARY_ACTIVE') {
-      impactResolvedAt = Date.now();
-      sessionStorage.setItem('sentinelfo_impactResolved', impactResolvedAt);
-      let impactTime = '';
-      if (failureInjectedAt) {
-        const diff = Math.floor((impactResolvedAt - failureInjectedAt) / 1000);
-        impactTime = ' (total impact: ' + formatSeconds(diff) + ')';
-      }
-      addEvent('Aurora promoted — app fully operational' + impactTime, 'success');
-      stopTimer();
-    } else if (to === 'PRIMARY_ACTIVE' && from !== 'PRIMARY_ACTIVE') {
-      addEvent('Failback complete — primary is active', 'success');
-      stopTimer();
-    } else if (from === 'SECONDARY_ACTIVE' && to === 'FAILBACK_IN_PROGRESS') {
-      addEvent('Failback in progress...', 'info');
-    } else {
-      addEvent('State changed: ' + from + ' -> ' + to, 'info');
+    // Detect Aurora promotion (w2 becomes writer while waiting)
+    if (state === 'WAITING_AURORA_PROMOTION' && aw2.role === 'writer' && !auroraAt) {
+      auroraAt = Date.now();
+      const dbTime = failoverAt ? fmt(Math.floor((auroraAt - failoverAt) / 1000)) : '?';
+      addEvent('Aurora promoted — us-west-2 is now writer (DB time: ' + dbTime + ')', 'success');
     }
+
+    lastState = state;
+    save();
+    updateTimers();
   }
 
-  function updateStateBadge(state) {
-    const classes = {
-      'PRIMARY_ACTIVE': 'state-primary-active',
-      'WAITING_AURORA_PROMOTION': 'state-waiting',
-      'SECONDARY_ACTIVE': 'state-secondary-active',
-      'FAILBACK_IN_PROGRESS': 'state-failback',
-    };
-    stateBadge.textContent = state.replace(/_/g, ' ');
-    stateBadge.className = 'state-badge ' + (classes[state] || 'state-unknown');
-  }
-
-  function updateServiceNode(id, label, healthy, detail) {
+  function updateNode(id, healthy, detail) {
     const el = document.getElementById(id);
     if (!el) return;
     el.className = 'service-node ' + (healthy ? 'healthy' : 'unhealthy');
-    const detailEl = el.querySelector('.service-detail');
-    if (detailEl && detail) detailEl.textContent = detail;
+    const d = el.querySelector('.service-detail');
+    if (d && detail !== undefined) d.textContent = detail;
   }
 
-  // Poll
-  async function refreshDemoStatus() {
+  async function poll() {
     try {
       const data = await apiCall('/api/status', 'GET');
-      updateDiagram(data.status, data.lock);
-    } catch (e) {
-      // Silent
-    }
+      update(data.status);
+    } catch(e) {}
   }
 
+  // Init
   renderEvents();
-  // Restart timer if we had an active failure injection
-  if (failureInjectedAt && !impactResolvedAt) {
-    startTimer();
-  } else if (failureInjectedAt && impactResolvedAt) {
-    // Show final time
-    const diff = Math.floor((impactResolvedAt - failureInjectedAt) / 1000);
-    timerEl.textContent = formatSeconds(diff);
-  }
-  refreshDemoStatus();
-  setInterval(refreshDemoStatus, 5000);
+  updateTimers();
+  if (failureAt && !resolvedAt) startTimer();
+  poll();
+  setInterval(poll, 4000);
 }

@@ -297,10 +297,11 @@ def start_test(version, architecture, backend, provider):
 
 
 def stop_test():
-    """Disable EventBridge, reset state."""
+    """Disable EventBridge, reset state, restore ECS."""
     backend = _get_active_backend()
     for region in BOTH_REGIONS:
         disable_eventbridge(region)
+        scale_ecs(2, region)  # Restore ECS (trigger_failover may have scaled to 0)
     reset_state(backend)
 
 
