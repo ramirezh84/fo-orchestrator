@@ -612,6 +612,52 @@ def trigger_failover():
     scale_ecs(0, PRIMARY_REGION)
 
 
+def promote_aurora():
+    """Trigger Aurora switchover to secondary region."""
+    try:
+        target_arn = f"arn:aws:rds:{SECONDARY_REGION}:{ACCOUNT_ID}:cluster:{AURORA_CLUSTER_W2}"
+        _client("rds", PRIMARY_REGION).switchover_global_cluster(
+            GlobalClusterIdentifier=AURORA_GLOBAL_CLUSTER,
+            TargetDbClusterIdentifier=target_arn,
+        )
+        return {"ok": True, "message": "Aurora switchover initiated to us-west-2"}
+    except ClientError as e:
+        if "InvalidGlobalClusterStateFault" in str(e):
+            # Try unplanned failover
+            try:
+                target_arn = f"arn:aws:rds:{SECONDARY_REGION}:{ACCOUNT_ID}:cluster:{AURORA_CLUSTER_W2}"
+                _client("rds", SECONDARY_REGION).failover_global_cluster(
+                    GlobalClusterIdentifier=AURORA_GLOBAL_CLUSTER,
+                    TargetDbClusterIdentifier=target_arn,
+                    AllowDataLoss=True,
+                )
+                return {"ok": True, "message": "Aurora failover initiated (unplanned) to us-west-2"}
+            except ClientError as e2:
+                return {"ok": False, "error": str(e2)}
+        return {"ok": False, "error": str(e)}
+
+
+def invoke_failback(operator):
+    """Invoke the failback Lambda to return traffic to primary."""
+    payload = json.dumps({
+        "target_region": PRIMARY_REGION,
+        "skip_health_check": False,
+        "operator": operator,
+        "aurora_confirmed": True,
+        "skip_readiness_check": True,
+    })
+    try:
+        resp = _client("lambda", PRIMARY_REGION).invoke(
+            FunctionName=f"{FAILBACK_LAMBDA}:active",
+            InvocationType="RequestResponse",
+            Payload=payload.encode("utf-8"),
+        )
+        result = json.loads(resp["Payload"].read().decode("utf-8"))
+        return {"ok": True, "message": "Failback completed", "result": result}
+    except ClientError as e:
+        return {"ok": False, "error": str(e)}
+
+
 def get_full_status():
     """Aggregate status from all AWS services."""
     aliases = get_lambda_aliases()

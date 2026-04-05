@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SentinelFO — Demo</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <!-- Top Bar -->
+  <div class="topbar">
+    <div class="topbar-left">
+      <a href="/" class="topbar-brand">Sentinel<span>FO</span></a>
+      <nav class="topbar-nav">
+        <a href="/">Admin</a>
+        <a href="/demo" class="active">Demo</a>
+      </nav>
+    </div>
+    <div class="topbar-right">
+      <span>{{ username }}</span>
+      <a href="/logout">Sign out</a>
+    </div>
+  </div>
+
+  <div class="demo-content">
+
+    <!-- Traffic Diagram -->
+    <div class="traffic-diagram">
+
+      <!-- us-west-1 -->
+      <div id="region-w1" class="region-box active">
+        <div class="region-header">
+          <span class="region-name">us-west-1</span>
+          <span id="role-w1" class="region-role role-active">Active</span>
+        </div>
+        <div class="service-chain">
+          <div id="svc-r53-w1" class="service-node healthy">
+            <div class="service-icon">R53</div>
+            <span>Route 53</span>
+            <span class="service-detail"></span>
+          </div>
+          <div class="service-arrow">&darr;</div>
+          <div id="svc-alb-w1" class="service-node healthy">
+            <div class="service-icon">ALB</div>
+            <span>Application LB</span>
+            <span class="service-detail"></span>
+          </div>
+          <div class="service-arrow">&darr;</div>
+          <div id="svc-ecs-w1" class="service-node healthy">
+            <div class="service-icon">ECS</div>
+            <span>ECS Service</span>
+            <span class="service-detail">--</span>
+          </div>
+          <div class="service-arrow">&darr;</div>
+          <div id="svc-aurora-w1" class="service-node healthy">
+            <div class="service-icon">RDS</div>
+            <span>Aurora (Writer)</span>
+            <span class="service-detail">--</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Traffic flow arrow -->
+      <div class="traffic-flow">
+        <span id="flow-arrow" class="flow-arrow">&rarr;</span>
+        <span id="flow-label" class="flow-label">standby</span>
+      </div>
+
+      <!-- us-west-2 -->
+      <div id="region-w2" class="region-box standby">
+        <div class="region-header">
+          <span class="region-name">us-west-2</span>
+          <span id="role-w2" class="region-role role-secondary">Standby</span>
+        </div>
+        <div class="service-chain">
+          <div id="svc-r53-w2" class="service-node healthy">
+            <div class="service-icon">R53</div>
+            <span>Route 53</span>
+            <span class="service-detail"></span>
+          </div>
+          <div class="service-arrow">&darr;</div>
+          <div id="svc-alb-w2" class="service-node healthy">
+            <div class="service-icon">ALB</div>
+            <span>Application LB</span>
+            <span class="service-detail"></span>
+          </div>
+          <div class="service-arrow">&darr;</div>
+          <div id="svc-ecs-w2" class="service-node healthy">
+            <div class="service-icon">ECS</div>
+            <span>ECS Service</span>
+            <span class="service-detail">--</span>
+          </div>
+          <div class="service-arrow">&darr;</div>
+          <div id="svc-aurora-w2" class="service-node healthy">
+            <div class="service-icon">RDS</div>
+            <span>Aurora (Reader)</span>
+            <span class="service-detail">--</span>
+          </div>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- Timeline -->
+    <div class="timeline-section">
+      <div class="timeline-header">
+        <span class="timeline-title">Event Timeline</span>
+        <div>
+          <span class="elapsed-label">Elapsed</span>
+          <span id="elapsed-timer" class="elapsed-timer">00:00</span>
+        </div>
+      </div>
+      <div id="timeline-events" class="timeline-events">
+        <div class="timeline-empty">Waiting for events...</div>
+      </div>
+    </div>
+
+    <!-- Control Bar -->
+    <div class="control-bar">
+      <span id="state-badge" class="state-badge state-unknown">--</span>
+      <span class="control-sep"></span>
+      <button id="btn-inject" class="btn btn-sm btn-danger">
+        <span class="spinner"></span>
+        <span class="btn-text">Inject Failure</span>
+      </button>
+      <button id="btn-failback" class="btn btn-sm">
+        <span class="spinner"></span>
+        <span class="btn-text">Failback</span>
+      </button>
+      <button id="btn-clear" class="btn btn-sm" style="margin-left:auto;">
+        <span class="btn-text">Clear Timeline</span>
+      </button>
+    </div>
+
+  </div>
+
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+  <script>
+    initDemoPage();
+  </script>
+</body>
+</html>

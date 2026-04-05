@@ -89,6 +89,15 @@ def index():
     )
 
 
+@app.route("/demo")
+@login_required
+def demo():
+    return render_template(
+        "demo.html",
+        username=session.get("username", ""),
+    )
+
+
 # ── API ─────────────────────────────────────────────────────────────────────────
 
 
@@ -196,6 +205,28 @@ def api_trigger():
     try:
         aws_ops.trigger_failover()
         return jsonify({"ok": True, "message": "Failure injected. Failover in ~3 minutes."})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/aurora/promote", methods=["POST"])
+@login_required
+def api_aurora_promote():
+    """Trigger Aurora switchover to secondary region."""
+    try:
+        result = aws_ops.promote_aurora()
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/failback", methods=["POST"])
+@login_required
+def api_failback():
+    """Invoke the failback Lambda to return traffic to primary."""
+    try:
+        result = aws_ops.invoke_failback(session.get("username", "unknown"))
+        return jsonify(result)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 

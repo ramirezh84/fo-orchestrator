@@ -1,260 +1,146 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-<title>SentinelFO Control Portal</title>
-<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SentinelFO — Admin</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
 <body>
-  <div class="container">
-    <!-- Header -->
-    <div class="header">
-      <div class="title">SentinelFO <span class="subtitle">Control Portal</span></div>
-      <div class="user-info">{{ username }} <a href="/logout" class="logout-link">[Logout]</a></div>
+  <!-- Top Bar -->
+  <div class="topbar">
+    <div class="topbar-left">
+      <a href="/" class="topbar-brand">Sentinel<span>FO</span></a>
+      <nav class="topbar-nav">
+        <a href="/" class="active">Admin</a>
+        <a href="/demo">Demo</a>
+      </nav>
     </div>
+    <div class="topbar-right">
+      <span>{{ username }}</span>
+      <a href="/logout">Sign out</a>
+    </div>
+  </div>
 
-    <!-- Status Bar -->
-    <div class="status-bar">
-      <div class="status-left">
-        <span class="label">STATUS:</span>
-        <span id="test-status" class="status-idle">IDLE</span>
-        <span id="test-config-display" class="test-config-text"></span>
-      </div>
-      <div class="status-right">
-        <span class="label">Aurora:</span>
-        <span id="aurora-badge" class="badge badge-off">OFF</span>
-        <button id="btn-aurora-toggle" class="btn-sm" onclick="toggleAurora()">Turn ON</button>
-        <span class="sep">|</span>
-        <span class="label">Lock:</span>
-        <span id="lock-status">Free</span>
+  <div class="admin-content">
+
+    <!-- Test Status -->
+    <div class="card">
+      <div class="card-header">Test Status</div>
+      <div class="card-body">
+        <div class="test-status-bar">
+          <span id="test-badge" class="badge badge-idle">IDLE</span>
+          <span id="test-config-display" class="test-config-text"></span>
+          <span style="margin-left:auto; display:flex; align-items:center; gap:6px;">
+            <span class="refresh-dot" id="refresh-indicator"></span>
+            <span style="font-size:11px; color:var(--text-muted);">Auto-refresh 15s</span>
+          </span>
+        </div>
       </div>
     </div>
 
     <!-- Configuration -->
-    <div class="config-panel">
-      <div class="config-row">
-        <label>Version</label>
-        <select id="sel-version" onchange="onVersionChange()">
-          {% for key, ver in versions.items() %}
-          <option value="{{ key }}">{{ ver.name }}</option>
-          {% endfor %}
-        </select>
-        <div id="version-features" class="feature-list"></div>
-      </div>
-      <div class="config-row">
-        <label>Architecture</label>
-        <select id="sel-architecture">
-          {% for key, arch in architectures.items() %}
-          <option value="{{ key }}">{{ arch.name }} — {{ arch.description }}</option>
-          {% endfor %}
-        </select>
-      </div>
-      <div class="config-row">
-        <label>Backend</label>
-        <select id="sel-backend">
-          {% for key, be in backends.items() %}
-          <option value="{{ key }}">{{ be.name }}</option>
-          {% endfor %}
-        </select>
-      </div>
-      <div class="config-row" id="provider-row">
-        <label>LLM Provider</label>
-        <select id="sel-provider">
-          {% for key, prov in providers.items() %}
-          <option value="{{ key }}">{{ prov.name }}</option>
-          {% endfor %}
-        </select>
+    <div class="card">
+      <div class="card-header">Configuration</div>
+      <div class="card-body">
+        <div class="config-grid">
+          <label>Version</label>
+          <select id="sel-version">
+            {% for key, ver in versions.items() %}
+            <option value="{{ key }}">{{ ver.name }}</option>
+            {% endfor %}
+          </select>
+
+          <div></div>
+          <div id="version-features" class="feature-list"></div>
+
+          <label>Architecture</label>
+          <select id="sel-architecture">
+            {% for key, arch in architectures.items() %}
+            <option value="{{ key }}">{{ arch.name }} &mdash; {{ arch.description }}</option>
+            {% endfor %}
+          </select>
+
+          <label>Backend</label>
+          <select id="sel-backend">
+            {% for key, be in backends.items() %}
+            <option value="{{ key }}">{{ be.name }}</option>
+            {% endfor %}
+          </select>
+
+          <label id="provider-row-label">LLM Provider</label>
+          <select id="provider-row-select">
+            {% for key, prov in providers.items() %}
+            <option value="{{ key }}">{{ prov.name }}</option>
+            {% endfor %}
+          </select>
+        </div>
+
+        <!-- Aurora Toggle -->
+        <div class="aurora-row">
+          <span class="aurora-label">Aurora Instances</span>
+          <div id="aurora-toggle" class="toggle-track">
+            <div class="toggle-thumb"></div>
+          </div>
+          <span id="aurora-status-text" class="aurora-status-text">Off</span>
+        </div>
       </div>
     </div>
 
-    <!-- Action Buttons -->
-    <div class="actions">
-      <button class="btn btn-start" onclick="startTest()">Start Test</button>
-      <button class="btn btn-stop" onclick="stopTest()">Stop Test</button>
-      <button class="btn btn-trigger" onclick="triggerFailover()">Trigger Failover</button>
+    <!-- Actions -->
+    <div class="card">
+      <div class="card-header">Actions</div>
+      <div class="card-body">
+        <div class="actions-row">
+          <button id="btn-start" class="btn btn-primary">
+            <span class="spinner"></span>
+            <span class="btn-text">Start Test</span>
+          </button>
+          <button id="btn-stop" class="btn btn-danger">
+            <span class="spinner"></span>
+            <span class="btn-text">Stop Test</span>
+          </button>
+        </div>
+        <div class="message-area">
+          <div id="admin-message" class="message hidden"></div>
+        </div>
+      </div>
     </div>
 
     <!-- Live Status -->
-    <div class="live-panel">
-      <div class="panel-title">Live Status <span id="refresh-indicator" class="refresh-dot"></span></div>
-      <div class="status-grid">
-        <div class="region-status">
-          <div class="region-label">Primary (us-west-1)</div>
-          <div>ECS: <span id="ecs-w1">--</span></div>
-          <div>Aurora: <span id="aurora-w1">--</span></div>
-          <div>EventBridge: <span id="eb-w1">--</span></div>
+    <div class="card">
+      <div class="card-header">Infrastructure Status</div>
+      <div class="card-body">
+        <div class="status-grid">
+          <div class="region-card">
+            <div class="region-card-title">us-west-1 (Primary)</div>
+            <div class="stat-row"><span class="stat-label">ECS</span><span id="ecs-w1" class="stat-value">--</span></div>
+            <div class="stat-row"><span class="stat-label">Aurora</span><span id="aurora-w1" class="stat-value">--</span></div>
+            <div class="stat-row"><span class="stat-label">EventBridge</span><span id="eb-w1" class="stat-value">--</span></div>
+          </div>
+          <div class="region-card">
+            <div class="region-card-title">us-west-2 (Secondary)</div>
+            <div class="stat-row"><span class="stat-label">ECS</span><span id="ecs-w2" class="stat-value">--</span></div>
+            <div class="stat-row"><span class="stat-label">Aurora</span><span id="aurora-w2" class="stat-value">--</span></div>
+            <div class="stat-row"><span class="stat-label">EventBridge</span><span id="eb-w2" class="stat-value">--</span></div>
+          </div>
         </div>
-        <div class="region-status">
-          <div class="region-label">Secondary (us-west-2)</div>
-          <div>ECS: <span id="ecs-w2">--</span></div>
-          <div>Aurora: <span id="aurora-w2">--</span></div>
-          <div>EventBridge: <span id="eb-w2">--</span></div>
+        <div class="state-summary">
+          <span><span class="stat-label">State:</span><span id="fo-state" class="stat-value">--</span></span>
+          <span><span class="stat-label">Active:</span><span id="fo-active" class="stat-value">--</span></span>
+          <span><span class="stat-label">Latch:</span><span id="fo-latch" class="stat-value">--</span></span>
+          <span><span class="stat-label">Failures:</span><span id="fo-failures" class="stat-value">--</span></span>
+          <span><span class="stat-label">Lambda:</span><span id="lambda-version" class="stat-value">--</span></span>
+          <span><span class="stat-label">Backend:</span><span id="active-backend" class="stat-value">--</span></span>
+          <span><span class="stat-label">Lock:</span><span id="lock-status" class="stat-value" style="color:var(--success)">Free</span></span>
         </div>
-      </div>
-      <div class="state-row">
-        <span>State: <span id="fo-state">--</span></span>
-        <span>Active Region: <span id="fo-active">--</span></span>
-        <span>Latch: <span id="fo-latch">--</span></span>
-        <span>Failures: <span id="fo-failures">--</span></span>
-      </div>
-      <div class="state-row">
-        <span>Lambda: active &rarr; <span id="lambda-version">--</span></span>
-        <span>Backend: <span id="active-backend">--</span></span>
       </div>
     </div>
-
-    <!-- Message Area -->
-    <div id="message" class="message hidden"></div>
   </div>
 
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
   <script>
-    const VERSIONS = {{ versions | tojson }};
-
-    function onVersionChange() {
-      const ver = document.getElementById('sel-version').value;
-      const config = VERSIONS[ver];
-      const provRow = document.getElementById('provider-row');
-      provRow.style.display = config.supports_provider ? 'flex' : 'none';
-
-      const featureList = document.getElementById('version-features');
-      featureList.innerHTML = config.features.map(f => '<div class="feature-item">' + f + '</div>').join('');
-    }
-
-    function showMessage(text, isError) {
-      const el = document.getElementById('message');
-      el.textContent = text;
-      el.className = 'message ' + (isError ? 'message-error' : 'message-ok');
-      setTimeout(() => el.className = 'message hidden', 5000);
-    }
-
-    async function apiCall(url, method, body) {
-      try {
-        const opts = { method, headers: { 'Content-Type': 'application/json' } };
-        if (body) opts.body = JSON.stringify(body);
-        const resp = await fetch(url, opts);
-        const data = await resp.json();
-        if (!resp.ok) throw new Error(data.error || 'Request failed');
-        return data;
-      } catch (e) {
-        showMessage(e.message, true);
-        throw e;
-      }
-    }
-
-    async function startTest() {
-      const data = await apiCall('/api/start', 'POST', {
-        version: document.getElementById('sel-version').value,
-        architecture: document.getElementById('sel-architecture').value,
-        backend: document.getElementById('sel-backend').value,
-        provider: document.getElementById('sel-provider').value,
-      });
-      showMessage(data.message, false);
-      refreshStatus();
-    }
-
-    async function stopTest() {
-      const data = await apiCall('/api/stop', 'POST');
-      showMessage(data.message, false);
-      refreshStatus();
-    }
-
-    async function triggerFailover() {
-      const data = await apiCall('/api/trigger', 'POST');
-      showMessage(data.message, false);
-    }
-
-    async function toggleAurora() {
-      const badge = document.getElementById('aurora-badge');
-      const state = badge.textContent;
-      if (state === 'STARTING') { showMessage('Aurora is starting, please wait...', true); return; }
-      const isOn = state === 'ON' || state === 'PARTIAL';
-      const url = isOn ? '/api/aurora/off' : '/api/aurora/on';
-      const data = await apiCall(url, 'POST');
-      showMessage(data.message, false);
-      refreshStatus();
-    }
-
-    async function refreshStatus() {
-      try {
-        const data = await apiCall('/api/status', 'GET');
-        const s = data.status;
-        const l = data.lock;
-
-        // ECS
-        const ecsW1 = s.ecs['us-west-1'];
-        const ecsW2 = s.ecs['us-west-2'];
-        document.getElementById('ecs-w1').textContent = ecsW1.running !== null ? ecsW1.running + '/' + ecsW1.desired : 'N/A';
-        document.getElementById('ecs-w2').textContent = ecsW2.running !== null ? ecsW2.running + '/' + ecsW2.desired : 'N/A';
-
-        // Aurora — both regions must be available for "ON"
-        const aw1 = s.aurora['us-west-1'];
-        const aw2 = s.aurora['us-west-2'];
-        document.getElementById('aurora-w1').textContent = aw1;
-        document.getElementById('aurora-w2').textContent = aw2;
-        const bothAvailable = aw1 === 'available' && aw2 === 'available';
-        const anyRunning = aw1 !== 'not-found' || aw2 !== 'not-found';
-        const creating = aw1 === 'creating' || aw2 === 'creating';
-        let badgeText = 'OFF', badgeClass = 'badge-off', btnText = 'Turn ON';
-        if (bothAvailable) { badgeText = 'ON'; badgeClass = 'badge-on'; btnText = 'Turn OFF'; }
-        else if (creating) { badgeText = 'STARTING'; badgeClass = 'badge-warn'; btnText = 'Wait...'; }
-        else if (anyRunning) { badgeText = 'PARTIAL'; badgeClass = 'badge-warn'; btnText = 'Turn OFF'; }
-        document.getElementById('aurora-badge').textContent = badgeText;
-        document.getElementById('aurora-badge').className = 'badge ' + badgeClass;
-        document.getElementById('btn-aurora-toggle').textContent = btnText;
-
-        // EventBridge
-        document.getElementById('eb-w1').textContent = s.eventbridge['us-west-1'];
-        document.getElementById('eb-w2').textContent = s.eventbridge['us-west-2'];
-
-        // State
-        const st = s.state;
-        document.getElementById('fo-state').textContent = st.state || '--';
-        document.getElementById('fo-active').textContent = st.active_region || '--';
-        document.getElementById('fo-latch').textContent = st.latch_engaged !== undefined ? (st.latch_engaged ? 'YES' : 'no') : '--';
-        document.getElementById('fo-failures').textContent = st.consecutive_failures !== undefined ? st.consecutive_failures : '--';
-
-        // Lambda + Backend
-        const verName = s.active_alias_name || ('v' + s.active_version);
-        document.getElementById('lambda-version').textContent = verName + ' (version ' + (s.active_version || '?') + ')';
-        document.getElementById('active-backend').textContent = s.active_backend || 'dynamodb';
-
-        // Lock
-        if (l.locked) {
-          document.getElementById('lock-status').textContent = 'Held by ' + l.locked_by;
-          document.getElementById('lock-status').className = 'lock-held';
-        } else {
-          document.getElementById('lock-status').textContent = 'Free';
-          document.getElementById('lock-status').className = 'lock-free';
-        }
-
-        // Test status
-        const isActive = ecsW1.desired > 0 || ecsW2.desired > 0;
-        const statusEl = document.getElementById('test-status');
-        const configEl = document.getElementById('test-config-display');
-        if (isActive && l.locked) {
-          statusEl.textContent = 'ACTIVE';
-          statusEl.className = 'status-active';
-          try {
-            const cfg = JSON.parse(l.test_config);
-            configEl.textContent = cfg.version + ' / ' + cfg.architecture + ' / ' + cfg.backend;
-          } catch(e) { configEl.textContent = ''; }
-        } else {
-          statusEl.textContent = 'IDLE';
-          statusEl.className = 'status-idle';
-          configEl.textContent = '';
-        }
-
-        // Refresh indicator
-        document.getElementById('refresh-indicator').classList.add('pulse');
-        setTimeout(() => document.getElementById('refresh-indicator').classList.remove('pulse'), 500);
-      } catch (e) {
-        // Silent refresh failure
-      }
-    }
-
-    // Initialize
-    onVersionChange();
-    refreshStatus();
-    setInterval(refreshStatus, 15000);
+    initAdminPage({{ versions | tojson }});
   </script>
 </body>
 </html>
