@@ -105,9 +105,9 @@
     <div class="timeline-section">
       <div class="timeline-header">
         <span class="timeline-title">Event Timeline</span>
-        <div>
-          <span class="elapsed-label">Elapsed</span>
-          <span id="elapsed-timer" class="elapsed-timer">00:00</span>
+        <div style="display:flex; gap:32px; align-items:baseline;">
+          <span><span class="elapsed-label">Detection</span><span id="impact-timer" class="elapsed-timer" style="font-size:16px;">00:00</span></span>
+          <span><span class="elapsed-label">Total Impact</span><span id="elapsed-timer" class="elapsed-timer">00:00</span></span>
         </div>
       </div>
       <div id="timeline-events" class="timeline-events">
@@ -122,6 +122,10 @@
       <button id="btn-inject" class="btn btn-sm btn-danger">
         <span class="spinner"></span>
         <span class="btn-text">Inject Failure</span>
+      </button>
+      <button id="btn-promote" class="btn btn-sm btn-primary">
+        <span class="spinner"></span>
+        <span class="btn-text">Promote Aurora</span>
       </button>
       <button id="btn-failback" class="btn btn-sm">
         <span class="spinner"></span>

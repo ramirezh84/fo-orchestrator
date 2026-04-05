@@ -133,6 +133,30 @@ function initAdminPage(VERSIONS) {
       });
   });
 
+  // Auto-promote toggle
+  document.getElementById('auto-promote-toggle').addEventListener('click', function() {
+    const track = this;
+    const isOn = track.classList.contains('on');
+    const newValue = !isOn;
+
+    track.style.opacity = '0.5';
+    track.style.pointerEvents = 'none';
+
+    apiCall('/api/auto-promote', 'POST', { enabled: newValue })
+      .then(data => {
+        track.classList.toggle('on', newValue);
+        document.getElementById('auto-promote-text').textContent = newValue
+          ? 'On — Aurora will auto-promote after failover'
+          : 'Off — operator must promote Aurora manually';
+        showMessage(msgEl, data.message, false);
+      })
+      .catch(e => showMessage(msgEl, e.message, true))
+      .finally(() => {
+        track.style.opacity = '';
+        track.style.pointerEvents = '';
+      });
+  });
+
   // Status refresh
   async function refreshAdminStatus() {
     try {
@@ -241,11 +265,13 @@ function initAdminPage(VERSIONS) {
 // ── Demo Page ───────────────────────────────────────────────────────────────
 
 function initDemoPage() {
-  let events = [];
-  let lastState = null;
-  let failureInjectedAt = null;
+  // Restore state from sessionStorage (survives page navigation)
+  let events = JSON.parse(sessionStorage.getItem('sentinelfo_events') || '[]');
+  let lastState = sessionStorage.getItem('sentinelfo_lastState') || null;
+  let failureInjectedAt = Number(sessionStorage.getItem('sentinelfo_failureAt')) || null;
   let timerInterval = null;
-  let failoverDetectedAt = null;
+  let failoverDetectedAt = Number(sessionStorage.getItem('sentinelfo_failoverAt')) || null;
+  let impactResolvedAt = Number(sessionStorage.getItem('sentinelfo_impactResolved')) || null;
 
   const eventsContainer = document.getElementById('timeline-events');
   const timerEl = document.getElementById('elapsed-timer');
@@ -258,15 +284,25 @@ function initDemoPage() {
       const data = await apiCall('/api/trigger', 'POST');
       addEvent('Failure injected — ECS scaled to 0 in primary', 'error');
       failureInjectedAt = Date.now();
+      sessionStorage.setItem('sentinelfo_failureAt', failureInjectedAt);
+      impactResolvedAt = null;
+      sessionStorage.removeItem('sentinelfo_impactResolved');
       startTimer();
+    });
+  });
+
+  document.getElementById('btn-promote').addEventListener('click', function() {
+    const btn = this;
+    btnAction(btn, async () => {
+      const data = await apiCall('/api/aurora/promote', 'POST');
+      addEvent('Aurora promotion initiated — ' + (data.message || ''), 'info');
     });
   });
 
   document.getElementById('btn-failback').addEventListener('click', function() {
     const btn = this;
     btnAction(btn, async () => {
-      // Failback is done by calling stop (which resets everything)
-      const data = await apiCall('/api/stop', 'POST');
+      const data = await apiCall('/api/failback', 'POST');
       addEvent('Failback initiated — restoring primary', 'info');
     });
   });
@@ -276,8 +312,15 @@ function initDemoPage() {
     lastState = null;
     failureInjectedAt = null;
     failoverDetectedAt = null;
+    impactResolvedAt = null;
+    sessionStorage.removeItem('sentinelfo_events');
+    sessionStorage.removeItem('sentinelfo_lastState');
+    sessionStorage.removeItem('sentinelfo_failureAt');
+    sessionStorage.removeItem('sentinelfo_failoverAt');
+    sessionStorage.removeItem('sentinelfo_impactResolved');
     stopTimer();
     timerEl.textContent = '00:00';
+    if (document.getElementById('impact-timer')) document.getElementById('impact-timer').textContent = '00:00';
     renderEvents();
   });
 
@@ -290,6 +333,7 @@ function initDemoPage() {
       elapsed = '+' + formatSeconds(diff);
     }
     events.push({ time: timeStr, text, type: type || 'info', elapsed });
+    sessionStorage.setItem('sentinelfo_events', JSON.stringify(events));
     renderEvents();
   }
 
@@ -320,8 +364,15 @@ function initDemoPage() {
     stopTimer();
     timerInterval = setInterval(() => {
       if (failureInjectedAt) {
-        const diff = Math.floor((Date.now() - failureInjectedAt) / 1000);
+        const endTime = impactResolvedAt || Date.now();
+        const diff = Math.floor((endTime - failureInjectedAt) / 1000);
         timerEl.textContent = formatSeconds(diff);
+        // Show detection time separately if we have it
+        const impactEl = document.getElementById('impact-timer');
+        if (impactEl && failoverDetectedAt) {
+          const detDiff = Math.floor((failoverDetectedAt - failureInjectedAt) / 1000);
+          impactEl.textContent = formatSeconds(detDiff);
+        }
       }
     }, 1000);
   }
@@ -419,11 +470,13 @@ function initDemoPage() {
     }
 
     lastState = currentState;
+    sessionStorage.setItem('sentinelfo_lastState', currentState);
   }
 
   function onStateTransition(from, to, s) {
     if (from === 'PRIMARY_ACTIVE' && to === 'WAITING_AURORA_PROMOTION') {
       failoverDetectedAt = Date.now();
+      sessionStorage.setItem('sentinelfo_failoverAt', failoverDetectedAt);
       let detectionTime = '';
       if (failureInjectedAt) {
         const diff = Math.floor((failoverDetectedAt - failureInjectedAt) / 1000);
@@ -432,7 +485,15 @@ function initDemoPage() {
       addEvent('FAILOVER TRIGGERED' + detectionTime + ' — DNS switched to us-west-2', 'error');
       addEvent('Waiting for Aurora promotion...', 'warn');
     } else if (from === 'WAITING_AURORA_PROMOTION' && to === 'SECONDARY_ACTIVE') {
-      addEvent('Aurora promoted — secondary fully active', 'success');
+      impactResolvedAt = Date.now();
+      sessionStorage.setItem('sentinelfo_impactResolved', impactResolvedAt);
+      let impactTime = '';
+      if (failureInjectedAt) {
+        const diff = Math.floor((impactResolvedAt - failureInjectedAt) / 1000);
+        impactTime = ' (total impact: ' + formatSeconds(diff) + ')';
+      }
+      addEvent('Aurora promoted — app fully operational' + impactTime, 'success');
+      stopTimer();
     } else if (to === 'PRIMARY_ACTIVE' && from !== 'PRIMARY_ACTIVE') {
       addEvent('Failback complete — primary is active', 'success');
       stopTimer();
@@ -473,6 +534,14 @@ function initDemoPage() {
   }
 
   renderEvents();
+  // Restart timer if we had an active failure injection
+  if (failureInjectedAt && !impactResolvedAt) {
+    startTimer();
+  } else if (failureInjectedAt && impactResolvedAt) {
+    // Show final time
+    const diff = Math.floor((impactResolvedAt - failureInjectedAt) / 1000);
+    timerEl.textContent = formatSeconds(diff);
+  }
   refreshDemoStatus();
   setInterval(refreshDemoStatus, 5000);
 }

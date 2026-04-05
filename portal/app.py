@@ -209,6 +209,23 @@ def api_trigger():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/auto-promote", methods=["POST"])
+@login_required
+def api_auto_promote():
+    """Toggle AURORA_AUTO_PROMOTE env var on the Lambda."""
+    data = request.get_json() or {}
+    enabled = data.get("enabled", False)
+    try:
+        for region in [aws_ops.PRIMARY_REGION, aws_ops.SECONDARY_REGION]:
+            aws_ops.update_lambda_env(
+                {"AURORA_AUTO_PROMOTE": "true" if enabled else "false"},
+                region
+            )
+        return jsonify({"ok": True, "message": f"Aurora auto-promote {'enabled' if enabled else 'disabled'}"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/aurora/promote", methods=["POST"])
 @login_required
 def api_aurora_promote():
