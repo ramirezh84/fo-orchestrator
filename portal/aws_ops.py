@@ -145,8 +145,8 @@ def create_aurora_instances():
     """
     errors = []
 
-    # Ensure secondary cluster is part of the global cluster
-    rejoin_secondary_to_global()
+    # Ensure secondary cluster exists and is part of the global cluster
+    _ensure_secondary_cluster_in_global()
 
     # Create primary instance first (must exist before secondary instance)
     for region, cluster_id, inst_id in [
@@ -187,126 +187,171 @@ def create_aurora_instances():
 
 
 def delete_aurora_instances():
-    """Delete Aurora instances in both regions.
+    """Delete Aurora instances only. Keep clusters in the global cluster.
 
-    Must delete secondary instance first, then remove secondary cluster
-    from global, then delete primary instance. AWS won't let you delete
-    the last instance of the master cluster while a replica cluster is attached.
+    Deletes secondary instance first, waits, then deletes primary.
+    Does NOT remove clusters from the global — that way create_aurora_instances
+    only needs to create instances, not rebuild clusters.
     """
+    import time
     errors = []
 
-    # Step 1: Delete secondary instance (if exists)
+    # Step 1: Delete secondary instance
     try:
         _client("rds", SECONDARY_REGION).delete_db_instance(
             DBInstanceIdentifier=AURORA_INSTANCE_W2, SkipFinalSnapshot=True
         )
         logger.info("Deleting secondary Aurora instance...")
-        # Wait for deletion
-        try:
-            waiter = _client("rds", SECONDARY_REGION).get_waiter("db_instance_deleted")
-            waiter.wait(DBInstanceIdentifier=AURORA_INSTANCE_W2,
-                        WaiterConfig={"Delay": 15, "MaxAttempts": 60})
-        except Exception:
-            pass  # May already be gone
     except ClientError as e:
         if "DBInstanceNotFound" not in str(e) and "is already being deleted" not in str(e):
             errors.append(f"secondary instance: {e}")
 
-    # Step 2: Remove secondary cluster from global (so primary can be deleted)
-    try:
-        cluster_arn = f"arn:aws:rds:{SECONDARY_REGION}:{ACCOUNT_ID}:cluster:{AURORA_CLUSTER_W2}"
-        _client("rds", SECONDARY_REGION).remove_from_global_cluster(
-            GlobalClusterIdentifier=AURORA_GLOBAL_CLUSTER,
-            DbClusterIdentifier=cluster_arn,
-        )
-        logger.info("Removed secondary cluster from global...")
-        import time
-        # Wait for detach
-        for _ in range(30):
-            try:
-                resp = _client("rds", SECONDARY_REGION).describe_db_clusters(
-                    DBClusterIdentifier=AURORA_CLUSTER_W2
-                )
-                if resp["DBClusters"][0].get("Status") == "available":
-                    # Verify not in global members
-                    g_resp = _client("rds", PRIMARY_REGION).describe_global_clusters(
-                        GlobalClusterIdentifier=AURORA_GLOBAL_CLUSTER
-                    )
-                    members = [m["DBClusterArn"] for m in g_resp["GlobalClusters"][0].get("GlobalClusterMembers", [])]
-                    if cluster_arn not in members:
-                        break
-            except ClientError:
+    # Wait for secondary instance deletion
+    for _ in range(60):
+        try:
+            resp = _client("rds", SECONDARY_REGION).describe_db_instances(
+                DBInstanceIdentifier=AURORA_INSTANCE_W2
+            )
+            status = resp["DBInstances"][0].get("DBInstanceStatus", "") if resp.get("DBInstances") else ""
+            if not status:
                 break
-            time.sleep(5)
-    except ClientError as e:
-        if "is not a member" not in str(e) and "is not found" not in str(e):
-            errors.append(f"detach secondary: {e}")
+            time.sleep(10)
+        except ClientError:
+            break  # Gone
 
-    # Step 3: Delete primary instance
+    # Step 2: Delete primary instance
+    # With secondary instance gone but cluster still in global, we need to
+    # temporarily remove secondary cluster from global to delete primary instance
     try:
         _client("rds", PRIMARY_REGION).delete_db_instance(
             DBInstanceIdentifier=AURORA_INSTANCE_W1, SkipFinalSnapshot=True
         )
         logger.info("Deleting primary Aurora instance...")
     except ClientError as e:
-        if "DBInstanceNotFound" not in str(e) and "is already being deleted" not in str(e):
+        if "Cannot delete the last instance of the master cluster" in str(e):
+            # Need to detach secondary cluster first
+            logger.info("Detaching secondary cluster from global to allow primary deletion...")
+            try:
+                cluster_arn = f"arn:aws:rds:{SECONDARY_REGION}:{ACCOUNT_ID}:cluster:{AURORA_CLUSTER_W2}"
+                _client("rds", SECONDARY_REGION).remove_from_global_cluster(
+                    GlobalClusterIdentifier=AURORA_GLOBAL_CLUSTER,
+                    DbClusterIdentifier=cluster_arn,
+                )
+                # Wait for detach
+                for _ in range(30):
+                    try:
+                        g_resp = _client("rds", PRIMARY_REGION).describe_global_clusters(
+                            GlobalClusterIdentifier=AURORA_GLOBAL_CLUSTER
+                        )
+                        members = [m["DBClusterArn"] for m in g_resp["GlobalClusters"][0].get("GlobalClusterMembers", [])]
+                        if cluster_arn not in members:
+                            break
+                    except ClientError:
+                        break
+                    time.sleep(5)
+                # Retry primary deletion
+                _client("rds", PRIMARY_REGION).delete_db_instance(
+                    DBInstanceIdentifier=AURORA_INSTANCE_W1, SkipFinalSnapshot=True
+                )
+                logger.info("Primary instance deleting after detach...")
+            except ClientError as e2:
+                errors.append(f"primary instance (after detach): {e2}")
+        elif "DBInstanceNotFound" not in str(e) and "is already being deleted" not in str(e):
             errors.append(f"primary instance: {e}")
 
     return errors
 
 
-def rejoin_secondary_to_global():
-    """Rejoin the secondary cluster to the global cluster (after delete_aurora_instances detached it)."""
+def _ensure_secondary_cluster_in_global():
+    """Ensure the secondary cluster exists and is part of the global cluster.
+
+    Handles three states:
+    1. Cluster exists and is in global → nothing to do
+    2. Cluster exists but standalone (detached) → delete it, recreate in global
+    3. Cluster doesn't exist → create it in global
+    """
+    import time
+    cluster_arn = f"arn:aws:rds:{SECONDARY_REGION}:{ACCOUNT_ID}:cluster:{AURORA_CLUSTER_W2}"
+
+    # Check if already in global
     try:
-        cluster_arn = f"arn:aws:rds:{SECONDARY_REGION}:{ACCOUNT_ID}:cluster:{AURORA_CLUSTER_W2}"
-        # Check if already a member
         g_resp = _client("rds", PRIMARY_REGION).describe_global_clusters(
             GlobalClusterIdentifier=AURORA_GLOBAL_CLUSTER
         )
         members = [m["DBClusterArn"] for m in g_resp["GlobalClusters"][0].get("GlobalClusterMembers", [])]
         if cluster_arn in members:
-            return  # Already joined
+            logger.info("Secondary cluster already in global cluster")
+            return
+    except ClientError as e:
+        logger.error(f"Cannot check global cluster: {e}")
+        return
 
-        # Need to delete standalone secondary cluster and recreate it in the global
-        # This is complex - for now, recreate the cluster
+    # Check if cluster exists as standalone (needs to be deleted first)
+    try:
+        _client("rds", SECONDARY_REGION).describe_db_clusters(
+            DBClusterIdentifier=AURORA_CLUSTER_W2
+        )
+        # Exists but not in global — delete it
+        logger.info("Deleting standalone secondary cluster...")
         try:
             _client("rds", SECONDARY_REGION).delete_db_cluster(
                 DBClusterIdentifier=AURORA_CLUSTER_W2, SkipFinalSnapshot=True
             )
-            import time
-            for _ in range(40):
-                try:
-                    _client("rds", SECONDARY_REGION).describe_db_clusters(
-                        DBClusterIdentifier=AURORA_CLUSTER_W2
-                    )
-                    time.sleep(5)
-                except ClientError:
-                    break  # Deleted
+        except ClientError:
+            pass
+        for _ in range(40):
+            try:
+                _client("rds", SECONDARY_REGION).describe_db_clusters(
+                    DBClusterIdentifier=AURORA_CLUSTER_W2
+                )
+                time.sleep(5)
+            except ClientError:
+                break
+    except ClientError:
+        pass  # Doesn't exist — good, we'll create it
 
-            # Get KMS key and subnet group for secondary region
-            kms_key = _client("kms", SECONDARY_REGION).describe_key(
-                KeyId="alias/aws/rds"
-            )["KeyMetadata"]["Arn"]
-            sg_resp = _client("ec2", SECONDARY_REGION).describe_security_groups(
-                Filters=[{"Name": "group-name", "Values": ["*AuroraSG*"]}]
+    # Create secondary cluster in the global
+    logger.info("Creating secondary cluster in global...")
+    kms_key = _client("kms", SECONDARY_REGION).describe_key(
+        KeyId="alias/aws/rds"
+    )["KeyMetadata"]["Arn"]
+    sg_resp = _client("ec2", SECONDARY_REGION).describe_security_groups(
+        Filters=[{"Name": "group-name", "Values": ["*AuroraSG*"]}]
+    )
+    sg_id = sg_resp["SecurityGroups"][0]["GroupId"] if sg_resp["SecurityGroups"] else None
+
+    # Get engine version from the global cluster
+    g_resp = _client("rds", PRIMARY_REGION).describe_global_clusters(
+        GlobalClusterIdentifier=AURORA_GLOBAL_CLUSTER
+    )
+    engine_version = g_resp["GlobalClusters"][0].get("EngineVersion", "17.4")
+
+    kwargs = {
+        "DBClusterIdentifier": AURORA_CLUSTER_W2,
+        "GlobalClusterIdentifier": AURORA_GLOBAL_CLUSTER,
+        "Engine": "aurora-postgresql",
+        "EngineVersion": engine_version,
+        "StorageEncrypted": True,
+        "KmsKeyId": kms_key,
+        "DBSubnetGroupName": "fo-demo-aurora-subnet-group",
+    }
+    if sg_id:
+        kwargs["VpcSecurityGroupIds"] = [sg_id]
+    _client("rds", SECONDARY_REGION).create_db_cluster(**kwargs)
+
+    # Wait for it to be available
+    for _ in range(30):
+        try:
+            resp = _client("rds", SECONDARY_REGION).describe_db_clusters(
+                DBClusterIdentifier=AURORA_CLUSTER_W2
             )
-            sg_id = sg_resp["SecurityGroups"][0]["GroupId"] if sg_resp["SecurityGroups"] else None
-
-            kwargs = {
-                "DBClusterIdentifier": AURORA_CLUSTER_W2,
-                "GlobalClusterIdentifier": AURORA_GLOBAL_CLUSTER,
-                "Engine": "aurora-postgresql",
-                "StorageEncrypted": True,
-                "KmsKeyId": kms_key,
-                "DBSubnetGroupName": "fo-demo-aurora-subnet-group",
-            }
-            if sg_id:
-                kwargs["VpcSecurityGroupIds"] = [sg_id]
-            _client("rds", SECONDARY_REGION).create_db_cluster(**kwargs)
-        except ClientError as e:
-            logger.warning(f"Failed to rejoin secondary: {e}")
-    except ClientError as e:
-        logger.warning(f"Failed to check global membership: {e}")
+            if resp["DBClusters"][0].get("Status") == "available":
+                logger.info("Secondary cluster created and available")
+                return
+        except ClientError:
+            pass
+        time.sleep(10)
+    logger.warning("Timeout waiting for secondary cluster")
 
 
 # ── EventBridge Operations ────────────────────────────────────────────────────
