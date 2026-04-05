@@ -46,9 +46,7 @@ from botocore.exceptions import ClientError
 
 from state_backend import create_backend, S3StateBackend
 
-from ai.config import AI_FAILBACK_READINESS_ENABLED, AI_FAILBACK_STABILITY_WINDOW_MINUTES
-from ai.stability_collector import collect_stability_context
-from ai.failback_readiness import assess_failback_readiness, format_readiness_for_sns
+# AI modules imported lazily inside functions to support v1.0 mode
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -494,16 +492,21 @@ def handler(event, context):
     # Step 2.5: AI Failback Readiness Assessment (non-blocking)
     readiness_appendix = ""
     skip_readiness_check = event.get("skip_readiness_check", False)
-    if AI_FAILBACK_READINESS_ENABLED and not skip_readiness_check:
+    readiness_enabled = os.environ.get("AI_FAILBACK_READINESS_ENABLED", "false").lower() == "true"
+    if readiness_enabled and not skip_readiness_check:
         logger.info("Step 2.5: Running AI failback readiness assessment...")
         try:
+            from ai.stability_collector import collect_stability_context
+            from ai.failback_readiness import assess_failback_readiness, format_readiness_for_sns
+
+            window_minutes = int(os.environ.get("AI_FAILBACK_STABILITY_WINDOW_MINUTES", "15"))
             stability = collect_stability_context(
                 region=target_region,
                 aurora_cluster_id=AURORA_CLUSTER_ID,
                 aurora_global_cluster_id=AURORA_GLOBAL_CLUSTER_ID,
                 ecs_cluster=ECS_CLUSTER_NAME,
                 ecs_service=ECS_SERVICE_NAME,
-                window_minutes=AI_FAILBACK_STABILITY_WINDOW_MINUTES,
+                window_minutes=window_minutes,
             )
             assessment = assess_failback_readiness(stability, region=target_region)
             readiness_appendix = "\n\n" + format_readiness_for_sns(assessment, stability)

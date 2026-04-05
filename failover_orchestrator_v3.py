@@ -55,11 +55,8 @@ from botocore.exceptions import ClientError
 
 from state_backend import create_backend, ConditionalCheckFailedError
 
-from ai.config import AI_RCA_ENABLED, AI_AURORA_ADVISOR_MODE
-from ai.collector import collect_incident_context
-from ai.rca_analyzer import analyze_incident, format_rca_for_sns
-from ai.stability_collector import collect_stability_context
-from ai.aurora_advisor import advise_aurora_promotion, format_advisor_for_sns
+# AI modules are imported lazily inside functions to support v1.0 mode
+# (where AI_RCA_ENABLED=false and AI modules may not be needed)
 
 # ---------------------------------------------------------------------------
 # Configuration - set as Lambda environment variables
@@ -1091,10 +1088,14 @@ def _run_rca_analysis(health_signals: dict) -> str:
     Returns formatted RCA text to append to SNS notifications,
     or empty string if disabled/failed. Never raises.
     """
-    if not AI_RCA_ENABLED:
+    # Read at invocation time so Lambda env var updates take effect
+    if os.environ.get("AI_RCA_ENABLED", "false").lower() != "true":
         return ""
 
     try:
+        from ai.collector import collect_incident_context
+        from ai.rca_analyzer import analyze_incident, format_rca_for_sns
+
         logger.info("AI RCA enabled — collecting incident context")
         context = collect_incident_context(
             region=CURRENT_REGION,
@@ -1125,11 +1126,16 @@ def _run_aurora_advisor(scenario: str) -> tuple:
     recommendation_dict: full advisor output, or None.
     Never raises.
     """
-    if AI_AURORA_ADVISOR_MODE == "disabled":
+    # Read at invocation time so Lambda env var updates take effect
+    advisor_mode = os.environ.get("AI_AURORA_ADVISOR_MODE", "disabled").lower()
+    if advisor_mode == "disabled":
         return "", None
 
     try:
-        logger.info(f"Aurora advisor enabled (mode={AI_AURORA_ADVISOR_MODE}) — collecting stability data")
+        from ai.stability_collector import collect_stability_context
+        from ai.aurora_advisor import advise_aurora_promotion, format_advisor_for_sns
+
+        logger.info(f"Aurora advisor enabled (mode={advisor_mode}) — collecting stability data")
         stability = collect_stability_context(
             region=CURRENT_REGION,
             aurora_cluster_id=AURORA_CLUSTER_ID,

@@ -86,7 +86,7 @@ def switch_active_alias(version_alias, region):
 
 
 def update_lambda_env(env_vars, region):
-    """Update environment variables on both Lambdas."""
+    """Update environment variables on both Lambdas and force cold start."""
     lam = _client("lambda", region)
     for func in [ORCHESTRATOR_LAMBDA, FAILBACK_LAMBDA]:
         try:
@@ -98,9 +98,13 @@ def update_lambda_env(env_vars, region):
             waiter = lam.get_waiter("function_updated_v2")
             waiter.wait(FunctionName=func, WaiterConfig={"Delay": 2, "MaxAttempts": 30})
 
+            # Update env vars — this forces a new Lambda execution environment
+            # (cold start), ensuring config changes take effect immediately
             lam.update_function_configuration(
                 FunctionName=func, Environment={"Variables": existing}
             )
+
+            waiter.wait(FunctionName=func, WaiterConfig={"Delay": 2, "MaxAttempts": 30})
         except ClientError as e:
             logger.warning(f"Failed to update env on {func} in {region}: {e}")
 

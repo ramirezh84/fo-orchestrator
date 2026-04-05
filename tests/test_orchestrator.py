@@ -633,24 +633,24 @@ class TestRCAIntegration:
     """Tests for _run_rca_analysis non-blocking behavior."""
 
     def test_returns_empty_when_disabled(self):
-        with patch.object(orch, "AI_RCA_ENABLED", False):
+        with patch.dict(os.environ, {"AI_RCA_ENABLED": "false"}):
             result = orch._run_rca_analysis({"http": {"healthy": False}})
             assert result == ""
 
-    @patch("failover_orchestrator_v3.format_rca_for_sns", return_value="== RCA ==\nSummary")
-    @patch("failover_orchestrator_v3.analyze_incident", return_value="RCA text")
-    @patch("failover_orchestrator_v3.collect_incident_context", return_value={"signals": {}})
+    @patch("ai.rca_analyzer.format_rca_for_sns", return_value="== RCA ==\nSummary")
+    @patch("ai.rca_analyzer.analyze_incident", return_value="RCA text")
+    @patch("ai.collector.collect_incident_context", return_value={"signals": {}})
     def test_returns_formatted_rca_when_enabled(self, mock_collect, mock_analyze, mock_format):
-        with patch.object(orch, "AI_RCA_ENABLED", True):
+        with patch.dict(os.environ, {"AI_RCA_ENABLED": "true"}):
             result = orch._run_rca_analysis({"http": {"healthy": False}})
             assert "== RCA ==" in result
             mock_collect.assert_called_once()
             mock_analyze.assert_called_once()
 
-    @patch("failover_orchestrator_v3.collect_incident_context", side_effect=Exception("API timeout"))
+    @patch("ai.collector.collect_incident_context", side_effect=Exception("API timeout"))
     def test_returns_empty_on_failure(self, mock_collect):
         """RCA failure is non-blocking — returns empty string, does not raise."""
-        with patch.object(orch, "AI_RCA_ENABLED", True):
+        with patch.dict(os.environ, {"AI_RCA_ENABLED": "true"}):
             result = orch._run_rca_analysis({"http": {"healthy": False}})
             assert result == ""
 
