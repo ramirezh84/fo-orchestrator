@@ -15,7 +15,7 @@ if _root not in sys.path:
 from flask import Flask, redirect, render_template, request, session, url_for, jsonify
 from portal.config import (
     PORTAL_USERNAME, PORTAL_PASSWORD, SECRET_KEY,
-    VERSIONS, ARCHITECTURES, BACKENDS, PROVIDERS, STACKS,
+    VERSIONS, ARCHITECTURES, BACKENDS, PROVIDERS, STACKS, BOTH_REGIONS,
 )
 from portal import aws_ops, lock
 

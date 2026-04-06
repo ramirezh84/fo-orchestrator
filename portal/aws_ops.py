@@ -279,7 +279,10 @@ def start_test(stack_id, version, architecture, backend_unused, provider):
     reset_state(stack_id)
 
     # Step 5: Configure Lambda env vars + alias
-    env_vars = {}
+    # Always explicitly set STATE_BACKEND to prevent contamination from old config
+    env_vars = {"STATE_BACKEND": s["state_backend"]}
+    if s["state_backend"] == "dynamodb":
+        env_vars["STATE_TABLE"] = s["state_table"]
     ver_config = VERSIONS.get(version, {})
     env_vars.update(ver_config.get("env_overrides", {}))
     env_vars["ROUTING_MODE"] = ARCHITECTURES.get(architecture, {}).get("env_overrides", {}).get("ROUTING_MODE", "failover")

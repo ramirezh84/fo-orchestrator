@@ -1345,6 +1345,7 @@ def _reload_dynamic_config():
 
     # Reinitialize state backend (DynamoDB or S3)
     _state_backend = create_backend(region=CURRENT_REGION, client_config=_client_config)
+    logger.info(f"Config reloaded: STATE_BACKEND={os.environ.get('STATE_BACKEND','?')}, backend={type(_state_backend).__name__}")
 
     # Reinitialize remote state backend for S3 CRR
     _REMOTE_STATE_BUCKET = os.environ.get("REMOTE_STATE_BUCKET", "")
