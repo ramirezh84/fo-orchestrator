@@ -4,9 +4,26 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Multi-region failover orchestrator for AWS infrastructure (Deposits 2.0 platform). Lambda-based system that manages automated failover and manual failback between us-west-1 (primary) and us-west-2 (secondary), with a "latch" mechanism to prevent Route 53 from flip-flopping traffic.
+**SentinelFO** (Sentinel Failover Orchestrator) — AI-enhanced multi-region failover platform for AWS infrastructure. Lambda-based system that manages automated failover and manual failback between us-west-1 (primary) and us-west-2 (secondary), with progressive AI intelligence for root cause analysis, failback readiness, and Aurora promotion decisions.
 
 **Core problem solved:** Route 53 failover records are stateless and can flip traffic back and forth rapidly. This system adds a decision layer with consecutive-failure thresholds, cooldowns, and an explicit latch that keeps the old region marked unhealthy until an operator manually runs failback.
+
+### Version History
+
+| Version | Tag | Features |
+|---------|-----|----------|
+| v1.0 | `v1.0` | Core failover: 5-signal health eval, DNS failover, latch, anti-flip-flop, manual failback |
+| v1.1 | `v1.1` | + AI root cause analysis (Claude/Gemini), non-blocking, appended to SNS |
+| v1.2 | `v1.2` | + Failback readiness (GO/NO-GO), Aurora promotion advisor (advisory/guided/autonomous) |
+| v1.2.1 | `v1.2.1` | + Dynamic config reload (`_reload_dynamic_config`), portal compatibility |
+
+### Demo Environment (v2.0 Platform)
+
+Single shared infrastructure controlled by the SentinelFO portal. Aurora and ECS run permanently. Lambda versioning with aliases enables switching between v1.0/v1.1/v1.2 behavior via env vars.
+
+- **Portal:** `python3 portal/app.py` → http://localhost:5001 (login: eramirez)
+- **Lambda aliases:** `v1-0`, `v1-1`, `v1-2`, `active` — all point to the same code (v1.2.1). Version behavior controlled by env vars.
+- **CI/CD:** GitHub Actions runs tests on every PR. Deploy via `python3 tools/publish_version.py --alias v1-2`.
 
 ## Development Process
 
@@ -49,10 +66,18 @@ Before merging any PR:
 
 ## Commands
 
-No build system. Deployment is manual via AWS CLI:
-
 ```bash
-# Package and deploy orchestrator Lambda (include state_backend.py + ai module)
+# Run the full test suite (REQUIRED before every commit)
+python3 -m pytest tests/ -v
+
+# Run the SentinelFO control portal (http://localhost:5001)
+python3 portal/app.py
+
+# Publish Lambda version and update alias (demo environment)
+python3 tools/publish_version.py --alias v1-2
+python3 tools/publish_version.py --alias active --copy-from v1-2
+
+# Package and deploy orchestrator Lambda (production)
 zip failover_orchestrator_v3.zip failover_orchestrator_v3.py state_backend.py ai/__init__.py ai/config.py ai/llm_client.py ai/collector.py ai/rca_analyzer.py ai/stability_collector.py ai/aurora_advisor.py
 aws lambda update-function-code \
   --function-name failover-orchestrator-prod \
@@ -60,16 +85,13 @@ aws lambda update-function-code \
   --region us-west-1
 # Repeat for us-west-2
 
-# Package and deploy failback Lambda (include state_backend.py)
+# Package and deploy failback Lambda (production)
 zip manual_failback_v2.zip manual_failback_v2.py state_backend.py ai/__init__.py ai/config.py ai/llm_client.py ai/stability_collector.py ai/failback_readiness.py
 aws lambda update-function-code \
   --function-name failover-manual-failback-prod \
   --zip-file fileb://manual_failback_v2.zip \
   --region us-west-1
 # Repeat for us-west-2
-
-# Run the full test suite (REQUIRED before every commit)
-python3 -m pytest tests/ -v
 
 # Run the interactive CLI operator tool
 python3 failover_cli.py
@@ -78,7 +100,7 @@ python3 failover_cli.py
 python3 failover_dashboard_local.py
 ```
 
-Runtime dependencies: `boto3`, `botocore` (provided by Lambda runtime). Dashboard requires `flask`.
+Runtime dependencies: `boto3`, `botocore` (provided by Lambda runtime). Portal and dashboard require `flask`.
 
 ## Architecture
 
@@ -98,8 +120,15 @@ Runtime dependencies: `boto3`, `botocore` (provided by Lambda runtime). Dashboar
 | `ai/stability_collector.py` | Time-series stability data: Aurora replication lag, ECS task trends, ALB error rates. |
 | `ai/failback_readiness.py` | LLM-powered GO/NO-GO/CAUTION assessment before failback. |
 | `ai/aurora_advisor.py` | Progressive Aurora promotion advisor: advisory → guided → autonomous modes. |
+| `portal/app.py` | SentinelFO control portal (Flask). Test configuration, activation, demo visualization. |
+| `portal/aws_ops.py` | Portal AWS operations: Lambda alias switching, ECS scaling, Aurora management, state reset. |
+| `portal/config.py` | Portal configuration: version definitions, feature matrix, AWS resource names. |
+| `portal/lock.py` | DynamoDB-based test locking (prevents concurrent tests). |
+| `tools/publish_version.py` | Publish Lambda version and create/update alias. Used by CI/CD and manually. |
 | `tools/setup_s3_state_backend.py` | Infrastructure setup script for S3 CRR backend. |
 | `tools/generate_dashboard.py` | CloudWatch dashboard generator. |
+| `.github/workflows/test.yml` | GitHub Actions: run pytest on every PR to main. |
+| `.github/workflows/deploy.yml` | GitHub Actions: publish Lambda version on tag push. |
 | `tests/test_orchestrator.py` | Regression tests for core orchestrator logic (52 tests). |
 | `tests/test_state_backend.py` | Unit + integration + CRR replication tests for state backends. |
 | `tests/test_e2e_s3_backend.py` | End-to-end scenario tests for S3 backend. |
@@ -113,15 +142,21 @@ Runtime dependencies: `boto3`, `botocore` (provided by Lambda runtime). Dashboar
 | `cfn/aurora.yaml` | CloudFormation: Aurora Global Database cluster. |
 | `cfn/failover.yaml` | CloudFormation: Orchestrator Lambda, EventBridge, CloudWatch alarms, Route 53 health checks. |
 
-### Deployed Infrastructure
+### Deployed Infrastructure (Shared Demo Environment)
 
-| Stack | us-west-1 (primary) | us-west-2 (secondary) |
-|-------|--------------------|-----------------------|
-| `fo-demo-network` | VPC, subnets, NAT | VPC, subnets, NAT |
-| `fo-demo-app` | ECS cluster, ALB, SGs | ECS cluster, ALB, SGs |
-| `fo-demo-failover` | Orchestrator + Failback Lambdas | Orchestrator + Failback Lambdas |
+Single shared infrastructure — no per-scenario duplication. Aurora and ECS run permanently.
+
+| Resource | us-west-1 (primary) | us-west-2 (secondary) |
+|----------|--------------------|-----------------------|
+| CFN: `fo-demo-network` | VPC, subnets, NAT | VPC, subnets, NAT |
+| CFN: `fo-demo-app` | ECS cluster, ALB, SGs | ECS cluster, ALB, SGs |
+| CFN: `fo-demo-failover` | Orchestrator + Failback Lambdas (versioned) | Same (versioned) |
 | DynamoDB | `fo-demo-state` (Global Table) | `fo-demo-state` (replica) |
-| Aurora | `fo-demo-aurora-w1` (writer) | `fo-demo-aurora-w2` (reader) |
+| S3 | `fo-demo-state-us-west-1-*` (CRR) | `fo-demo-state-us-west-2-*` (CRR) |
+| Aurora | `fo-demo-aurora-w1` (writer, db.r6g.large) | `fo-demo-aurora-w2` (reader, db.r6g.large) |
+| Lambda aliases | `v1-0`, `v1-1`, `v1-2`, `active` | Same |
+| EventBridge | `fo-demo-orchestrator-schedule` → `active` alias | Same |
+| SNS | `fo-demo-alerts` (confirmed email subscription) | — |
 
 ### Supported Use Cases
 
@@ -236,6 +271,9 @@ All configuration is via Lambda environment variables. Key variables:
 - **Multi-provider LLM support**: Claude and Gemini are both supported via `AI_RCA_PROVIDER`. Uses urllib (no SDK dependency) for both providers.
 - **Progressive Aurora automation**: Aurora promotion advisor has three modes (advisory → guided → autonomous) so operators can build trust incrementally. Hard guardrails (replication lag, sync status, cluster/instance state) run before the LLM call and cannot be overridden — deterministic safety beats AI confidence.
 - **AI failback readiness is blocking**: Unlike RCA (fire-and-forget), the failback readiness assessment can block a failback with a NO_GO verdict. Operators can override with `skip_readiness_check=true`.
+- **Dynamic config reload** (v1.2.1): `_reload_dynamic_config()` runs at the start of every `handler()` invocation. Re-reads `STATE_BACKEND`, `ROUTING_MODE`, `PASSIVE_PUBLISH_ZERO`, `AURORA_AUTO_PROMOTE` from `os.environ` and reinitializes the state backend. This allows the portal to change Lambda env vars dynamically without requiring a cold start. AI features (`AI_RCA_ENABLED`, `AI_AURORA_ADVISOR_MODE`) use lazy imports — checked at invocation time, imported only when enabled.
+- **Lambda versioning for demos**: One codebase deployed to all aliases (v1-0, v1-1, v1-2, active). Version behavior is controlled by env vars set by the portal. Production deployments use actual git tags (v1.0, v1.1, v1.2) with env vars set at deploy time.
+- **v1.0 is production-stable**: v1.0 code at the `v1.0` git tag must not be modified. If a bug is found, create v1.0.1 with a minimal fix. The demo portal uses v1.2.1 code for all versions — the v1.0 behavior is identical when AI features are disabled via env vars.
 
 ## Operational Notes
 
