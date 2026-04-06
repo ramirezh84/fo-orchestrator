@@ -286,29 +286,45 @@ def start_test(version, architecture, backend, provider):
             f"Click Reset Everything first to switchover Aurora back."
         )
 
-    # Step 3: Verify ECS is running in both regions
-    for region in BOTH_REGIONS:
-        ecs = get_ecs_status(region)
+    # Step 3: Set ECS desired counts based on architecture
+    is_zero_container = architecture == "zero-container"
+    scale_ecs(2, PRIMARY_REGION)
+    if is_zero_container:
+        scale_ecs(0, SECONDARY_REGION)  # Zero-container: secondary starts at 0
+    else:
+        ecs = get_ecs_status(SECONDARY_REGION)
         if ecs["desired"] == 0:
-            scale_ecs(2, region)
+            scale_ecs(2, SECONDARY_REGION)
 
     # Step 4: Reset state BEFORE enabling EventBridge
     reset_state(backend)
 
     # Step 5: Configure Lambda env vars + alias
-    env_vars = {}
+    # Base env vars from version and backend
+    base_env = {}
     ver_config = VERSIONS.get(version, {})
-    env_vars.update(ver_config.get("env_overrides", {}))
-    env_vars.update(ARCHITECTURES.get(architecture, {}).get("env_overrides", {}))
-    env_vars.update(BACKENDS.get(backend, {}).get("env_overrides", {}))
+    base_env.update(ver_config.get("env_overrides", {}))
+    base_env.update(BACKENDS.get(backend, {}).get("env_overrides", {}))
     if ver_config.get("supports_provider") and provider:
         prov = PROVIDERS.get(provider, {})
-        env_vars[prov.get("env_key", "AI_RCA_PROVIDER")] = prov.get("env_value", "claude")
+        base_env[prov.get("env_key", "AI_RCA_PROVIDER")] = prov.get("env_value", "claude")
+
+    # Architecture env vars — PASSIVE_PUBLISH_ZERO is secondary-only
+    arch_config = ARCHITECTURES.get(architecture, {})
+    base_env["ROUTING_MODE"] = arch_config.get("env_overrides", {}).get("ROUTING_MODE", "failover")
 
     ver_alias = ver_config.get("alias", version.replace(".", "-"))
 
     for region in BOTH_REGIONS:
-        region_vars = dict(env_vars)
+        region_vars = dict(base_env)
+
+        # PASSIVE_PUBLISH_ZERO: only set on secondary region
+        if is_zero_container and region == SECONDARY_REGION:
+            region_vars["PASSIVE_PUBLISH_ZERO"] = "true"
+        else:
+            region_vars["PASSIVE_PUBLISH_ZERO"] = "false"
+
+        # S3 backend: per-region bucket names
         if backend == "s3":
             if region == PRIMARY_REGION:
                 region_vars["STATE_BUCKET"] = S3_STATE_BUCKET_W1
@@ -316,6 +332,7 @@ def start_test(version, architecture, backend, provider):
             else:
                 region_vars["STATE_BUCKET"] = S3_STATE_BUCKET_W2
                 region_vars["REMOTE_STATE_BUCKET"] = S3_STATE_BUCKET_W1
+
         set_lambda_env(region_vars, region)
         switch_alias(ver_alias, region)
 
