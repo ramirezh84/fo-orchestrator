@@ -1337,11 +1337,26 @@ def _reload_dynamic_config():
     global ROUTING_MODE, PASSIVE_PUBLISH_ZERO, FAILOVER_MODE
     global _state_backend, _remote_state_backend, _REMOTE_STATE_BUCKET
     global AURORA_AUTO_PROMOTE
+    global HEALTH_ENDPOINT, HEALTH_CHECK_URL, HEALTH_CHECK_TIMEOUT_SECONDS
+    global COOLDOWN_MINUTES, CONSECUTIVE_FAILURES_THRESHOLD
+    global MIN_HEALTHY_HOST_COUNT, API_GW_5XX_THRESHOLD_PERCENT
+    global ACTIVE_REGION_STALE_THRESHOLD_MINUTES
+    global CW_NAMESPACE
 
+    # All dynamic config — re-read from os.environ every invocation
     ROUTING_MODE = os.environ.get("ROUTING_MODE", "failover").lower()
     PASSIVE_PUBLISH_ZERO = os.environ.get("PASSIVE_PUBLISH_ZERO", "false").lower() == "true"
     FAILOVER_MODE = os.environ.get("FAILOVER_MODE", "auto").lower()
     AURORA_AUTO_PROMOTE = os.environ.get("AURORA_AUTO_PROMOTE", "false").lower() == "true"
+    HEALTH_ENDPOINT = os.environ.get("HEALTH_ENDPOINT", "/actuator/health")
+    HEALTH_CHECK_URL = os.environ.get("HEALTH_CHECK_URL", "")
+    HEALTH_CHECK_TIMEOUT_SECONDS = int(os.environ.get("HEALTH_CHECK_TIMEOUT_SECONDS", "5"))
+    COOLDOWN_MINUTES = int(os.environ.get("COOLDOWN_MINUTES", "30"))
+    CONSECUTIVE_FAILURES_THRESHOLD = int(os.environ.get("CONSECUTIVE_FAILURES_THRESHOLD", "3"))
+    MIN_HEALTHY_HOST_COUNT = int(os.environ.get("MIN_HEALTHY_HOST_COUNT", "1"))
+    API_GW_5XX_THRESHOLD_PERCENT = float(os.environ.get("API_GW_5XX_THRESHOLD_PERCENT", "50.0"))
+    ACTIVE_REGION_STALE_THRESHOLD_MINUTES = int(os.environ.get("ACTIVE_REGION_STALE_THRESHOLD_MINUTES", "3"))
+    CW_NAMESPACE = os.environ.get("CW_NAMESPACE", "Custom/RegionFailover")
 
     # Reinitialize state backend (DynamoDB or S3)
     _state_backend = create_backend(region=CURRENT_REGION, client_config=_client_config)
