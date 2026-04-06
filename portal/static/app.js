@@ -53,10 +53,10 @@ function clearMessage(container) {
 
 // ── Admin Page ──────────────────────────────────────────────────────────────
 
-function initAdminPage(VERSIONS) {
+function initAdminPage(VERSIONS, STACK_ID) {
+  const API = '/api/' + STACK_ID;
   const selVersion = document.getElementById('sel-version');
   const selArch = document.getElementById('sel-architecture');
-  const selBackend = document.getElementById('sel-backend');
   const selProvider = document.getElementById('provider-row-select');
   const msgEl = document.getElementById('admin-message');
 
@@ -83,11 +83,10 @@ function initAdminPage(VERSIONS) {
     const btn = this;
     btnAction(btn, async () => {
       clearMessage(msgEl);
-      const data = await apiCall('/api/start', 'POST', {
+      const data = await apiCall(API + '/start', 'POST', {
         version: selVersion.value,
         architecture: selArch.value,
-        backend: selBackend.value,
-        provider: selProvider.value,
+        provider: selProvider ? selProvider.value : 'claude',
       });
       showMessage(msgEl, data.message, false);
       refreshAdminStatus();
@@ -99,7 +98,7 @@ function initAdminPage(VERSIONS) {
     const btn = this;
     btnAction(btn, async () => {
       clearMessage(msgEl);
-      const data = await apiCall('/api/stop', 'POST');
+      const data = await apiCall(API + '/stop', 'POST');
       showMessage(msgEl, data.message, false);
       refreshAdminStatus();
     });
@@ -113,7 +112,7 @@ function initAdminPage(VERSIONS) {
       return;
     }
     const isOn = track.classList.contains('on');
-    const url = isOn ? '/api/aurora/off' : '/api/aurora/on';
+    // Aurora ON/OFF removed — Aurora runs permanently
 
     // Create a proxy button for loading state
     track.style.opacity = '0.5';
@@ -139,7 +138,7 @@ function initAdminPage(VERSIONS) {
     if (!confirm('Reset everything? This will stop the test, switchover Aurora to primary if needed, and reset all state.')) return;
     btnAction(btn, async () => {
       clearMessage(msgEl);
-      const data = await apiCall('/api/reset', 'POST');
+      const data = await apiCall(API + '/reset', 'POST');
       showMessage(msgEl, data.message, false);
       refreshAdminStatus();
     });
@@ -154,7 +153,7 @@ function initAdminPage(VERSIONS) {
     track.style.opacity = '0.5';
     track.style.pointerEvents = 'none';
 
-    apiCall('/api/auto-promote', 'POST', { enabled: newValue })
+    apiCall(API + '/auto-promote', 'POST', { enabled: newValue })
       .then(data => {
         track.classList.toggle('on', newValue);
         document.getElementById('auto-promote-text').textContent = newValue
@@ -172,7 +171,7 @@ function initAdminPage(VERSIONS) {
   // Status refresh
   async function refreshAdminStatus() {
     try {
-      const data = await apiCall('/api/status', 'GET');
+      const data = await apiCall(API + '/status', 'GET');
       const s = data.status;
       const l = data.lock;
 
@@ -280,28 +279,30 @@ function initAdminPage(VERSIONS) {
 
 // ── Demo Page ───────────────────────────────────────────────────────────────
 
-function initDemoPage() {
-  // Persistent state (survives page navigation)
-  let events = JSON.parse(sessionStorage.getItem('sfo_events') || '[]');
-  let lastState = sessionStorage.getItem('sfo_lastState') || null;
-  let lastFailures = Number(sessionStorage.getItem('sfo_lastFailures') || '0');
-  let failureAt = Number(sessionStorage.getItem('sfo_failureAt')) || 0;
-  let failoverAt = Number(sessionStorage.getItem('sfo_failoverAt')) || 0;
-  let auroraAt = Number(sessionStorage.getItem('sfo_auroraAt')) || 0;
-  let resolvedAt = Number(sessionStorage.getItem('sfo_resolvedAt')) || 0;
+function initDemoPage(STACK_ID) {
+  var API = '/api/' + STACK_ID;
+  // Persistent state (survives page navigation, per-stack)
+  var SK = 'sfo_' + STACK_ID + '_';
+  let events = JSON.parse(sessionStorage.getItem(SK + 'events') || '[]');
+  let lastState = sessionStorage.getItem(SK + 'lastState') || null;
+  let lastFailures = Number(sessionStorage.getItem(SK + 'lastFailures') || '0');
+  let failureAt = Number(sessionStorage.getItem(SK + 'failureAt')) || 0;
+  let failoverAt = Number(sessionStorage.getItem(SK + 'failoverAt')) || 0;
+  let auroraAt = Number(sessionStorage.getItem(SK + 'auroraAt')) || 0;
+  let resolvedAt = Number(sessionStorage.getItem(SK + 'resolvedAt')) || 0;
   let timerInterval = null;
 
   const eventsEl = document.getElementById('timeline-events');
   const stateBadge = document.getElementById('state-badge');
 
   function save() {
-    sessionStorage.setItem('sfo_events', JSON.stringify(events));
-    sessionStorage.setItem('sfo_lastState', lastState || '');
-    sessionStorage.setItem('sfo_lastFailures', lastFailures);
-    sessionStorage.setItem('sfo_failureAt', failureAt);
-    sessionStorage.setItem('sfo_failoverAt', failoverAt);
-    sessionStorage.setItem('sfo_auroraAt', auroraAt);
-    sessionStorage.setItem('sfo_resolvedAt', resolvedAt);
+    sessionStorage.setItem(SK + 'events', JSON.stringify(events));
+    sessionStorage.setItem(SK + 'lastState', lastState || '');
+    sessionStorage.setItem(SK + 'lastFailures', lastFailures);
+    sessionStorage.setItem(SK + 'failureAt', failureAt);
+    sessionStorage.setItem(SK + 'failoverAt', failoverAt);
+    sessionStorage.setItem(SK + 'auroraAt', auroraAt);
+    sessionStorage.setItem(SK + 'resolvedAt', resolvedAt);
   }
 
   function fmt(s) {
@@ -363,7 +364,7 @@ function initDemoPage() {
   // Buttons
   document.getElementById('btn-inject').addEventListener('click', function() {
     btnAction(this, async () => {
-      await apiCall('/api/trigger', 'POST');
+      await apiCall(API + '/trigger', 'POST');
       failureAt = Date.now(); failoverAt = 0; auroraAt = 0; resolvedAt = 0;
       addEvent('Failure injected — ECS scaling to 0 in primary', 'error');
       addEvent('Health checks will detect failure in ~60-120s (3 consecutive)', 'warn');
@@ -373,14 +374,14 @@ function initDemoPage() {
 
   document.getElementById('btn-promote').addEventListener('click', function() {
     btnAction(this, async () => {
-      const data = await apiCall('/api/aurora/promote', 'POST');
+      const data = await apiCall(API + '/aurora/promote', 'POST');
       addEvent('Aurora promotion initiated: ' + (data.message || ''), 'info');
     });
   });
 
   document.getElementById('btn-failback').addEventListener('click', function() {
     btnAction(this, async () => {
-      const data = await apiCall('/api/failback', 'POST');
+      const data = await apiCall(API + '/failback', 'POST');
       addEvent('Failback initiated', 'info');
     });
   });
@@ -520,7 +521,7 @@ function initDemoPage() {
 
   async function poll() {
     try {
-      const data = await apiCall('/api/status', 'GET');
+      const data = await apiCall(API + '/status', 'GET');
       update(data.status);
     } catch(e) {}
   }

@@ -12,8 +12,11 @@
     <div class="topbar-left">
       <a href="/" class="topbar-brand">Sentinel<span>FO</span></a>
       <nav class="topbar-nav">
-        <a href="/" class="active">Admin</a>
-        <a href="/demo">Demo</a>
+        <a href="/">Home</a>
+        {% for sid, s in stacks.items() %}
+        <a href="/{{ sid }}" {% if sid == stack_id %}class="active"{% endif %}>{{ s.name }}</a>
+        {% endfor %}
+        <a href="/{{ stack_id }}/demo">Demo</a>
       </nav>
     </div>
     <div class="topbar-right">
@@ -58,13 +61,6 @@
           <select id="sel-architecture">
             {% for key, arch in architectures.items() %}
             <option value="{{ key }}">{{ arch.name }} &mdash; {{ arch.description }}</option>
-            {% endfor %}
-          </select>
-
-          <label>Backend</label>
-          <select id="sel-backend">
-            {% for key, be in backends.items() %}
-            <option value="{{ key }}">{{ be.name }}</option>
             {% endfor %}
           </select>
 
@@ -153,7 +149,8 @@
 
   <script src="{{ url_for('static', filename='app.js') }}"></script>
   <script>
-    initAdminPage({{ versions | tojson }});
+    var STACK_ID = {{ stack_id | tojson }};
+    initAdminPage({{ versions | tojson }}, STACK_ID);
   </script>
 </body>
 </html>

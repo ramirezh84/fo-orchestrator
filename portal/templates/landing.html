@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SentinelFO</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <div class="topbar">
+    <div class="topbar-left">
+      <a href="/" class="topbar-brand">Sentinel<span>FO</span></a>
+    </div>
+    <div class="topbar-right">
+      <span>{{ username }}</span>
+      <a href="/logout">Sign out</a>
+    </div>
+  </div>
+
+  <div class="admin-content" style="max-width:700px; margin-top:60px;">
+    <h2 style="font-size:20px; font-weight:700; margin-bottom:8px;">Choose Environment</h2>
+    <p style="color:var(--text-muted); margin-bottom:32px;">
+      Each environment has its own Lambdas, ECS service, Aurora cluster, and state store.
+      They run independently and can be tested simultaneously.
+    </p>
+
+    {% for sid, s in stacks.items() %}
+    <a href="/{{ sid }}" style="text-decoration:none; display:block;">
+      <div class="card" style="cursor:pointer; transition:box-shadow 0.15s;">
+        <div class="card-body" style="display:flex; justify-content:space-between; align-items:center;">
+          <div>
+            <div style="font-size:16px; font-weight:600; color:var(--text-primary);">{{ s.name }}</div>
+            <div style="font-size:13px; color:var(--text-muted); margin-top:4px;">{{ s.description }}</div>
+          </div>
+          <div style="font-size:20px; color:var(--text-muted);">&rarr;</div>
+        </div>
+      </div>
+    </a>
+    {% endfor %}
+  </div>
+</body>
+</html>

@@ -1,7 +1,7 @@
-"""AWS operations for the SentinelFO portal.
+"""AWS operations for the SentinelFO portal — stack-aware.
 
-Simplified: Aurora and ECS run permanently. The portal only manages
-Lambda configuration, EventBridge rules, and state resets.
+Every function takes a stack_id ('ddb' or 's3') to select which
+set of AWS resources to operate on. No runtime env var switching.
 """
 
 import json
@@ -14,13 +14,7 @@ from botocore.exceptions import ClientError
 
 from portal.config import (
     PRIMARY_REGION, SECONDARY_REGION, BOTH_REGIONS, ACCOUNT_ID,
-    ORCHESTRATOR_LAMBDA, FAILBACK_LAMBDA,
-    ECS_CLUSTER, ECS_SERVICE,
-    STATE_TABLE,
-    AURORA_GLOBAL_CLUSTER, AURORA_CLUSTER_W1, AURORA_CLUSTER_W2,
-    AURORA_INSTANCE_W1, AURORA_INSTANCE_W2,
-    EVENTBRIDGE_RULE,
-    S3_STATE_BUCKET_W1, S3_STATE_BUCKET_W2,
+    ECS_CLUSTER, SNS_TOPIC_ARN, STACKS,
     VERSIONS, ARCHITECTURES, BACKENDS, PROVIDERS,
 )
 
@@ -31,29 +25,35 @@ def _client(service, region=PRIMARY_REGION):
     return boto3.client(service, region_name=region)
 
 
+def _stk(stack_id):
+    """Get stack config dict."""
+    return STACKS[stack_id]
+
+
 # ── Lambda ──────────────────────────────────────────────────────────────────
 
 
-def get_lambda_aliases(region=PRIMARY_REGION):
+def get_lambda_aliases(stack_id, region=PRIMARY_REGION):
     try:
-        resp = _client("lambda", region).list_aliases(FunctionName=ORCHESTRATOR_LAMBDA)
+        resp = _client("lambda", region).list_aliases(FunctionName=_stk(stack_id)["orchestrator_lambda"])
         return {a["Name"]: a["FunctionVersion"] for a in resp.get("Aliases", [])}
     except ClientError:
         return {}
 
 
-def get_active_version(region=PRIMARY_REGION):
+def get_active_version(stack_id, region=PRIMARY_REGION):
     try:
-        resp = _client("lambda", region).get_alias(FunctionName=ORCHESTRATOR_LAMBDA, Name="active")
+        resp = _client("lambda", region).get_alias(
+            FunctionName=_stk(stack_id)["orchestrator_lambda"], Name="active")
         return resp["FunctionVersion"]
     except ClientError:
         return None
 
 
-def switch_alias(version_alias, region):
-    """Point 'active' alias to the same version as version_alias, per function."""
+def switch_alias(stack_id, version_alias, region):
     lam = _client("lambda", region)
-    for func in [ORCHESTRATOR_LAMBDA, FAILBACK_LAMBDA]:
+    s = _stk(stack_id)
+    for func in [s["orchestrator_lambda"], s["failback_lambda"]]:
         try:
             resp = lam.get_alias(FunctionName=func, Name=version_alias)
             ver = resp["FunctionVersion"]
@@ -68,10 +68,10 @@ def switch_alias(version_alias, region):
                 pass
 
 
-def set_lambda_env(env_vars, region):
-    """Update env vars on both Lambdas. Simple retry on conflict."""
+def set_lambda_env(stack_id, env_vars, region):
     lam = _client("lambda", region)
-    for func in [ORCHESTRATOR_LAMBDA, FAILBACK_LAMBDA]:
+    s = _stk(stack_id)
+    for func in [s["orchestrator_lambda"], s["failback_lambda"]]:
         for attempt in range(5):
             try:
                 resp = lam.get_function_configuration(FunctionName=func)
@@ -93,9 +93,10 @@ def set_lambda_env(env_vars, region):
 # ── ECS ─────────────────────────────────────────────────────────────────────
 
 
-def get_ecs_status(region):
+def get_ecs_status(stack_id, region):
     try:
-        resp = _client("ecs", region).describe_services(cluster=ECS_CLUSTER, services=[ECS_SERVICE])
+        resp = _client("ecs", region).describe_services(
+            cluster=ECS_CLUSTER, services=[_stk(stack_id)["ecs_service"]])
         if not resp["services"]:
             return {"running": 0, "desired": 0}
         svc = resp["services"][0]
@@ -104,21 +105,22 @@ def get_ecs_status(region):
         return {"running": 0, "desired": 0}
 
 
-def scale_ecs(desired, region):
-    _client("ecs", region).update_service(cluster=ECS_CLUSTER, service=ECS_SERVICE, desiredCount=desired)
+def scale_ecs(stack_id, desired, region):
+    _client("ecs", region).update_service(
+        cluster=ECS_CLUSTER, service=_stk(stack_id)["ecs_service"], desiredCount=desired)
 
 
 # ── Aurora ──────────────────────────────────────────────────────────────────
 
 
-def get_aurora_status():
+def get_aurora_status(stack_id):
+    s = _stk(stack_id)
     result = {}
     for region, inst_id, cluster_id in [
-        (PRIMARY_REGION, AURORA_INSTANCE_W1, AURORA_CLUSTER_W1),
-        (SECONDARY_REGION, AURORA_INSTANCE_W2, AURORA_CLUSTER_W2),
+        (PRIMARY_REGION, s["aurora_instance_w1"], s["aurora_cluster_w1"]),
+        (SECONDARY_REGION, s["aurora_instance_w2"], s["aurora_cluster_w2"]),
     ]:
-        status = "not-found"
-        role = "unknown"
+        status, role = "not-found", "unknown"
         try:
             resp = _client("rds", region).describe_db_instances(DBInstanceIdentifier=inst_id)
             if resp.get("DBInstances"):
@@ -126,36 +128,31 @@ def get_aurora_status():
         except ClientError:
             pass
         try:
-            c_resp = _client("rds", region).describe_db_clusters(DBClusterIdentifier=cluster_id)
-            if c_resp.get("DBClusters"):
-                repl_src = c_resp["DBClusters"][0].get("ReplicationSourceIdentifier", "")
-                role = "reader" if repl_src else "writer"
+            c = _client("rds", region).describe_db_clusters(DBClusterIdentifier=cluster_id)
+            if c.get("DBClusters"):
+                role = "reader" if c["DBClusters"][0].get("ReplicationSourceIdentifier") else "writer"
         except ClientError:
             pass
         result[region] = {"status": status, "role": role}
     return result
 
 
-def promote_aurora():
-    """Switchover Aurora to whichever region is currently the reader."""
-    aurora = get_aurora_status()
+def promote_aurora(stack_id):
+    s = _stk(stack_id)
+    aurora = get_aurora_status(stack_id)
     w1_role = aurora.get(PRIMARY_REGION, {}).get("role", "unknown")
     w2_role = aurora.get(SECONDARY_REGION, {}).get("role", "unknown")
-
     if w2_role == "reader":
-        target_arn = f"arn:aws:rds:{SECONDARY_REGION}:{ACCOUNT_ID}:cluster:{AURORA_CLUSTER_W2}"
+        target_arn = f"arn:aws:rds:{SECONDARY_REGION}:{ACCOUNT_ID}:cluster:{s['aurora_cluster_w2']}"
         target_name = "us-west-2"
     elif w1_role == "reader":
-        target_arn = f"arn:aws:rds:{PRIMARY_REGION}:{ACCOUNT_ID}:cluster:{AURORA_CLUSTER_W1}"
+        target_arn = f"arn:aws:rds:{PRIMARY_REGION}:{ACCOUNT_ID}:cluster:{s['aurora_cluster_w1']}"
         target_name = "us-west-1"
     else:
         return {"ok": False, "error": f"Cannot determine reader (w1={w1_role}, w2={w2_role})"}
-
     try:
         _client("rds", PRIMARY_REGION).switchover_global_cluster(
-            GlobalClusterIdentifier=AURORA_GLOBAL_CLUSTER,
-            TargetDbClusterIdentifier=target_arn,
-        )
+            GlobalClusterIdentifier=s["aurora_global"], TargetDbClusterIdentifier=target_arn)
         return {"ok": True, "message": f"Aurora switchover initiated to {target_name}"}
     except ClientError as e:
         return {"ok": False, "error": str(e)}
@@ -164,21 +161,21 @@ def promote_aurora():
 # ── EventBridge ─────────────────────────────────────────────────────────────
 
 
-def get_eventbridge_state(region):
+def get_eventbridge_state(stack_id, region):
     try:
-        resp = _client("events", region).describe_rule(Name=EVENTBRIDGE_RULE)
+        resp = _client("events", region).describe_rule(Name=_stk(stack_id)["eventbridge_rule"])
         return resp.get("State", "UNKNOWN")
     except ClientError:
         return "NOT_FOUND"
 
 
-def enable_eventbridge(region):
-    _client("events", region).enable_rule(Name=EVENTBRIDGE_RULE)
+def enable_eventbridge(stack_id, region):
+    _client("events", region).enable_rule(Name=_stk(stack_id)["eventbridge_rule"])
 
 
-def disable_eventbridge(region):
+def disable_eventbridge(stack_id, region):
     try:
-        _client("events", region).disable_rule(Name=EVENTBRIDGE_RULE)
+        _client("events", region).disable_rule(Name=_stk(stack_id)["eventbridge_rule"])
     except ClientError:
         pass
 
@@ -186,31 +183,17 @@ def disable_eventbridge(region):
 # ── State ───────────────────────────────────────────────────────────────────
 
 
-def get_failover_state(backend=None):
-    if backend is None:
-        backend = _get_active_backend()
-    if backend == "s3":
-        return _get_state_s3()
-    return _get_state_ddb()
+def get_failover_state(stack_id):
+    s = _stk(stack_id)
+    if s["state_backend"] == "s3":
+        return _get_state_s3(s["s3_bucket_w1"])
+    return _get_state_ddb(s["state_table"])
 
 
-def _get_active_backend():
-    try:
-        from portal.lock import get_lock_status
-        info = get_lock_status()
-        if info.get("locked") and info.get("test_config"):
-            cfg = json.loads(info["test_config"])
-            return cfg.get("backend", "dynamodb")
-    except Exception:
-        pass
-    return "dynamodb"
-
-
-def _get_state_ddb():
+def _get_state_ddb(table):
     try:
         resp = _client("dynamodb", PRIMARY_REGION).get_item(
-            TableName=STATE_TABLE, Key={"pk": {"S": "REGION_STATE"}}, ConsistentRead=True
-        )
+            TableName=table, Key={"pk": {"S": "REGION_STATE"}}, ConsistentRead=True)
         item = resp.get("Item")
         if not item:
             return {}
@@ -224,33 +207,33 @@ def _get_state_ddb():
         return {}
 
 
-def _get_state_s3():
+def _get_state_s3(bucket):
     try:
         resp = _client("s3", PRIMARY_REGION).get_object(
-            Bucket=S3_STATE_BUCKET_W1, Key="failover-state/REGION_STATE.json"
-        )
+            Bucket=bucket, Key="failover-state/REGION_STATE.json")
         return json.loads(resp["Body"].read().decode("utf-8"))
     except ClientError:
         return {}
 
 
-def reset_state(backend="dynamodb"):
+def reset_state(stack_id):
+    s = _stk(stack_id)
     now = datetime.now(timezone.utc).isoformat()
-    if backend == "s3":
+    if s["state_backend"] == "s3":
         data = {"active_region": PRIMARY_REGION, "state": "PRIMARY_ACTIVE",
                 "latch_engaged": False, "consecutive_failures": 0,
                 "last_failover_ts": "1970-01-01T00:00:00Z", "last_updated": now}
-        try:
-            _client("s3", PRIMARY_REGION).put_object(
-                Bucket=S3_STATE_BUCKET_W1, Key="failover-state/REGION_STATE.json",
-                Body=json.dumps(data).encode("utf-8"), ContentType="application/json"
-            )
-        except ClientError:
-            pass
+        for bucket in [s["s3_bucket_w1"], s["s3_bucket_w2"]]:
+            try:
+                _client("s3", PRIMARY_REGION).put_object(
+                    Bucket=bucket, Key="failover-state/REGION_STATE.json",
+                    Body=json.dumps(data).encode("utf-8"), ContentType="application/json")
+            except ClientError:
+                pass
     else:
         try:
             _client("dynamodb", PRIMARY_REGION).put_item(
-                TableName=STATE_TABLE,
+                TableName=s["state_table"],
                 Item={
                     "pk": {"S": "REGION_STATE"}, "active_region": {"S": PRIMARY_REGION},
                     "state": {"S": "PRIMARY_ACTIVE"}, "latch_engaged": {"BOOL": False},
@@ -258,8 +241,7 @@ def reset_state(backend="dynamodb"):
                     "last_failover_ts": {"S": "1970-01-01T00:00:00Z"},
                     "last_updated": {"S": now}, "cooldown_reset": {"BOOL": False},
                     "last_warning_notification_ts": {"S": "1970-01-01T00:00:00Z"},
-                }
-            )
+                })
         except ClientError:
             pass
 
@@ -267,193 +249,172 @@ def reset_state(backend="dynamodb"):
 # ── Composite Operations ────────────────────────────────────────────────────
 
 
-def start_test(version, architecture, backend, provider):
+def start_test(stack_id, version, architecture, backend_unused, provider):
     """Configure Lambda, reset state, then enable EventBridge.
 
-    Order matters: disable EB first → reset state �� configure Lambda → enable EB.
-    This prevents the orchestrator from writing stale state during configuration.
+    backend_unused: ignored — backend is baked into the stack at deploy time.
     """
-    # Step 1: Ensure EventBridge is OFF (prevent race condition)
+    s = _stk(stack_id)
+
+    # Step 1: Disable EventBridge
     for region in BOTH_REGIONS:
-        disable_eventbridge(region)
+        disable_eventbridge(stack_id, region)
 
     # Step 2: Verify Aurora writer is in primary
-    aurora = get_aurora_status()
-    w1_role = aurora.get(PRIMARY_REGION, {}).get("role", "unknown")
-    if w1_role != "writer":
-        raise RuntimeError(
-            f"Aurora writer is in {SECONDARY_REGION}, not primary. "
-            f"Click Reset Everything first to switchover Aurora back."
-        )
+    aurora = get_aurora_status(stack_id)
+    if aurora.get(PRIMARY_REGION, {}).get("role") != "writer":
+        raise RuntimeError("Aurora writer is not in primary. Click Reset Everything first.")
 
-    # Step 3: Set ECS desired counts based on architecture
+    # Step 3: ECS — primary always 2, secondary depends on architecture
     is_zero_container = architecture == "zero-container"
-    scale_ecs(2, PRIMARY_REGION)
+    scale_ecs(stack_id, 2, PRIMARY_REGION)
     if is_zero_container:
-        scale_ecs(0, SECONDARY_REGION)  # Zero-container: secondary starts at 0
+        scale_ecs(stack_id, 0, SECONDARY_REGION)
     else:
-        ecs = get_ecs_status(SECONDARY_REGION)
+        ecs = get_ecs_status(stack_id, SECONDARY_REGION)
         if ecs["desired"] == 0:
-            scale_ecs(2, SECONDARY_REGION)
+            scale_ecs(stack_id, 2, SECONDARY_REGION)
 
-    # Step 4: Reset state BEFORE enabling EventBridge
-    reset_state(backend)
+    # Step 4: Reset state
+    reset_state(stack_id)
 
     # Step 5: Configure Lambda env vars + alias
-    # Base env vars from version and backend
-    base_env = {}
+    env_vars = {}
     ver_config = VERSIONS.get(version, {})
-    base_env.update(ver_config.get("env_overrides", {}))
-    base_env.update(BACKENDS.get(backend, {}).get("env_overrides", {}))
+    env_vars.update(ver_config.get("env_overrides", {}))
+    env_vars["ROUTING_MODE"] = ARCHITECTURES.get(architecture, {}).get("env_overrides", {}).get("ROUTING_MODE", "failover")
     if ver_config.get("supports_provider") and provider:
         prov = PROVIDERS.get(provider, {})
-        base_env[prov.get("env_key", "AI_RCA_PROVIDER")] = prov.get("env_value", "claude")
-
-    # Architecture env vars — PASSIVE_PUBLISH_ZERO is secondary-only
-    arch_config = ARCHITECTURES.get(architecture, {})
-    base_env["ROUTING_MODE"] = arch_config.get("env_overrides", {}).get("ROUTING_MODE", "failover")
+        env_vars[prov.get("env_key", "AI_RCA_PROVIDER")] = prov.get("env_value", "claude")
 
     ver_alias = ver_config.get("alias", version.replace(".", "-"))
 
     for region in BOTH_REGIONS:
-        region_vars = dict(base_env)
-
-        # PASSIVE_PUBLISH_ZERO: only set on secondary region
+        region_vars = dict(env_vars)
         if is_zero_container and region == SECONDARY_REGION:
             region_vars["PASSIVE_PUBLISH_ZERO"] = "true"
         else:
             region_vars["PASSIVE_PUBLISH_ZERO"] = "false"
+        set_lambda_env(stack_id, region_vars, region)
+        switch_alias(stack_id, ver_alias, region)
 
-        # S3 backend: per-region bucket names
-        if backend == "s3":
-            if region == PRIMARY_REGION:
-                region_vars["STATE_BUCKET"] = S3_STATE_BUCKET_W1
-                region_vars["REMOTE_STATE_BUCKET"] = S3_STATE_BUCKET_W2
-            else:
-                region_vars["STATE_BUCKET"] = S3_STATE_BUCKET_W2
-                region_vars["REMOTE_STATE_BUCKET"] = S3_STATE_BUCKET_W1
-
-        set_lambda_env(region_vars, region)
-        switch_alias(ver_alias, region)
-
-    # Step 6: Enable EventBridge LAST (state is clean, Lambda is configured)
+    # Step 6: Enable EventBridge LAST
     for region in BOTH_REGIONS:
-        enable_eventbridge(region)
+        enable_eventbridge(stack_id, region)
 
 
-def stop_test():
-    """Disable EventBridge, reset state, restore ECS."""
-    backend = _get_active_backend()
+def stop_test(stack_id):
     for region in BOTH_REGIONS:
-        disable_eventbridge(region)
-        scale_ecs(2, region)  # Restore ECS (trigger_failover may have scaled to 0)
-    reset_state(backend)
+        disable_eventbridge(stack_id, region)
+        scale_ecs(stack_id, 2, region)
+    reset_state(stack_id)
 
 
-def trigger_failover():
-    """Inject failure: scale ECS to 0 in primary, reset cooldown."""
-    try:
-        _client("dynamodb", PRIMARY_REGION).update_item(
-            TableName=STATE_TABLE, Key={"pk": {"S": "REGION_STATE"}},
-            UpdateExpression="SET consecutive_failures = :zero, last_failover_ts = :epoch, cooldown_reset = :t",
-            ExpressionAttributeValues={
-                ":zero": {"N": "0"}, ":epoch": {"S": "1970-01-01T00:00:00Z"}, ":t": {"BOOL": True}
-            }
-        )
-    except ClientError:
-        pass
-    scale_ecs(0, PRIMARY_REGION)
+def trigger_failover(stack_id):
+    s = _stk(stack_id)
+    # Reset cooldown in DynamoDB (works for DDB stack; S3 stack reads from S3 but cooldown reset helps)
+    if s["state_backend"] == "dynamodb":
+        try:
+            _client("dynamodb", PRIMARY_REGION).update_item(
+                TableName=s["state_table"], Key={"pk": {"S": "REGION_STATE"}},
+                UpdateExpression="SET consecutive_failures = :zero, last_failover_ts = :epoch, cooldown_reset = :t",
+                ExpressionAttributeValues={
+                    ":zero": {"N": "0"}, ":epoch": {"S": "1970-01-01T00:00:00Z"}, ":t": {"BOOL": True}})
+        except ClientError:
+            pass
+    else:
+        # S3: overwrite state with reset cooldown
+        state = get_failover_state(stack_id)
+        if state:
+            state["consecutive_failures"] = 0
+            state["last_failover_ts"] = "1970-01-01T00:00:00Z"
+            state["cooldown_reset"] = True
+            try:
+                _client("s3", PRIMARY_REGION).put_object(
+                    Bucket=s["s3_bucket_w1"], Key="failover-state/REGION_STATE.json",
+                    Body=json.dumps(state).encode("utf-8"), ContentType="application/json")
+            except ClientError:
+                pass
+    scale_ecs(stack_id, 0, PRIMARY_REGION)
 
 
-def full_reset():
-    """Stop test, switchover Aurora to primary if needed, reset state, restore ECS."""
+def full_reset(stack_id):
     messages = []
-
-    # Stop test
     for region in BOTH_REGIONS:
-        disable_eventbridge(region)
+        disable_eventbridge(stack_id, region)
     messages.append("EventBridge disabled")
 
-    # Check if Aurora needs switchover
-    aurora = get_aurora_status()
-    w1_role = aurora.get(PRIMARY_REGION, {}).get("role", "unknown")
-    if w1_role == "reader":
+    # Aurora switchover back to primary if needed
+    s = _stk(stack_id)
+    aurora = get_aurora_status(stack_id)
+    if aurora.get(PRIMARY_REGION, {}).get("role") == "reader":
         try:
-            target_arn = f"arn:aws:rds:{PRIMARY_REGION}:{ACCOUNT_ID}:cluster:{AURORA_CLUSTER_W1}"
+            target_arn = f"arn:aws:rds:{PRIMARY_REGION}:{ACCOUNT_ID}:cluster:{s['aurora_cluster_w1']}"
             _client("rds", PRIMARY_REGION).switchover_global_cluster(
-                GlobalClusterIdentifier=AURORA_GLOBAL_CLUSTER,
-                TargetDbClusterIdentifier=target_arn,
-            )
-            messages.append("Aurora switchover to primary initiated (~60s)")
+                GlobalClusterIdentifier=s["aurora_global"], TargetDbClusterIdentifier=target_arn)
+            messages.append("Aurora switchover initiated (~60s)")
             for _ in range(30):
                 try:
                     g = _client("rds", PRIMARY_REGION).describe_global_clusters(
-                        GlobalClusterIdentifier=AURORA_GLOBAL_CLUSTER)
-                    if any(m["IsWriter"] and AURORA_CLUSTER_W1 in m["DBClusterArn"]
+                        GlobalClusterIdentifier=s["aurora_global"])
+                    if any(m["IsWriter"] and s["aurora_cluster_w1"] in m["DBClusterArn"]
                            for m in g["GlobalClusters"][0].get("GlobalClusterMembers", [])):
-                        messages.append("Aurora writer restored to primary")
+                        messages.append("Aurora writer restored")
                         break
                 except ClientError:
                     pass
                 time.sleep(5)
         except ClientError as e:
-            messages.append(f"Aurora switchover: {e}")
+            messages.append(f"Aurora: {e}")
     else:
         messages.append("Aurora already in primary")
 
-    # Reset state
-    reset_state("dynamodb")
-    reset_state("s3")
+    reset_state(stack_id)
     messages.append("State reset")
-
-    # Restore ECS in both regions
     for region in BOTH_REGIONS:
-        scale_ecs(2, region)
-    messages.append("ECS restored to 2 in both regions")
-
+        scale_ecs(stack_id, 2, region)
+    messages.append("ECS restored")
     return {"ok": True, "message": "; ".join(messages)}
 
 
-def invoke_failback(operator):
-    """Invoke the failback Lambda."""
+def invoke_failback(stack_id, operator):
+    s = _stk(stack_id)
     payload = json.dumps({
         "target_region": PRIMARY_REGION, "skip_health_check": False,
-        "operator": operator, "aurora_confirmed": True, "skip_readiness_check": True,
-    })
+        "operator": operator, "aurora_confirmed": True, "skip_readiness_check": True})
     try:
         resp = _client("lambda", PRIMARY_REGION).invoke(
-            FunctionName=f"{FAILBACK_LAMBDA}:active",
-            InvocationType="RequestResponse", Payload=payload.encode("utf-8"),
-        )
+            FunctionName=f"{s['failback_lambda']}:active",
+            InvocationType="RequestResponse", Payload=payload.encode("utf-8"))
         result = json.loads(resp["Payload"].read().decode("utf-8"))
         return {"ok": True, "message": "Failback completed", "result": result}
     except ClientError as e:
         return {"ok": False, "error": str(e)}
 
 
-def get_full_status():
-    aliases = get_lambda_aliases()
-    active_version = get_active_version()
+def get_full_status(stack_id):
+    s = _stk(stack_id)
+    aliases = get_lambda_aliases(stack_id)
+    active_version = get_active_version(stack_id)
     active_alias_name = None
     for name, ver in aliases.items():
         if name != "active" and ver == active_version:
             active_alias_name = name
             break
-
-    backend = _get_active_backend()
     return {
+        "stack": stack_id,
+        "stack_name": s["name"],
         "lambda_aliases": aliases,
         "active_version": active_version,
         "active_alias_name": active_alias_name,
-        "active_backend": backend,
         "ecs": {
-            PRIMARY_REGION: get_ecs_status(PRIMARY_REGION),
-            SECONDARY_REGION: get_ecs_status(SECONDARY_REGION),
+            PRIMARY_REGION: get_ecs_status(stack_id, PRIMARY_REGION),
+            SECONDARY_REGION: get_ecs_status(stack_id, SECONDARY_REGION),
         },
-        "aurora": get_aurora_status(),
+        "aurora": get_aurora_status(stack_id),
         "eventbridge": {
-            PRIMARY_REGION: get_eventbridge_state(PRIMARY_REGION),
-            SECONDARY_REGION: get_eventbridge_state(SECONDARY_REGION),
+            PRIMARY_REGION: get_eventbridge_state(stack_id, PRIMARY_REGION),
+            SECONDARY_REGION: get_eventbridge_state(stack_id, SECONDARY_REGION),
         },
-        "state": get_failover_state(backend),
+        "state": get_failover_state(stack_id),
     }

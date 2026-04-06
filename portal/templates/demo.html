@@ -11,8 +11,11 @@
     <div class="topbar-left">
       <a href="/" class="topbar-brand">Sentinel<span>FO</span></a>
       <nav class="topbar-nav">
-        <a href="/">Admin</a>
-        <a href="/demo" class="active">Demo</a>
+        <a href="/">Home</a>
+        {% for sid, s in stacks.items() %}
+        <a href="/{{ sid }}" {% if sid == stack_id %}{% endif %}>{{ s.name }}</a>
+        {% endfor %}
+        <a href="/{{ stack_id }}/demo" class="active">Demo</a>
       </nav>
     </div>
     <div class="topbar-right">
@@ -164,7 +167,8 @@
 
   <script src="{{ url_for('static', filename='app.js') }}"></script>
   <script>
-    initDemoPage();
+    var STACK_ID = {{ stack_id | tojson }};
+    initDemoPage(STACK_ID);
   </script>
 </body>
 </html>
