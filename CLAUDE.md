@@ -275,6 +275,83 @@ All configuration is via Lambda environment variables. Key variables:
 - **Lambda versioning for demos**: One codebase deployed to all aliases (v1-0, v1-1, v1-2, active). Version behavior is controlled by env vars set by the portal. Production deployments use actual git tags (v1.0, v1.1, v1.2) with env vars set at deploy time.
 - **v1.0 is production-stable**: v1.0 code at the `v1.0` git tag must not be modified. If a bug is found, create v1.0.1 with a minimal fix. The demo portal uses v1.2.1 code for all versions — the v1.0 behavior is identical when AI features are disabled via env vars.
 
+## Prerequisites & Dependency Settings
+
+The following infrastructure must be configured correctly for Vigil to operate. Validate each setting before enabling the orchestrator.
+
+### Route 53
+
+| Setting | Recommended | Why |
+|---------|-------------|-----|
+| Failover record TTL | 60s | Lower TTL = faster DNS propagation after failover. Clients cache the record for this duration. |
+| Health check type | CloudWatch alarm-based | Health check watches the `RegionActiveStatus` CloudWatch alarm (not direct HTTP). Vigil publishes the metric; Route 53 reacts to the alarm state. |
+| Health check `FailureThreshold` | 1-3 | Number of consecutive 30s checks before Route 53 marks unhealthy. Lower = faster switch. With alarm-based checks, 1 is safe since Vigil already applies its own consecutive threshold. |
+| Health check `InsufficientDataHealthStatus` | Unhealthy | If CloudWatch data is missing, treat as unhealthy. Ensures failover fires if the orchestrator Lambda stops running. |
+
+### CloudWatch Alarm (per region)
+
+| Setting | Required Value | Why |
+|---------|---------------|-----|
+| Metric | `RegionActiveStatus` | Published by the orchestrator Lambda every 60s |
+| Namespace | Must match `CW_NAMESPACE` env var | Default: `Custom/RegionFailover`. Demo uses `Custom/FoDemo`. |
+| Dimensions | `Region=<region-name>` | Must match exactly what the orchestrator publishes |
+| Threshold | 0.5 (LessThan) | metric=1.0 = healthy, metric=0.0 = unhealthy |
+| Period | 60 seconds | Matches EventBridge schedule |
+| EvaluationPeriods | 1 | React within one period |
+| TreatMissingData | `breaching` | If the orchestrator stops publishing (Lambda crash, EventBridge disabled), alarm fires → Route 53 marks region unhealthy |
+
+### Application Auto Scaling (zero-container secondary only)
+
+| Setting | Required Value | Why |
+|---------|---------------|-----|
+| Scalable target min | 0 | Allows scale to zero when passive |
+| Scalable target max | N (production task count ceiling) | Must be > 0 to allow scale-up during failover. E.g., 6 if CPU/memory scaling can go up to 6. |
+| `vigil-scale-up` policy | StepScaling, ExactCapacity=N (normal task count) | Attached to alarm **OK** action. Fires when orchestrator claims failover and publishes metric=1. |
+| `vigil-scale-down` policy | StepScaling, ExactCapacity=0 | Attached to alarm **ALARM** action. Fires after failback when orchestrator resumes publishing metric=0. |
+| Existing CPU/memory policies | No changes needed | They remain dormant at desired=0 (nothing to measure). After failover scales to N, they handle load-based scaling normally. |
+
+### EventBridge Rule (per region)
+
+| Setting | Required Value | Why |
+|---------|---------------|-----|
+| Schedule | `rate(1 minute)` | Orchestrator runs every 60 seconds |
+| Target | Lambda alias ARN (e.g., `:active`) | Target the alias, not the base function, to support version switching |
+| State | ENABLED in both regions | Both regions must run the orchestrator — primary evaluates health, secondary monitors staleness |
+
+### Lambda
+
+| Setting | Required Value | Why |
+|---------|---------------|-----|
+| VPC attachment | Same VPC as the application ALB | Lambda must reach the private/internal ALB endpoint for HTTP health checks |
+| Subnets | Private subnets with NAT Gateway | Lambda needs internet access for SNS, CloudWatch, RDS API calls |
+| Timeout | 60 seconds minimum | Health checks + potential AI analysis can take 15-30s |
+| Memory | 256 MB minimum | Sufficient for health evaluation + AI module imports |
+| IAM permissions | `rds:Describe*`, `rds:SwitchoverGlobalCluster`, `rds:FailoverGlobalCluster`, `ecs:Describe*`, `cloudwatch:PutMetricData`, `cloudwatch:GetMetricData`, `sns:Publish`, `dynamodb:GetItem/PutItem/UpdateItem` (or `s3:GetObject/PutObject` for S3 backend), `secretsmanager:GetSecretValue` (for AI features) | Missing permissions cause silent failures — the orchestrator catches errors but skips the failed check |
+
+### Aurora Global Database
+
+| Setting | Required Value | Why |
+|---------|---------------|-----|
+| Global cluster | Must exist with clusters in both regions | Required for auto-promote (switchover/failover API calls) |
+| `AURORA_CLUSTER_ID` env var | Set per region (e.g., `my-cluster-w1` in us-west-1, `my-cluster-w2` in us-west-2) | Orchestrator uses this for health checks. Must match the regional cluster identifier, not the global. |
+| `AURORA_GLOBAL_CLUSTER_ID` env var | Global cluster identifier | Used by auto-promote to find the target cluster ARN in the failover region |
+
+### SNS
+
+| Setting | Required Value | Why |
+|---------|---------------|-----|
+| Topic | Must exist with confirmed email subscription | Unconfirmed subscriptions silently drop notifications |
+| Lambda IAM | `sns:Publish` on the topic ARN | Permission must reference the exact topic ARN |
+| Integration | Mission Control / Netcool (optional) | For incident management enrichment beyond email |
+
+### Application Health Endpoint
+
+| Setting | Recommended | Why |
+|---------|-------------|-----|
+| Endpoint path | `/healthcheck` (simple) or `/deep-healthcheck` (with DB validation) | The orchestrator calls this every 60s. `/deep-healthcheck` with DB validation will detect DB connectivity issues but requires the Aurora endpoint to be correctly configured in the app. `/healthcheck` (app-only, no DB) avoids false positives from DB misconfigurations. |
+| Response time | < 5 seconds | Configurable via `HEALTH_CHECK_TIMEOUT_SECONDS`. Slow endpoints cause the health check to fail. |
+| 503 response | Only when genuinely unhealthy | Any non-2xx response is treated as unhealthy. Ensure maintenance pages or startup delays don't return 503. |
+
 ## Operational Notes
 
 - Lambda must be VPC-attached to reach private ALB endpoints
