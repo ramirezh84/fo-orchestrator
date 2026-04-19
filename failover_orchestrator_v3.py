@@ -953,13 +953,19 @@ def check_active_region_staleness(active_region: str, state: dict) -> dict:
         # Cannot reach active region's CloudWatch - region is likely down
         cw_stale = True
         cw_reason = f"Cannot reach CloudWatch in {active_region}: {str(e)}"
-        logger.error(cw_reason)
+        if heartbeat_stale:
+            logger.error(cw_reason)
+        else:
+            logger.debug(cw_reason)
     except Exception as e:
         # Catch connection timeouts, DNS failures, and any other network errors.
         # These are not ClientError - they're lower-level socket/connection issues.
         cw_stale = True
         cw_reason = f"Cross-region CW call failed ({type(e).__name__}): {str(e)}"
-        logger.error(cw_reason)
+        if heartbeat_stale:
+            logger.error(cw_reason)
+        else:
+            logger.debug(cw_reason)
 
     # -----------------------------------------------------------------------
     # Decision: stale if BOTH methods agree the active region is down.
