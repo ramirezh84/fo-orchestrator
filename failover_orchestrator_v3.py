@@ -111,6 +111,7 @@ API_GW_NAME = os.environ.get("API_GW_NAME", "")
 # ---------------------------------------------------------------------------
 APP_LOG_GROUP = os.environ.get("APP_LOG_GROUP", "")
 AURORA_CLUSTER_ID = os.environ.get("AURORA_CLUSTER_ID", "")
+TARGET_AURORA_CLUSTER_ID = os.environ.get("TARGET_AURORA_CLUSTER_ID", "")
 AURORA_GLOBAL_CLUSTER_ID = os.environ.get("AURORA_GLOBAL_CLUSTER_ID", "")
 
 # ---------------------------------------------------------------------------
@@ -389,15 +390,13 @@ def _get_aurora_cluster_arn_in_region(target_region: str) -> Optional[str]:
     """
     Return the Aurora cluster ARN for the target region.
 
-    Queries the global cluster to find the correct member ARN for the target
-    region. This handles the case where primary and secondary clusters have
-    different identifiers (e.g., fo-demo-aurora-w1 vs fo-demo-aurora-w2).
+    Priority:
+      1. Query describe_global_clusters (most robust if allowed)
+      2. Use explicit TARGET_AURORA_CLUSTER_ID if provided
+      3. Fallback to suffix-swapping logic
     """
     if not AURORA_GLOBAL_CLUSTER_ID:
-        # Fallback: construct from local AURORA_CLUSTER_ID (only works if same name in both regions)
-        if not AURORA_CLUSTER_ID or not _AWS_ACCOUNT_ID:
-            return None
-        return f"arn:aws:rds:{target_region}:{_AWS_ACCOUNT_ID}:cluster:{AURORA_CLUSTER_ID}"
+        return _construct_fallback_arn(target_region)
 
     try:
         resp = rds.describe_global_clusters(GlobalClusterIdentifier=AURORA_GLOBAL_CLUSTER_ID)
@@ -407,12 +406,26 @@ def _get_aurora_cluster_arn_in_region(target_region: str) -> Optional[str]:
                 if f":{target_region}:" in arn:
                     return arn
     except Exception as e:
-        logger.warning(f"Failed to look up Aurora cluster in {target_region}: {e}")
+        logger.warning(f"Failed to look up Aurora cluster via Global Cluster API: {e}")
 
-    # Fallback
-    if AURORA_CLUSTER_ID and _AWS_ACCOUNT_ID:
-        return f"arn:aws:rds:{target_region}:{_AWS_ACCOUNT_ID}:cluster:{AURORA_CLUSTER_ID}"
-    return None
+    # Fallback 1: Explicit target ID from environment
+    if TARGET_AURORA_CLUSTER_ID and _AWS_ACCOUNT_ID:
+        return f"arn:aws:rds:{target_region}:{_AWS_ACCOUNT_ID}:cluster:{TARGET_AURORA_CLUSTER_ID}"
+
+    # Fallback 2: Suffix-swapping logic (last resort)
+    return _construct_fallback_arn(target_region)
+
+
+def _construct_fallback_arn(region: str) -> Optional[str]:
+    """Last resort logic to guess the ARN based on local cluster ID."""
+    if not AURORA_CLUSTER_ID or not _AWS_ACCOUNT_ID:
+        return None
+    target_cluster_id = AURORA_CLUSTER_ID
+    if region == "us-west-2" and target_cluster_id.endswith("-w1"):
+        target_cluster_id = target_cluster_id[:-3] + "-w2"
+    elif region == "us-west-1" and target_cluster_id.endswith("-w2"):
+        target_cluster_id = target_cluster_id[:-3] + "-w1"
+    return f"arn:aws:rds:{region}:{_AWS_ACCOUNT_ID}:cluster:{target_cluster_id}"
 
 
 # ===========================================================================
@@ -979,13 +992,19 @@ def check_active_region_staleness(active_region: str, state: dict) -> dict:
         # Cannot reach active region's CloudWatch - region is likely down
         cw_stale = True
         cw_reason = f"Cannot reach CloudWatch in {active_region}: {str(e)}"
-        logger.error(cw_reason)
+        if heartbeat_stale:
+            logger.error(cw_reason)
+        else:
+            logger.debug(cw_reason)
     except Exception as e:
         # Catch connection timeouts, DNS failures, and any other network errors.
         # These are not ClientError - they're lower-level socket/connection issues.
         cw_stale = True
         cw_reason = f"Cross-region CW call failed ({type(e).__name__}): {str(e)}"
-        logger.error(cw_reason)
+        if heartbeat_stale:
+            logger.error(cw_reason)
+        else:
+            logger.debug(cw_reason)
 
     # -----------------------------------------------------------------------
     # Decision: stale if BOTH methods agree the active region is down.
@@ -1827,9 +1846,15 @@ def _handle_passive_region(state: dict, active_region: str) -> dict:
 
     # -----------------------------------------------------------------
     # LATCH CHECK: Am I the region that was failed away from?
-    # If latch is engaged and I'm not the active region, I must stay
-    # marked as unhealthy so Route 53 doesn't route traffic back here.
     # -----------------------------------------------------------------
+    our_health = evaluate_region_health()
+    current_health_map = state.get("region_health", {})
+    current_health_map[CURRENT_REGION] = {
+        "healthy": our_health["healthy"],
+        "ts": datetime.now(timezone.utc).isoformat()
+    }
+    update_failover_state({"region_health": current_health_map})
+
     if latch_engaged:
         logger.info(
             f"Latch is engaged and I am the PASSIVE region ({CURRENT_REGION}). "
@@ -1837,12 +1862,6 @@ def _handle_passive_region(state: dict, active_region: str) -> dict:
             f"Traffic must stay on {active_region} until manual failback."
         )
         publish_region_health_metric(CURRENT_REGION, False)
-
-        # Still check if the active region is alive - if not, we need to
-        # handle it even though we're latched (the latch means we were
-        # failed away from, but the NEW active region might also go down)
-        # However, if the latch is already engaged, the initial failover
-        # was already handled. We just log and return.
         return {"statusCode": 200, "body": "Latched region, staying marked unhealthy"}
 
     # -----------------------------------------------------------------
@@ -2145,6 +2164,43 @@ def _handle_active_region(state: dict, active_region: str,
     # FAILOVER THRESHOLD REACHED
     # =====================================================================
     target_region = SECONDARY_REGION if active_region == PRIMARY_REGION else PRIMARY_REGION
+
+    # ---------------------------------------------------------------------
+    # DUAL-REGION CIRCUIT BREAKER
+    # Before failing over, check if the target region is actually healthy.
+    # If the target is ALSO unhealthy, we stay in the current region
+    # and alert operators of a global outage to prevent flip-flopping.
+    # ---------------------------------------------------------------------
+    peer_health_info = state.get("region_health", {}).get(target_region, {})
+    peer_healthy = peer_health_info.get("healthy", True)  # Assume healthy if unknown
+    peer_ts_str = peer_health_info.get("ts")
+    
+    is_peer_stale = False
+    if peer_ts_str:
+        peer_ts = datetime.fromisoformat(peer_ts_str.replace("Z", "+00:00"))
+        if now - peer_ts > timedelta(minutes=5):
+            is_peer_stale = True
+
+    if not peer_healthy or is_peer_stale:
+        logger.critical(
+            f"DUAL-REGION OUTAGE DETECTED! Target region {target_region} is "
+            f"{'UNHEALTHY' if not peer_healthy else 'STALE'}. Halting failover."
+        )
+        publish_region_health_metric(CURRENT_REGION, True)  # Desperate attempt to keep DNS somewhere
+        send_notification(
+            subject=f"CRITICAL: Dual-Region Outage Detected ({APP_NAME})",
+            message=(
+                f"Region {CURRENT_REGION} has hit the failover threshold, BUT "
+                f"the target region {target_region} is ALSO unhealthy.\n\n"
+                f"Failover has been HALTED to prevent an infinite loop.\n"
+                f"Manual intervention is REQUIRED immediately.\n\n"
+                f"Current region health: UNHEALTHY\n"
+                f"Target region ({target_region}) health: "
+                f"{'UNHEALTHY' if not peer_healthy else 'STALE (Last heartbeat: ' + peer_ts_str + ')'}\n\n"
+                f"Decision: {health.get('decision_reason', 'N/A')}"
+            ),
+        )
+        return {"statusCode": 200, "body": "Dual-region outage, failover halted"}
 
     # In manual mode, notify but don't execute. The operator reviews
     # the notification and runs a single command to trigger failover.
