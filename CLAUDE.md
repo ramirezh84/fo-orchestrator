@@ -16,6 +16,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | v1.1 | `v1.1` | + AI root cause analysis (Claude/Gemini), non-blocking, appended to SNS |
 | v1.2 | `v1.2` | + Failback readiness (GO/NO-GO), Aurora promotion advisor (advisory/guided/autonomous) |
 | v1.2.1 | `v1.2.1` | + Dynamic config reload (`_reload_dynamic_config`), portal compatibility |
+| v1.3 | `v1.3` | + ElastiCache Global Datastore failover tracking, 6th health signal, combined Aurora+Redis promotion gate |
 
 ### Demo Environment (v2.0 Platform)
 
@@ -137,6 +138,7 @@ Runtime dependencies: `boto3`, `botocore` (provided by Lambda runtime). Portal a
 | `tests/test_stability_collector.py` | Unit tests for stability data collection (19 tests). |
 | `tests/test_failback_readiness.py` | Unit tests for failback readiness assessment (18 tests). |
 | `tests/test_aurora_advisor.py` | Unit tests for Aurora promotion advisor, all phases (32 tests). |
+| `tests/test_elasticache.py` | Unit tests for ElastiCache Global Datastore failover support (25 tests). |
 | `cfn/network.yaml` | CloudFormation: VPC, subnets, NAT Gateway. |
 | `cfn/app.yaml` | CloudFormation: ECS, ALB, security groups, VPC endpoints. |
 | `cfn/aurora.yaml` | CloudFormation: Aurora Global Database cluster. |
@@ -189,12 +191,13 @@ On failback (if AI_FAILBACK_READINESS_ENABLED=true):
 
 ### Health Signal Evaluation
 
-Five signals evaluated with quorum logic (≥50% must fail to declare region unhealthy):
+Six signals evaluated with quorum logic (≥50% must fail to declare region unhealthy):
 1. **HTTP** `/actuator/health` on private ALB — any failure = immediately unhealthy (bypasses quorum)
 2. **ALB** HealthyHostCount ≥ `MIN_HEALTHY_HOST_COUNT`
 3. **ECS** RunningTasks ≥ 50% of desired
 4. **API Gateway** 5xx error rate < `API_GW_5XX_THRESHOLD_PERCENT`
-5. **Aurora** cluster status must be "available"
+5. **Aurora** cluster status must be "available" (includes maintenance statuses like `modifying`, `resetting-master-credentials`)
+6. **ElastiCache** replication group status must be "available" (skipped when `ELASTICACHE_REPLICATION_GROUP_ID` not configured)
 
 ### State Management
 
@@ -214,6 +217,8 @@ JSON file at `s3://<bucket>/failover-state/REGION_STATE.json` with bidirectional
 - `latch_engaged` — prevents flip-flopping; only cleared by failback Lambda
 - `consecutive_failures` — must reach threshold before failover fires
 - `last_failover_ts` — enforces cooldown window
+- `aurora_promotion_pending` — True while Aurora writer promotion is pending
+- `redis_promotion_pending` — True while ElastiCache primary promotion is pending (False when not configured)
 
 ### Anti-Flip-Flop Mechanisms
 
@@ -241,7 +246,12 @@ All configuration is via Lambda environment variables. Key variables:
 | `COOLDOWN_MINUTES` | 30 | Minimum time between failovers |
 | `CONSECUTIVE_FAILURES_THRESHOLD` | 3 | Sustained failures to trigger failover |
 | `AURORA_AUTO_PROMOTE` | false | Auto-promote Aurora or wait for operator |
-| `MIN_HEALTHY_HOST_COUNT` | 1 | Minimum ALB targets |
+| `ELASTICACHE_REPLICATION_GROUP_ID` | (empty) | Local ElastiCache replication group ID (health check signal 6) |
+| `ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID` | (empty) | ElastiCache Global Datastore ID (failover + primary detection) |
+| `ELASTICACHE_AUTO_PROMOTE` | false | Auto-failover ElastiCache Global Datastore on failover |
+| `AURORA_CLUSTER_ID` | (required) | Local Aurora cluster ID (e.g. `fo-demo-aurora-w1`) |
+| `TARGET_AURORA_CLUSTER_ID` | (required) | Peer Aurora cluster ID (e.g. `fo-demo-aurora-w2`) |
+| `AURORA_GLOBAL_CLUSTER_ID` | (required) | Aurora Global Database cluster ID |
 | `API_GW_5XX_THRESHOLD_PERCENT` | 50.0 | Error rate threshold |
 | `ACTIVE_REGION_STALE_THRESHOLD_MINUTES` | 3 | Heartbeat age to declare region failed |
 | `AI_RCA_ENABLED` | false | Enable AI-powered root cause analysis on failover |
@@ -273,6 +283,7 @@ All configuration is via Lambda environment variables. Key variables:
 - **AI failback readiness is blocking**: Unlike RCA (fire-and-forget), the failback readiness assessment can block a failback with a NO_GO verdict. Operators can override with `skip_readiness_check=true`.
 - **Dynamic config reload** (v1.2.1): `_reload_dynamic_config()` runs at the start of every `handler()` invocation. Re-reads `STATE_BACKEND`, `ROUTING_MODE`, `PASSIVE_PUBLISH_ZERO`, `AURORA_AUTO_PROMOTE` from `os.environ` and reinitializes the state backend. This allows the portal to change Lambda env vars dynamically without requiring a cold start. AI features (`AI_RCA_ENABLED`, `AI_AURORA_ADVISOR_MODE`) use lazy imports — checked at invocation time, imported only when enabled.
 - **Lambda versioning for demos**: One codebase deployed to all aliases (v1-0, v1-1, v1-2, active). Version behavior is controlled by env vars set by the portal. Production deployments use actual git tags (v1.0, v1.1, v1.2) with env vars set at deploy time.
+- **ElastiCache Global Datastore tracking** (v1.3): `redis_promotion_pending` state field tracks ElastiCache promotion independently from Aurora. When `ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID` is empty, the field is never set to `True` and existing behavior is unchanged. State transitions to `SECONDARY_ACTIVE` only when both `aurora_promotion_pending` and `redis_promotion_pending` are `False`. Apps poll the S3 state file to determine when all data tier promotions are complete.
 - **v1.0 is production-stable**: v1.0 code at the `v1.0` git tag must not be modified. If a bug is found, create v1.0.1 with a minimal fix. The demo portal uses v1.2.1 code for all versions — the v1.0 behavior is identical when AI features are disabled via env vars.
 
 ## Prerequisites & Dependency Settings
