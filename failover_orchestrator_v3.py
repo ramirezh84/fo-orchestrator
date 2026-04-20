@@ -643,7 +643,13 @@ def check_aurora_cluster_status() -> dict:
                     "reason": "Cluster not found"}
 
         status = clusters[0].get("Status", "unknown")
-        healthy = status in {"available", "backing-up"}
+        # Include transient maintenance statuses where the cluster is still
+        # serving reads/writes (e.g., password reset, parameter changes).
+        healthy = status in {
+            "available", "backing-up", "modifying",
+            "resetting-master-credentials", "upgrading",
+            "maintenance", "renaming",
+        }
         return {
             "signal": "aurora_status",
             "healthy": healthy,
