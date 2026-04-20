@@ -314,6 +314,56 @@ class TestCheckAuroraClusterStatus:
             result = orch.check_aurora_cluster_status()
             assert result["healthy"] is True
 
+    def test_healthy_when_modifying(self):
+        mock_rds = MagicMock()
+        mock_rds.describe_db_clusters.return_value = {
+            "DBClusters": [{"Status": "modifying"}]
+        }
+        with patch.object(orch, "AURORA_CLUSTER_ID", "my-cluster"), \
+             patch.object(orch, "rds", mock_rds):
+            result = orch.check_aurora_cluster_status()
+            assert result["healthy"] is True
+
+    def test_healthy_when_resetting_master_credentials(self):
+        mock_rds = MagicMock()
+        mock_rds.describe_db_clusters.return_value = {
+            "DBClusters": [{"Status": "resetting-master-credentials"}]
+        }
+        with patch.object(orch, "AURORA_CLUSTER_ID", "my-cluster"), \
+             patch.object(orch, "rds", mock_rds):
+            result = orch.check_aurora_cluster_status()
+            assert result["healthy"] is True
+
+    def test_healthy_when_upgrading(self):
+        mock_rds = MagicMock()
+        mock_rds.describe_db_clusters.return_value = {
+            "DBClusters": [{"Status": "upgrading"}]
+        }
+        with patch.object(orch, "AURORA_CLUSTER_ID", "my-cluster"), \
+             patch.object(orch, "rds", mock_rds):
+            result = orch.check_aurora_cluster_status()
+            assert result["healthy"] is True
+
+    def test_healthy_when_maintenance(self):
+        mock_rds = MagicMock()
+        mock_rds.describe_db_clusters.return_value = {
+            "DBClusters": [{"Status": "maintenance"}]
+        }
+        with patch.object(orch, "AURORA_CLUSTER_ID", "my-cluster"), \
+             patch.object(orch, "rds", mock_rds):
+            result = orch.check_aurora_cluster_status()
+            assert result["healthy"] is True
+
+    def test_healthy_when_renaming(self):
+        mock_rds = MagicMock()
+        mock_rds.describe_db_clusters.return_value = {
+            "DBClusters": [{"Status": "renaming"}]
+        }
+        with patch.object(orch, "AURORA_CLUSTER_ID", "my-cluster"), \
+             patch.object(orch, "rds", mock_rds):
+            result = orch.check_aurora_cluster_status()
+            assert result["healthy"] is True
+
     def test_unhealthy_when_failing_over(self):
         mock_rds = MagicMock()
         mock_rds.describe_db_clusters.return_value = {
