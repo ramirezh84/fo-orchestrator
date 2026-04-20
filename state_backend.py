@@ -37,6 +37,8 @@ DEFAULT_STATE_FIELDS = {
     "consecutive_failures": 0,
     "last_active_metric_ts": None,  # Must be set by caller
     "aurora_promotion_pending": False,
+    "redis_promotion_pending": False,
+    "region_health": {},  # Map of region -> {"healthy": bool, "ts": iso_str}
     "last_warning_notification_ts": "1970-01-01T00:00:00Z",
 }
 

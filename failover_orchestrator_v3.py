@@ -126,6 +126,17 @@ AURORA_GLOBAL_CLUSTER_ID = os.environ.get("AURORA_GLOBAL_CLUSTER_ID", "")
 # ---------------------------------------------------------------------------
 AURORA_AUTO_PROMOTE = os.environ.get("AURORA_AUTO_PROMOTE", "false").lower() == "true"
 
+# ---------------------------------------------------------------------------
+# ElastiCache Global Datastore
+# When configured, the orchestrator tracks Redis promotion alongside Aurora.
+# The state field `redis_promotion_pending` gates SECONDARY_ACTIVE transition.
+# When ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID is empty (default), Redis
+# tracking is disabled and existing behavior is unchanged.
+# ---------------------------------------------------------------------------
+ELASTICACHE_REPLICATION_GROUP_ID = os.environ.get("ELASTICACHE_REPLICATION_GROUP_ID", "")
+ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID = os.environ.get("ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID", "")
+ELASTICACHE_AUTO_PROMOTE = os.environ.get("ELASTICACHE_AUTO_PROMOTE", "false").lower() == "true"
+
 # Derive AWS account ID from the SNS topic ARN (arn:aws:sns:region:account:name)
 _AWS_ACCOUNT_ID = SNS_TOPIC_ARN.split(":")[4] if ":" in SNS_TOPIC_ARN else ""
 
@@ -217,6 +228,7 @@ cloudwatch = boto3.client("cloudwatch", region_name=CURRENT_REGION, config=_clie
 sns = boto3.client("sns", region_name=CURRENT_REGION, config=_client_config)
 rds = boto3.client("rds", region_name=CURRENT_REGION, config=_client_config)
 ecs = boto3.client("ecs", region_name=CURRENT_REGION, config=_client_config)
+elasticache_client = boto3.client("elasticache", region_name=CURRENT_REGION, config=_client_config)
 
 # State backend — DynamoDB (default) or S3 (via STATE_BACKEND env var)
 _state_backend = create_backend(region=CURRENT_REGION, client_config=_client_config)
@@ -661,6 +673,32 @@ def check_aurora_cluster_status() -> dict:
         return {"signal": "aurora_status", "healthy": False, "reason": str(e)}
 
 
+def check_elasticache_status() -> dict:
+    """Check ElastiCache replication group is available."""
+    if not ELASTICACHE_REPLICATION_GROUP_ID:
+        return {"signal": "elasticache_status", "healthy": True,
+                "reason": "Not configured, skipping", "skipped": True}
+    try:
+        response = elasticache_client.describe_replication_groups(
+            ReplicationGroupId=ELASTICACHE_REPLICATION_GROUP_ID
+        )
+        rgs = response.get("ReplicationGroups", [])
+        if not rgs:
+            return {"signal": "elasticache_status", "healthy": False,
+                    "reason": "Replication group not found"}
+        status = rgs[0].get("Status", "unknown")
+        healthy = status == "available"
+        return {
+            "signal": "elasticache_status",
+            "healthy": healthy,
+            "value": status,
+            "reason": f"Replication group status={status}",
+        }
+    except ClientError as e:
+        logger.error(f"Error checking ElastiCache: {e}")
+        return {"signal": "elasticache_status", "healthy": False, "reason": str(e)}
+
+
 # ===========================================================================
 # Aggregate Health Evaluation
 # ===========================================================================
@@ -681,6 +719,7 @@ def evaluate_region_health() -> dict:
         check_ecs_running_tasks(),
         check_api_gateway_errors(),
         check_aurora_cluster_status(),
+        check_elasticache_status(),
     ]
 
     all_signals = [http_result] + infra_signals
@@ -754,6 +793,7 @@ def get_failover_state() -> dict:
                 "consecutive_failures": 0,
                 "last_active_metric_ts": datetime.now(timezone.utc).isoformat(),
                 "aurora_promotion_pending": False,
+                "redis_promotion_pending": False,
                 "last_warning_notification_ts": "1970-01-01T00:00:00Z",
             }
             _state_backend.put_state(default_state)
@@ -1361,7 +1401,8 @@ def _reload_dynamic_config():
     """
     global ROUTING_MODE, PASSIVE_PUBLISH_ZERO, FAILOVER_MODE
     global _state_backend, _remote_state_backend, _REMOTE_STATE_BUCKET
-    global AURORA_AUTO_PROMOTE
+    global AURORA_AUTO_PROMOTE, ELASTICACHE_AUTO_PROMOTE
+    global ELASTICACHE_REPLICATION_GROUP_ID, ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID
     global HEALTH_ENDPOINT, HEALTH_CHECK_URL, HEALTH_CHECK_TIMEOUT_SECONDS
     global COOLDOWN_MINUTES, CONSECUTIVE_FAILURES_THRESHOLD
     global MIN_HEALTHY_HOST_COUNT, API_GW_5XX_THRESHOLD_PERCENT
@@ -1373,6 +1414,9 @@ def _reload_dynamic_config():
     PASSIVE_PUBLISH_ZERO = os.environ.get("PASSIVE_PUBLISH_ZERO", "false").lower() == "true"
     FAILOVER_MODE = os.environ.get("FAILOVER_MODE", "auto").lower()
     AURORA_AUTO_PROMOTE = os.environ.get("AURORA_AUTO_PROMOTE", "false").lower() == "true"
+    ELASTICACHE_REPLICATION_GROUP_ID = os.environ.get("ELASTICACHE_REPLICATION_GROUP_ID", "")
+    ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID = os.environ.get("ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID", "")
+    ELASTICACHE_AUTO_PROMOTE = os.environ.get("ELASTICACHE_AUTO_PROMOTE", "false").lower() == "true"
     HEALTH_ENDPOINT = os.environ.get("HEALTH_ENDPOINT", "/actuator/health")
     HEALTH_CHECK_URL = os.environ.get("HEALTH_CHECK_URL", "")
     HEALTH_CHECK_TIMEOUT_SECONDS = int(os.environ.get("HEALTH_CHECK_TIMEOUT_SECONDS", "5"))
@@ -1448,11 +1492,13 @@ def handler(event, context):
     consecutive_failures = int(state.get("consecutive_failures", 0))
     last_failover_ts = state.get("last_failover_ts", "1970-01-01T00:00:00Z")
     aurora_promotion_pending = state.get("aurora_promotion_pending", False)
+    redis_promotion_pending = state.get("redis_promotion_pending", False)
 
     logger.info(
         f"State: active={active_region}, state={current_state}, "
         f"latch={latch_engaged}, failures={consecutive_failures}, "
-        f"aurora_pending={aurora_promotion_pending}, current_region={CURRENT_REGION}"
+        f"aurora_pending={aurora_promotion_pending}, "
+        f"redis_pending={redis_promotion_pending}, current_region={CURRENT_REGION}"
     )
 
     # Skip if a failover or failback is already in progress
@@ -1460,13 +1506,27 @@ def handler(event, context):
         logger.info(f"State is {current_state}, skipping evaluation")
         return {"statusCode": 200, "body": f"Skipping - {current_state}"}
 
-    # If Aurora promotion is pending, send periodic reminders.
-    # Only the Lambda in the NEW active region handles reminders.
-    # The Lambda in the failed region (if it's even running) goes to
-    # the passive handler where the latch keeps it publishing 0.
-    if aurora_promotion_pending and current_state == "WAITING_AURORA_PROMOTION":
+    # If data tier promotion is pending (Aurora and/or ElastiCache), handle
+    # reminders. Only the Lambda in the NEW active region handles this.
+    # The Lambda in the failed region falls through to passive handler.
+    any_promotion_pending = aurora_promotion_pending or redis_promotion_pending
+    if any_promotion_pending and current_state == "WAITING_AURORA_PROMOTION":
         if CURRENT_REGION == active_region:
-            return _handle_aurora_promotion_reminder(state)
+            if aurora_promotion_pending:
+                _handle_aurora_promotion_reminder(state)
+            if redis_promotion_pending:
+                _handle_elasticache_promotion_reminder(state)
+
+            # Re-read state to check if both flags are now cleared
+            state = get_failover_state()
+            aurora_still = state.get("aurora_promotion_pending", False)
+            redis_still = state.get("redis_promotion_pending", False)
+
+            if aurora_still or redis_still:
+                publish_region_health_metric(CURRENT_REGION, True)
+                return {"statusCode": 200, "body": "Waiting for data tier promotion"}
+            # Both cleared — fall through to _handle_active_region which
+            # transitions from WAITING_AURORA_PROMOTION to steady state
         # If we're not the active region, fall through to passive handler
         # which will publish 0 for us (latch is engaged)
 
@@ -1526,6 +1586,7 @@ def _execute_manual_failover() -> dict:
         "initiated_by": "MANUAL_EXECUTE",
         "reason": "Manual failover executed by operator",
         "aurora_promotion_pending": True,
+        "redis_promotion_pending": True if ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID else False,
     })
 
     if not claimed:
@@ -1545,60 +1606,82 @@ def _execute_manual_failover() -> dict:
         publish_region_health_metric(CURRENT_REGION, False)
 
         # Attempt automated Aurora promotion if enabled
+        aurora_auto_done = False
         if os.environ.get("AURORA_AUTO_PROMOTE", "false").lower() == "true":
             aurora_result = _auto_promote_aurora(target_region, "app_failure")
             if aurora_result["success"]:
-                send_notification(
-                    subject=f"FAILOVER EXECUTED: DNS moved to {target_region} - Aurora {aurora_result['method']} initiated",
-                    message=(
-                        f"Manual failover executed by operator.\n\n"
-                        f"From: {active_region}\n"
-                        f"To: {target_region}\n"
-                        f"Time: {now.isoformat()}\n\n"
-                        f"DNS has been moved. Route 53 is now routing traffic to {target_region}.\n\n"
-                        f"Aurora {aurora_result['method']} has been initiated AUTOMATICALLY.\n"
-                        f"Monitor progress with:\n\n"
-                        f"  aws rds describe-db-clusters \\\n"
-                        f"    --db-cluster-identifier {AURORA_CLUSTER_ID} \\\n"
-                        f"    --query 'DBClusters[0].{{Status:Status,ReplicationSource:ReplicationSourceIdentifier}}' \\\n"
-                        f"    --region {target_region}\n\n"
-                        f"Latch is ENGAGED. {active_region} will remain marked unhealthy."
-                    ),
-                )
-                return {
-                    "statusCode": 200,
-                    "body": f"Failover executed with auto Aurora {aurora_result['method']}: {active_region} -> {target_region}",
-                }
+                aurora_auto_done = True
             else:
                 logger.warning(
                     f"Auto Aurora promotion failed: {aurora_result['error']}. "
                     f"Falling back to manual notification."
                 )
 
-        # Manual Aurora promotion (default, or auto-promote failed)
-        aurora_commands = build_aurora_promotion_commands(target_region, "app_failure")
+        # Attempt automated ElastiCache promotion if enabled
+        elasticache_auto_done = False
+        if ELASTICACHE_AUTO_PROMOTE and ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID:
+            ec_result = _auto_promote_elasticache(target_region, "app_failure")
+            if ec_result["success"]:
+                elasticache_auto_done = True
+            else:
+                logger.warning(
+                    f"Auto ElastiCache promotion failed: {ec_result['error']}. "
+                    f"Falling back to manual notification."
+                )
 
-        send_notification(
-            subject=f"FAILOVER EXECUTED: DNS moved to {target_region} - PROMOTE AURORA NOW",
-            message=(
-                f"Manual failover executed by operator.\n\n"
-                f"From: {active_region}\n"
-                f"To: {target_region}\n"
-                f"Time: {now.isoformat()}\n\n"
-                f"DNS has been moved. Route 53 is now routing traffic to {target_region}.\n\n"
-                f"ACTION REQUIRED: Aurora must be promoted MANUALLY.\n"
-                f"Your app in {target_region} CANNOT WRITE until Aurora is promoted.\n\n"
-                f"{aurora_commands}\n\n"
-                f"Latch is ENGAGED. {active_region} will remain marked unhealthy.\n"
-                f"You will receive reminders every "
-                f"{AURORA_PROMOTION_REMINDER_INTERVAL_MINUTES} minutes until "
-                f"Aurora promotion is detected automatically."
-            ),
-        )
+        # Build notification message based on what was auto-promoted
+        auto_parts = []
+        manual_parts = []
+        if aurora_auto_done:
+            auto_parts.append(f"Aurora {aurora_result['method']} initiated AUTOMATICALLY.")
+        else:
+            manual_parts.append(build_aurora_promotion_commands(target_region, "app_failure"))
+
+        if ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID:
+            if elasticache_auto_done:
+                auto_parts.append("ElastiCache failover initiated AUTOMATICALLY.")
+            else:
+                manual_parts.append(build_elasticache_promotion_commands(target_region))
+
+        if auto_parts and not manual_parts:
+            # Everything auto-promoted
+            send_notification(
+                subject=f"FAILOVER EXECUTED: DNS moved to {target_region} - data tier promotion initiated",
+                message=(
+                    f"Manual failover executed by operator.\n\n"
+                    f"From: {active_region}\n"
+                    f"To: {target_region}\n"
+                    f"Time: {now.isoformat()}\n\n"
+                    f"DNS has been moved. Route 53 is now routing traffic to {target_region}.\n\n"
+                    + "\n".join(auto_parts) + "\n\n"
+                    f"Latch is ENGAGED. {active_region} will remain marked unhealthy."
+                ),
+            )
+        else:
+            # Some or all require manual action
+            subject_action = "PROMOTE DATA TIER NOW" if manual_parts else "promotion initiated"
+            send_notification(
+                subject=f"FAILOVER EXECUTED: DNS moved to {target_region} - {subject_action}",
+                message=(
+                    f"Manual failover executed by operator.\n\n"
+                    f"From: {active_region}\n"
+                    f"To: {target_region}\n"
+                    f"Time: {now.isoformat()}\n\n"
+                    f"DNS has been moved. Route 53 is now routing traffic to {target_region}.\n\n"
+                    + (("\n".join(auto_parts) + "\n\n") if auto_parts else "")
+                    + "ACTION REQUIRED: Manual promotion needed.\n"
+                    f"Your app in {target_region} CANNOT WRITE until promotion completes.\n\n"
+                    + "\n".join(manual_parts) + "\n\n"
+                    f"Latch is ENGAGED. {active_region} will remain marked unhealthy.\n"
+                    f"You will receive reminders every "
+                    f"{AURORA_PROMOTION_REMINDER_INTERVAL_MINUTES} minutes until "
+                    f"promotion is detected automatically."
+                ),
+            )
 
         return {
             "statusCode": 200,
-            "body": f"Manual failover executed: {active_region} -> {target_region}. Aurora promotion pending.",
+            "body": f"Manual failover executed: {active_region} -> {target_region}. Data tier promotion pending.",
         }
 
     except Exception as e:
@@ -1607,6 +1690,7 @@ def _execute_manual_failover() -> dict:
             "state": expected_state,
             "consecutive_failures": 0,
             "aurora_promotion_pending": False,
+            "redis_promotion_pending": False,
         })
         send_notification(
             subject=f"MANUAL FAILOVER FAILED: {active_region} -> {target_region}",
@@ -1643,6 +1727,7 @@ def _reset_state() -> dict:
             "consecutive_failures": 0,
             "last_active_metric_ts": now.isoformat(),
             "aurora_promotion_pending": False,
+            "redis_promotion_pending": False,
             "last_warning_notification_ts": "1970-01-01T00:00:00Z",
         }
         _state_backend.put_state(reset_state)
@@ -1741,6 +1826,60 @@ def _handle_aurora_promotion_reminder(state: dict) -> dict:
     return {"statusCode": 200, "body": "Waiting for Aurora promotion"}
 
 
+def _handle_elasticache_promotion_reminder(state: dict) -> dict:
+    """
+    Runs while ElastiCache promotion is pending. Checks every minute whether
+    the ElastiCache Global Datastore has been promoted to this region.
+
+    If the local region is now the primary:
+      - Clears redis_promotion_pending
+      - Sends a confirmation notification
+
+    If not yet promoted:
+      - Sends periodic reminders with manual CLI commands
+    """
+    active_region = state.get("active_region", SECONDARY_REGION)
+    last_failover_ts = state.get("last_failover_ts", "1970-01-01T00:00:00Z")
+    last_ts = datetime.fromisoformat(last_failover_ts.replace("Z", "+00:00"))
+    now = datetime.now(timezone.utc)
+    minutes_since_failover = (now - last_ts).total_seconds() / 60
+
+    redis_promoted = _check_if_elasticache_primary(active_region)
+
+    if redis_promoted:
+        logger.info(
+            f"ElastiCache promotion detected! {active_region} is now the primary. "
+            f"Clearing redis_promotion_pending."
+        )
+        update_failover_state({"redis_promotion_pending": False})
+
+        send_notification(
+            subject=f"ElastiCache promotion confirmed - {active_region} is primary",
+            message=(
+                f"The ElastiCache Global Datastore has been promoted.\n\n"
+                f"Region {active_region} is now the primary.\n"
+                f"redis_promotion_pending has been automatically cleared.\n\n"
+                f"Time: {now.isoformat()}\n"
+                f"Minutes since failover: {int(minutes_since_failover)}"
+            ),
+        )
+        return {"statusCode": 200, "body": "ElastiCache promotion detected and confirmed"}
+
+    # ElastiCache not yet promoted - send periodic reminders
+    if int(minutes_since_failover) % AURORA_PROMOTION_REMINDER_INTERVAL_MINUTES == 0:
+        send_notification(
+            subject=f"REMINDER: ElastiCache promotion still pending ({int(minutes_since_failover)}m)",
+            message=(
+                f"DNS failover to {active_region} occurred {int(minutes_since_failover)} "
+                f"minutes ago but ElastiCache has NOT been promoted yet.\n\n"
+                f"Your app in {active_region} CANNOT WRITE to Redis.\n\n"
+                f"{build_elasticache_promotion_commands(active_region)}"
+            ),
+        )
+
+    return {"statusCode": 200, "body": "Waiting for ElastiCache promotion"}
+
+
 def _check_if_aurora_writer(region: str) -> bool:
     """
     Check if the Aurora cluster in the specified region is the writer
@@ -1829,6 +1968,122 @@ def _auto_promote_aurora(target_region: str, scenario: str) -> dict:
         return {"success": False, "method": "failover", "error": error_msg}
 
 
+def _check_if_elasticache_primary(region: str) -> bool:
+    """
+    Check if the ElastiCache replication group in the specified region
+    is the PRIMARY in the Global Datastore.
+
+    Uses describe_global_replication_groups to find the member whose
+    ReplicationGroupRegion matches `region` and has Role=PRIMARY.
+
+    Returns True if primary, False otherwise.
+    Returns False on any error (safe default - keeps waiting).
+    """
+    if not ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID:
+        return False
+    try:
+        ec_client = boto3.client("elasticache", region_name=region, config=_client_config)
+        response = ec_client.describe_global_replication_groups(
+            GlobalReplicationGroupId=ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID,
+            ShowMemberInfo=True,
+        )
+        for grg in response.get("GlobalReplicationGroups", []):
+            for member in grg.get("Members", []):
+                if member.get("ReplicationGroupRegion") == region:
+                    is_primary = member.get("Role", "").upper() == "PRIMARY"
+                    logger.info(
+                        f"ElastiCache {ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID} "
+                        f"in {region}: Role={member.get('Role')}"
+                    )
+                    return is_primary
+        logger.warning(f"No ElastiCache member found for region {region} in global datastore")
+        return False
+    except ClientError as e:
+        logger.error(f"Error checking ElastiCache primary status: {e}")
+        return False
+
+
+def _get_elasticache_rg_id_in_region(target_region: str) -> str:
+    """
+    Find the ElastiCache replication group ID in the target region by
+    querying the Global Datastore members.
+
+    Returns the ReplicationGroupId string, or empty string if not found.
+    """
+    if not ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID:
+        return ""
+    try:
+        response = elasticache_client.describe_global_replication_groups(
+            GlobalReplicationGroupId=ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID,
+            ShowMemberInfo=True,
+        )
+        for grg in response.get("GlobalReplicationGroups", []):
+            for member in grg.get("Members", []):
+                if member.get("ReplicationGroupRegion") == target_region:
+                    return member.get("ReplicationGroupId", "")
+        logger.warning(f"No ElastiCache member found for region {target_region}")
+        return ""
+    except ClientError as e:
+        logger.error(f"Error looking up ElastiCache RG in {target_region}: {e}")
+        return ""
+
+
+def _auto_promote_elasticache(target_region: str, scenario: str) -> dict:
+    """
+    Automatically failover the ElastiCache Global Datastore to the target region.
+
+    ElastiCache Global Datastore only supports failover (no switchover concept).
+    The API handles async replication gracefully.
+
+    Returns {"success": bool, "method": str, "error": str}
+    """
+    if not ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID:
+        return {"success": False, "method": "none",
+                "error": "ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID not configured"}
+
+    target_rg_id = _get_elasticache_rg_id_in_region(target_region)
+    if not target_rg_id:
+        return {"success": False, "method": "none",
+                "error": f"Cannot determine ElastiCache replication group ID in {target_region}"}
+
+    logger.info(f"Attempting ElastiCache global failover to {target_region} (RG: {target_rg_id})")
+    try:
+        elasticache_client.failover_global_replication_group(
+            GlobalReplicationGroupId=ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID,
+            PrimaryRegion=target_region,
+            PrimaryReplicationGroupId=target_rg_id,
+        )
+        logger.info(f"ElastiCache failover initiated to {target_region}")
+        return {"success": True, "method": "failover", "error": ""}
+    except ClientError as e:
+        error_msg = f"ElastiCache failover failed: {e}"
+        logger.error(error_msg)
+        return {"success": False, "method": "failover", "error": error_msg}
+
+
+def build_elasticache_promotion_commands(target_region: str) -> str:
+    """Build manual CLI commands for ElastiCache Global Datastore failover."""
+    if not ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID:
+        return ""
+    return (
+        "\n"
+        "========================================================================\n"
+        "ELASTICACHE PROMOTION REQUIRED\n"
+        "========================================================================\n"
+        "\n"
+        f"  aws elasticache failover-global-replication-group \\\n"
+        f"    --global-replication-group-id {ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID} \\\n"
+        f"    --primary-region {target_region} \\\n"
+        f"    --primary-replication-group-id <TARGET_RG_ID>\n"
+        "\n"
+        "Monitor progress:\n"
+        f"  aws elasticache describe-global-replication-groups \\\n"
+        f"    --global-replication-group-id {ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID} \\\n"
+        f"    --show-member-info\n"
+        "========================================================================\n"
+    )
+
+
 def _handle_passive_region(state: dict, active_region: str) -> dict:
     """
     Logic for the Lambda running in the PASSIVE region.
@@ -1904,6 +2159,7 @@ def _handle_passive_region(state: dict, active_region: str) -> dict:
             "initiated_by": "AUTO_PASSIVE",
             "reason": f"Region-level failure: {staleness['reason']}",
             "aurora_promotion_pending": True,
+        "redis_promotion_pending": True if ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID else False,
         })
 
         if not claimed:
@@ -1994,26 +2250,34 @@ def _handle_passive_region(state: dict, active_region: str) -> dict:
                         f"Falling back to manual notification."
                     )
 
+            # Attempt automated ElastiCache promotion
+            if ELASTICACHE_AUTO_PROMOTE and ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID:
+                ec_result = _auto_promote_elasticache(target_region, "region_failure")
+                if not ec_result["success"]:
+                    logger.warning(f"Auto ElastiCache promotion failed: {ec_result['error']}")
+
             if not aurora_handled:
                 # Manual Aurora promotion (default, or auto-promote failed)
                 aurora_commands = build_aurora_promotion_commands(
                     target_region, "region_failure"
                 )
+                elasticache_commands = build_elasticache_promotion_commands(target_region)
 
                 send_notification(
-                    subject=f"REGION FAILURE: DNS moved to {target_region} - PROMOTE AURORA NOW",
+                    subject=f"REGION FAILURE: DNS moved to {target_region} - PROMOTE DATA TIER NOW",
                     message=(
                         f"REGION-LEVEL FAILURE DETECTED.\n\n"
                         f"The active region {active_region} has stopped responding.\n"
                         f"DNS has been moved to {target_region}.\n\n"
-                        f"ACTION REQUIRED: Aurora must be promoted MANUALLY.\n"
-                        f"Your app in {target_region} CANNOT WRITE until Aurora is promoted.\n\n"
+                        f"ACTION REQUIRED: Data tier must be promoted MANUALLY.\n"
+                        f"Your app in {target_region} CANNOT WRITE until promotion completes.\n\n"
                         f"Time: {now.isoformat()}\n"
                         f"Detection: {staleness['reason']}\n\n"
-                        f"{aurora_commands}\n\n"
+                        f"{aurora_commands}\n"
+                        f"{elasticache_commands}\n\n"
                         f"You will receive reminders every "
                         f"{AURORA_PROMOTION_REMINDER_INTERVAL_MINUTES} minutes until "
-                        f"Aurora promotion is detected automatically."
+                        f"promotion is detected automatically."
                         f"{advisor_appendix}"
                     ),
                 )
@@ -2090,13 +2354,22 @@ def _handle_active_region(state: dict, active_region: str,
     now = datetime.now(timezone.utc)
     current_state = state.get("state", "PRIMARY_ACTIVE")
 
-    # If we're in WAITING_AURORA_PROMOTION but aurora_promotion_pending is
-    # False, the operator has completed Aurora promotion. Transition to
+    # If we're in WAITING_AURORA_PROMOTION but all promotion flags are cleared,
+    # the operator has completed all data tier promotions. Transition to
     # the appropriate steady state so the system is fully normalized.
     if current_state == "WAITING_AURORA_PROMOTION":
+        aurora_still = state.get("aurora_promotion_pending", False)
+        redis_still = state.get("redis_promotion_pending", False)
+        if aurora_still or redis_still:
+            logger.info(
+                f"Still waiting for data tier promotion: "
+                f"aurora_pending={aurora_still}, redis_pending={redis_still}"
+            )
+            publish_region_health_metric(CURRENT_REGION, True)
+            return {"statusCode": 200, "body": "Data tier promotion still pending"}
         new_state = "SECONDARY_ACTIVE" if active_region == SECONDARY_REGION else "PRIMARY_ACTIVE"
         logger.info(
-            f"Aurora promotion complete, transitioning from "
+            f"Data tier promotion complete, transitioning from "
             f"WAITING_AURORA_PROMOTION to {new_state}"
         )
         update_failover_state({"state": new_state})
@@ -2263,6 +2536,7 @@ def _handle_active_region(state: dict, active_region: str,
         "initiated_by": "AUTO_ACTIVE",
         "reason": f"Auto failover: {health.get('decision_reason', 'N/A')}",
         "aurora_promotion_pending": True,
+        "redis_promotion_pending": True if ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID else False,
     })
 
     if not claimed:
@@ -2363,12 +2637,19 @@ def _handle_active_region(state: dict, active_region: str,
                     f"Falling back to manual notification."
                 )
 
+        # Attempt automated ElastiCache promotion
+        if ELASTICACHE_AUTO_PROMOTE and ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID:
+            ec_result = _auto_promote_elasticache(target_region, "app_failure")
+            if not ec_result["success"]:
+                logger.warning(f"Auto ElastiCache promotion failed: {ec_result['error']}")
+
         if not aurora_handled:
             # Manual Aurora promotion (default, or auto-promote failed)
             aurora_commands = build_aurora_promotion_commands(target_region, "app_failure")
+            elasticache_commands = build_elasticache_promotion_commands(target_region)
 
             send_notification(
-                subject=f"FAILOVER: DNS moved to {target_region} - PROMOTE AURORA NOW",
+                subject=f"FAILOVER: DNS moved to {target_region} - PROMOTE DATA TIER NOW",
                 message=(
                     f"Automated DNS failover triggered.\n\n"
                     f"From: {active_region}\n"
@@ -2376,13 +2657,14 @@ def _handle_active_region(state: dict, active_region: str,
                     f"Time: {now.isoformat()}\n"
                     f"Decision: {health.get('decision_reason', 'N/A')}\n\n"
                     f"DNS has been moved. Route 53 is now routing traffic to {target_region}.\n\n"
-                    f"ACTION REQUIRED: Aurora must be promoted MANUALLY.\n"
-                    f"Your app in {target_region} CANNOT WRITE until Aurora is promoted.\n\n"
-                    f"{aurora_commands}\n\n"
+                    f"ACTION REQUIRED: Data tier must be promoted MANUALLY.\n"
+                    f"Your app in {target_region} CANNOT WRITE until promotion completes.\n\n"
+                    f"{aurora_commands}\n"
+                    f"{elasticache_commands}\n\n"
                     f"Latch is ENGAGED. {active_region} will remain marked unhealthy.\n"
                     f"You will receive reminders every "
                     f"{AURORA_PROMOTION_REMINDER_INTERVAL_MINUTES} minutes until "
-                    f"Aurora promotion is detected automatically.\n\n"
+                    f"promotion is detected automatically.\n\n"
                     f"Signals:\n{json.dumps(health['signals'], indent=2, default=str)}"
                     f"{ai_appendix}"
                 ),
@@ -2390,7 +2672,7 @@ def _handle_active_region(state: dict, active_region: str,
 
         return {
             "statusCode": 200,
-            "body": f"DNS failover executed: {active_region} -> {target_region}. Aurora {'auto-promoted' if aurora_handled else 'promotion pending'}.",
+            "body": f"DNS failover executed: {active_region} -> {target_region}. Data tier {'auto-promoted' if aurora_handled else 'promotion pending'}.",
         }
 
     except Exception as e:
@@ -2403,6 +2685,7 @@ def _handle_active_region(state: dict, active_region: str,
             ),
             "consecutive_failures": 0,
             "aurora_promotion_pending": False,
+            "redis_promotion_pending": False,
         })
         send_notification(
             subject=f"FAILOVER FAILED: {active_region} -> {target_region}",

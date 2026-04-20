@@ -34,9 +34,26 @@ Parameters:
   AuroraClusterId:
     Type: String
     Default: ''
+  TargetAuroraClusterId:
+    Type: String
+    Default: ''
+    Description: Aurora cluster identifier in the other region
   AuroraGlobalClusterId:
     Type: String
     Default: 'fo-demo-global'
+  ElastiCacheReplicationGroupId:
+    Type: String
+    Default: ''
+    Description: Local ElastiCache replication group ID (for health checks)
+  ElastiCacheGlobalReplicationGroupId:
+    Type: String
+    Default: ''
+    Description: ElastiCache Global Datastore ID (for failover + primary detection)
+  ElastiCacheAutoPromote:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Auto-failover ElastiCache on failover (like AURORA_AUTO_PROMOTE)
   NotificationEmail:
     Type: String
     Default: 'ranohep@gmail.com'
@@ -125,9 +142,23 @@ Resources:
               - Effect: Allow
                 Action:
                   - rds:DescribeDBClusters
+                  - rds:DescribeGlobalClusters
+                  - rds:DescribeEvents
                   - rds:FailoverGlobalCluster
                   - rds:SwitchoverGlobalCluster
                 Resource: '*'
+              # ElastiCache — health check + Global Datastore failover
+              - Effect: Allow
+                Action:
+                  - elasticache:DescribeReplicationGroups
+                  - elasticache:DescribeGlobalReplicationGroups
+                  - elasticache:FailoverGlobalReplicationGroup
+                Resource: '*'
+              # Secrets Manager — retrieve LLM API keys
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: 'arn:aws:secretsmanager:*:*:secret:failover-orchestrator/*'
               # ELB — describe ALB for healthy host count
               - Effect: Allow
                 Action:
@@ -191,8 +222,12 @@ Resources:
           ECS_CLUSTER_NAME: !Ref EcsClusterName
           ECS_SERVICE_NAME: !Ref EcsServiceName
           AURORA_CLUSTER_ID: !Ref AuroraClusterId
+          TARGET_AURORA_CLUSTER_ID: !Ref TargetAuroraClusterId
           AURORA_GLOBAL_CLUSTER_ID: !Ref AuroraGlobalClusterId
           AURORA_AUTO_PROMOTE: 'false'
+          ELASTICACHE_REPLICATION_GROUP_ID: !Ref ElastiCacheReplicationGroupId
+          ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID: !Ref ElastiCacheGlobalReplicationGroupId
+          ELASTICACHE_AUTO_PROMOTE: !Ref ElastiCacheAutoPromote
           FAILOVER_MODE: !Ref FailoverMode
           COOLDOWN_MINUTES: !Ref CooldownMinutes
           CONSECUTIVE_FAILURES_THRESHOLD: !Ref ConsecutiveFailuresThreshold
@@ -238,7 +273,9 @@ Resources:
           HEALTH_CHECK_URL: !Sub 'http://${InternalAlbDns}'
           HEALTH_ENDPOINT: '/deep-healthcheck'
           AURORA_CLUSTER_ID: !Ref AuroraClusterId
+          TARGET_AURORA_CLUSTER_ID: !Ref TargetAuroraClusterId
           AURORA_GLOBAL_CLUSTER_ID: !Ref AuroraGlobalClusterId
+          ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID: !Ref ElastiCacheGlobalReplicationGroupId
           ECS_CLUSTER_NAME: !Ref EcsClusterName
           ECS_SERVICE_NAME: !Ref EcsServiceName
           APP_NAME: !Sub '${Env}'

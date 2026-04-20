@@ -60,6 +60,8 @@ CW_NAMESPACE = os.environ.get("CW_NAMESPACE", "Custom/RegionFailover")
 CW_METRIC_NAME = os.environ.get("CW_METRIC_NAME", "RegionActiveStatus")
 AURORA_GLOBAL_CLUSTER_ID = os.environ.get("AURORA_GLOBAL_CLUSTER_ID", "")
 AURORA_CLUSTER_ID = os.environ.get("AURORA_CLUSTER_ID", "")
+TARGET_AURORA_CLUSTER_ID = os.environ.get("TARGET_AURORA_CLUSTER_ID", "")
+ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID = os.environ.get("ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID", "")
 
 # Derive AWS account ID from the SNS topic ARN
 _AWS_ACCOUNT_ID = SNS_TOPIC_ARN.split(":")[4] if ":" in SNS_TOPIC_ARN else ""
@@ -360,6 +362,46 @@ def validate_target_region_health(target_region: str) -> dict:
             "[Check 3/3] Aurora: SKIPPED (AURORA_CLUSTER_ID not configured)"
         )
 
+    # ---------------------------------------------------------------
+    # Check 4: ElastiCache Global Datastore primary status (optional)
+    # ---------------------------------------------------------------
+    if ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID:
+        logger.info(
+            f"[Check 4] ElastiCache: global_rg={ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID}"
+        )
+        try:
+            ec_client = boto3.client(
+                "elasticache", region_name=target_region, config=_client_config
+            )
+            resp = ec_client.describe_global_replication_groups(
+                GlobalReplicationGroupId=ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID,
+                ShowMemberInfo=True,
+            )
+            target_is_primary = False
+            for grg in resp.get("GlobalReplicationGroups", []):
+                for member in grg.get("Members", []):
+                    if member.get("ReplicationGroupRegion") == target_region:
+                        target_is_primary = member.get("Role", "").upper() == "PRIMARY"
+                        logger.info(f"  Role: {member.get('Role')}")
+
+            if not target_is_primary:
+                issue = (
+                    f"ElastiCache: The replication group in {target_region} is NOT "
+                    f"the primary. You must failover ElastiCache BEFORE running failback."
+                )
+                logger.error(f"  FAILED: {issue}")
+                issues.append(issue)
+            else:
+                logger.info(f"  PASSED: {target_region} is the ElastiCache primary")
+        except Exception as e:
+            issue = f"ElastiCache check failed: {type(e).__name__}: {e}"
+            logger.error(f"  FAILED: {issue}")
+            issues.append(issue)
+    else:
+        logger.info(
+            "[Check 4] ElastiCache: SKIPPED (not configured)"
+        )
+
     passed = len(issues) == 0
     logger.info(
         f"=== Health validation complete: "
@@ -378,8 +420,17 @@ def build_aurora_switchover_commands(target_region: str) -> str:
         return "AURORA_GLOBAL_CLUSTER_ID not configured."
 
     # Construct the target cluster ARN
-    if AURORA_CLUSTER_ID and _AWS_ACCOUNT_ID:
-        target_arn = f"arn:aws:rds:{target_region}:{_AWS_ACCOUNT_ID}:cluster:{AURORA_CLUSTER_ID}"
+    target_cluster_id = TARGET_AURORA_CLUSTER_ID or AURORA_CLUSTER_ID
+    
+    # Fallback to suffix swapping if TARGET_AURORA_CLUSTER_ID is missing
+    if not TARGET_AURORA_CLUSTER_ID and target_cluster_id:
+        if target_region == "us-west-2" and target_cluster_id.endswith("-w1"):
+            target_cluster_id = target_cluster_id[:-3] + "-w2"
+        elif target_region == "us-west-1" and target_cluster_id.endswith("-w2"):
+            target_cluster_id = target_cluster_id[:-3] + "-w1"
+
+    if target_cluster_id and _AWS_ACCOUNT_ID:
+        target_arn = f"arn:aws:rds:{target_region}:{_AWS_ACCOUNT_ID}:cluster:{target_cluster_id}"
     else:
         target_arn = "<TARGET_CLUSTER_ARN>"
 
@@ -423,6 +474,8 @@ STEP 3: Then run this Lambda IN THE TARGET REGION with aurora_confirmed=true:
 def _reload_dynamic_config():
     """Re-read config that the portal may change between invocations."""
     global _state_backend, _remote_state_backend, _REMOTE_STATE_BUCKET
+    global ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID
+    ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID = os.environ.get("ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID", "")
     _state_backend = create_backend(region=CURRENT_REGION, client_config=_client_config)
     _REMOTE_STATE_BUCKET = os.environ.get("REMOTE_STATE_BUCKET", "")
     _remote_state_backend = None
@@ -615,6 +668,7 @@ def handler(event, context):
             "initiated_by": "MANUAL",
             "reason": f"Manual failback by {operator}",
             "aurora_promotion_pending": False,
+            "redis_promotion_pending": False,
         })
 
         logger.info("  4d: Sending confirmation notification...")

@@ -83,6 +83,7 @@ def _make_state(
     consecutive_failures: int = 0,
     last_failover_ts: str = "1970-01-01T00:00:00Z",
     aurora_promotion_pending: bool = False,
+    redis_promotion_pending: bool = False,
     last_warning_notification_ts: str = "1970-01-01T00:00:00Z",
     last_active_metric_ts: Optional[str] = None,
 ) -> dict:
@@ -94,6 +95,7 @@ def _make_state(
         "consecutive_failures": consecutive_failures,
         "last_failover_ts": last_failover_ts,
         "aurora_promotion_pending": aurora_promotion_pending,
+        "redis_promotion_pending": redis_promotion_pending,
         "last_warning_notification_ts": last_warning_notification_ts,
         "last_active_metric_ts": last_active_metric_ts or datetime.now(timezone.utc).isoformat(),
     }
@@ -563,8 +565,8 @@ class TestFailoverTrigger:
         mock_publish.assert_any_call("us-east-1", False)
         # Notification sent
         mock_notify.assert_called_once()
-        assert "PROMOTE AURORA" in mock_notify.call_args[1]["subject"] or \
-               "PROMOTE AURORA" in mock_notify.call_args[0][0]
+        subject = mock_notify.call_args[1].get("subject", "")
+        assert "PROMOTE DATA TIER" in subject or "PROMOTE AURORA" in subject
 
     @patch.object(orch, "_run_rca_analysis", return_value="")
     @patch.object(orch, "send_warning_notification")
@@ -769,10 +771,11 @@ class TestHandlerRouting:
             result = orch.handler({}, None)
         assert "Skipping" in result["body"]
 
+    @patch.object(orch, "publish_region_health_metric")
     @patch.object(orch, "_handle_aurora_promotion_reminder",
                   return_value={"statusCode": 200, "body": "reminder"})
     @patch.object(orch, "get_failover_state")
-    def test_aurora_promotion_pending_routes_to_reminder(self, mock_get_state, mock_reminder):
+    def test_aurora_promotion_pending_routes_to_reminder(self, mock_get_state, mock_reminder, mock_publish):
         """Active region in WAITING_AURORA_PROMOTION goes to reminder handler."""
         mock_get_state.return_value = _make_state(
             active_region="us-east-2",
@@ -783,6 +786,7 @@ class TestHandlerRouting:
              patch.object(orch, "ROUTING_MODE", "failover"):
             result = orch.handler({}, None)
         mock_reminder.assert_called_once()
+        assert "Waiting" in result["body"]
 
 
 # ===========================================================================
