@@ -18,6 +18,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | v1.2.1 | `v1.2.1` | + Dynamic config reload (`_reload_dynamic_config`), portal compatibility |
 | v1.3 | `v1.3` | + ElastiCache Global Datastore failover tracking, 6th health signal, combined Aurora+Redis promotion gate |
 | v1.4 | `v1.4` | + Staged deployment: `FAILOVER_MODE=parked` activation gate, pre-flight resource validation |
+| v1.4.2 | `v1.4.2` | + Comprehensive SNS notification validation: 50 tests across all config variants (S3/DDB, ElastiCache on/off, API GW on/off, active/passive + active/active) |
 
 ### Demo Environment (v2.0 Platform)
 
@@ -145,6 +146,7 @@ Runtime dependencies: `boto3`, `botocore` (provided by Lambda runtime). Portal a
 | `tests/test_failback_readiness.py` | Unit tests for failback readiness assessment (18 tests). |
 | `tests/test_aurora_advisor.py` | Unit tests for Aurora promotion advisor, all phases (32 tests). |
 | `tests/test_elasticache.py` | Unit tests for ElastiCache Global Datastore failover support (25 tests). |
+| `tests/test_sns_notifications_failover.py` | SNS notification validation across all config variants: S3/DDB, ElastiCache on/off, API GW on/off, active/passive + active/active, AI disabled (50 tests). |
 | `cfn/network.yaml` | CloudFormation: VPC, subnets, NAT Gateway. |
 | `cfn/app.yaml` | CloudFormation: ECS, ALB, security groups, VPC endpoints. |
 | `cfn/aurora.yaml` | CloudFormation: Aurora Global Database cluster. |
