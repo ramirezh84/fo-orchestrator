@@ -17,6 +17,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | v1.2 | `v1.2` | + Failback readiness (GO/NO-GO), Aurora promotion advisor (advisory/guided/autonomous) |
 | v1.2.1 | `v1.2.1` | + Dynamic config reload (`_reload_dynamic_config`), portal compatibility |
 | v1.3 | `v1.3` | + ElastiCache Global Datastore failover tracking, 6th health signal, combined Aurora+Redis promotion gate |
+| v1.4 | `v1.4` | + Staged deployment: `FAILOVER_MODE=parked` activation gate, pre-flight resource validation |
 
 ### Demo Environment (v2.0 Platform)
 
@@ -47,8 +48,8 @@ All changes to this codebase MUST follow these practices:
 - **Run the full test suite before every commit:** `python3 -m pytest tests/ -v`
 - **All tests must pass** before pushing or creating a PR
 - New features require new tests — no untested code reaches `main`
-- Regression test suite (180 tests) covers:
-  - `tests/test_orchestrator.py` — Core orchestrator logic (52 tests)
+- Regression test suite covers:
+  - `tests/test_orchestrator.py` — Core orchestrator logic (66 tests)
   - `tests/test_rca.py` — AI RCA module (32 tests)
   - `tests/test_state_backend.py` — State backend (13 tests)
 
@@ -63,6 +64,7 @@ Before merging any PR:
 ### Deployment
 - Package Lambda zips with all required modules
 - Deploy to BOTH regions (us-west-1 and us-west-2)
+- For staged deployments: set `FAILOVER_MODE=parked` → deploy infrastructure in any order → run pre-flight check → change to `FAILOVER_MODE=auto` to activate
 - Verify health after deployment (check orchestrator logs)
 
 ## Commands
@@ -77,6 +79,10 @@ python3 portal/app.py
 # Publish Lambda version and update alias (demo environment)
 python3 tools/publish_version.py --alias v1-2
 python3 tools/publish_version.py --alias active --copy-from v1-2
+
+# Pre-flight check: validate resources before activation (invoke from AWS console)
+# Lambda Test tab → {"preflight": true}
+# Returns: {"ready": true/false, "checks": {"state_backend": ..., "cloudwatch_metric": ..., "sns_topic": ...}}
 
 # Package and deploy orchestrator Lambda (production)
 zip failover_orchestrator_v3.zip failover_orchestrator_v3.py state_backend.py ai/__init__.py ai/config.py ai/llm_client.py ai/collector.py ai/rca_analyzer.py ai/stability_collector.py ai/aurora_advisor.py
@@ -242,7 +248,7 @@ All configuration is via Lambda environment variables. Key variables:
 | `ROUTING_MODE` | failover | `failover` (active/passive with latch) or `active-active` (both regions serve, auto-recovery) |
 | `SNS_TOPIC_ARN` | (required) | Operator notifications |
 | `HEALTH_CHECK_URL` | (empty) | Private ALB URL for HTTP health check |
-| `FAILOVER_MODE` | auto | `auto` or `manual` (notify-only, no DNS change) |
+| `FAILOVER_MODE` | auto | `auto`, `manual` (notify-only), or `parked` (inactive during staged deployment) |
 | `COOLDOWN_MINUTES` | 30 | Minimum time between failovers |
 | `CONSECUTIVE_FAILURES_THRESHOLD` | 3 | Sustained failures to trigger failover |
 | `AURORA_AUTO_PROMOTE` | false | Auto-promote Aurora or wait for operator |
@@ -285,6 +291,7 @@ All configuration is via Lambda environment variables. Key variables:
 - **Lambda versioning for demos**: One codebase deployed to all aliases (v1-0, v1-1, v1-2, active). Version behavior is controlled by env vars set by the portal. Production deployments use actual git tags (v1.0, v1.1, v1.2) with env vars set at deploy time.
 - **ElastiCache Global Datastore tracking** (v1.3): `redis_promotion_pending` state field tracks ElastiCache promotion independently from Aurora. When `ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID` is empty, the field is never set to `True` and existing behavior is unchanged. State transitions to `SECONDARY_ACTIVE` only when both `aurora_promotion_pending` and `redis_promotion_pending` are `False`. Apps poll the S3 state file to determine when all data tier promotions are complete.
 - **v1.0 is production-stable**: v1.0 code at the `v1.0` git tag must not be modified. If a bug is found, create v1.0.1 with a minimal fix. The demo portal uses v1.2.1 code for all versions — the v1.0 behavior is identical when AI features are disabled via env vars.
+- **Staged deployment with parked mode** (v1.4): `FAILOVER_MODE=parked` causes the handler to exit immediately before `_reload_dynamic_config()`, avoiding state backend init errors when infrastructure doesn't exist yet. Engineers deploy components in any order with the Lambda parked, then change the env var to `auto` to activate. Pre-flight validation available via `{"preflight": true}` Lambda test event.
 
 ## Prerequisites & Dependency Settings
 
