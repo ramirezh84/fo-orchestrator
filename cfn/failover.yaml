@@ -60,7 +60,7 @@ Parameters:
   FailoverMode:
     Type: String
     Default: 'auto'
-    AllowedValues: ['auto', 'manual']
+    AllowedValues: ['auto', 'manual', 'parked']
   CooldownMinutes:
     Type: String
     Default: '5'

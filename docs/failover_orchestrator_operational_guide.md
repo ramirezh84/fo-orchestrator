@@ -124,13 +124,19 @@ Once failover executes, the Lambda sets `latch_engaged = true` in the DynamoDB G
 
 The latch can only be released by an operator explicitly invoking the Manual Failback Lambda. This ensures that failback is always a deliberate, validated action — never an automatic reaction to a recovering region.
 
+### Layer 4: Dual-Region Circuit Breaker (v1.0.1+)
+
+Before triggering an automated failover, the orchestrator checks the *target* region's health in the state backend. If the target region is ALSO unhealthy or its heartbeat is stale, the orchestrator aborts the failover and enters a "Dual-Region Outage" state.
+
+In this state, the Lambda stays in the current region and sends a CRITICAL alert. This prevents the "infinite loop" where regions fail back and forth during a global outage (e.g., a bad deployment or widespread dependency failure). Failover only resumes once the target region is confirmed healthy.
+
 ---
 
 ## Health Signal Evaluation
 
 ### Signal Priority
 
-The orchestrator evaluates five health signals. They are not all weighted equally.
+The orchestrator evaluates up to six health signals. They are not all weighted equally.
 
 **HTTP Health Check (`/actuator/health`) — PRIMARY SIGNAL.** This is the most important signal because it tests what actually matters: can a client reach the application and get a response? If this check fails, the region is marked unhealthy regardless of what the infrastructure metrics say. A failing HTTP check means the app is down from the consumer's perspective, period.
 
@@ -143,6 +149,8 @@ The HTTP check calls the configured endpoint on the private ALB. For Spring Boot
 **API Gateway 5xx Error Rate — MEDIUM PRIORITY.** Checks the `AWS/ApiGateway/5XXError` metric relative to total request count. If the 5xx rate exceeds the threshold (default: 50%), it indicates the API Gateway layer is unable to serve most requests. If there is no traffic in the evaluation window, this signal is assumed healthy (no traffic means no errors, and the HTTP check is a better indicator).
 
 **Aurora Cluster Status — HIGH PRIORITY.** Queries `DescribeDBClusters` to verify the local Aurora cluster has status `available`. Any other status (e.g., `failing-over`, `maintenance`, `stopped`) is unhealthy.
+
+**ElastiCache Replication Group Status — HIGH PRIORITY (optional).** Queries `DescribeReplicationGroups` to verify the local ElastiCache replication group has status `available`. This signal is only evaluated when `ELASTICACHE_REPLICATION_GROUP_ID` is set; when the env var is empty, the signal is skipped entirely and does not count toward the quorum. Any status other than `available` (e.g., `modifying`, `snapshotting`, `deleting`) causes the signal to fail.
 
 ### Decision Logic
 
@@ -308,6 +316,7 @@ The Global Table stores a single record with partition key `REGION_STATE`:
 | consecutive_failures | Number | How many consecutive unhealthy evaluations have occurred (resets to 0 on recovery or failover) |
 | last_active_metric_ts | String | ISO 8601 timestamp of the last time the active region Lambda published its metric (used by passive Lambda for staleness detection) |
 | aurora_promotion_pending | Boolean | If true, DNS has been moved but Aurora has not been promoted yet. The Lambda sends periodic reminders and automatically clears this flag when it detects the local Aurora cluster has become the writer via `DescribeDBClusters` (checking `ReplicationSourceIdentifier`). |
+| redis_promotion_pending | Boolean | If true, ElastiCache Global Datastore failover (promoting the secondary replication group to primary) is in progress. Only set to `True` when `ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID` is configured and `ELASTICACHE_AUTO_PROMOTE=true`. State transitions to `SECONDARY_ACTIVE` only when both `aurora_promotion_pending` and `redis_promotion_pending` are `False`. |
 | last_warning_notification_ts | String | ISO 8601 timestamp of the last WARNING-level notification sent. Used for notification throttling to prevent inbox flooding during flapping scenarios. |
 
 ---
@@ -555,7 +564,7 @@ Once you've verified the new system is publishing metrics and the Route 53 failo
 | `AURORA_AUTO_PROMOTE` | `false` | Set to `true` to automatically call `SwitchoverGlobalCluster` or `FailoverGlobalCluster` during failover. When `false`, operator receives CLI commands via SNS. See [Automated Aurora Promotion](#automated-aurora-promotion). |
 | `AURORA_PROMOTION_STRATEGY` | `SWITCHOVER_THEN_FAILOVER` | Sets the auto-promotion method. Use `FAILOVER_ONLY` if your IAM policy denies `rds:SwitchoverGlobalCluster`. |
 | `AURORA_MAX_REPLICATION_LAG_SECONDS` | `5` | If `AURORA_AUTO_PROMOTE` is true, this is the maximum replication lag in seconds allowed before an automated promotion is attempted. Prevents promotion if the secondary is too far behind. |
-| `FAILOVER_MODE` | `auto` | `auto` = full automated failover. `manual` = detect and notify only, operator must run `execute_failover` command. Start with `manual` during initial deployment validation. |
+| `FAILOVER_MODE` | `auto` | `auto` = full automated failover. `manual` = detect and notify only, operator must run `execute_failover` command. `parked` = Lambda exits immediately without evaluating health or reading state — use during staged deployments to keep the orchestrator dormant while deploying new code. Switch to `auto` once deployment is verified. |
 | `COOLDOWN_MINUTES` | `30` | Minimum minutes between automated failovers |
 | `CONSECUTIVE_FAILURES_THRESHOLD` | `3` | Consecutive unhealthy evaluations before failover |
 | `HEALTH_EVALUATION_WINDOW_MINUTES` | `5` | CloudWatch metric evaluation window |
@@ -655,7 +664,20 @@ Note: The failback Lambda works bidirectionally — it moves traffic TO whatever
 
 ### Performing a Manual Failback
 
-Failback is a two-step process: promote Aurora first, then move DNS.
+Failback is a three-step process when ElastiCache is configured: check ElastiCache readiness, promote Aurora, then move DNS.
+
+**Step 0 (if ElastiCache is configured): Verify ElastiCache Global Datastore before failback.**
+
+Confirm the current PRIMARY member is the secondary region and us-east-1 is SECONDARY — this is the state after failover:
+
+```bash
+aws elasticache describe-global-replication-groups \
+  --global-replication-group-id <GLOBAL_RG_ID> \
+  --show-member-info --region us-east-1
+# Expect: us-east-2 member = PRIMARY, us-east-1 member = SECONDARY, both available
+```
+
+The failback Lambda automatically calls `failover_global_replication_group` to promote us-east-1's replication group back to PRIMARY during failback. This is handled by the Lambda if `ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID` is set — no manual ElastiCache API call is needed.
 
 **Step 1: Switchover Aurora back to us-east-1:**
 
@@ -729,6 +751,24 @@ aws dynamodb update-item \
 ```
 
 **Warning:** This does NOT switchover Aurora. Only use this if Aurora has already been manually switched and you just need to reset the orchestrator's state.
+
+### Running a Preflight Check (v1.4+)
+
+Invoke the orchestrator with `{"preflight": true}` to validate connectivity to all configured services — state backend, CloudWatch, SNS, ElastiCache — without triggering any health evaluation or failover logic. Returns `ready: true/false` with per-check results.
+
+Run this after any infrastructure change (new Lambda code, CFN stack update, ElastiCache deployment) before switching `FAILOVER_MODE` from `parked` to `auto`:
+
+```bash
+aws lambda invoke \
+  --function-name <orchestrator-function-name> \
+  --payload '{"preflight": true}' \
+  --cli-binary-format raw-in-base64-out \
+  --region us-east-1 \
+  /dev/stdout
+# Expect: {"ready": true, "checks": {"state_backend": "PASS", "cloudwatch": "PASS", "sns": "PASS", "elasticache": "CONFIGURED"}}
+```
+
+If any check returns `FAIL`, resolve the issue before enabling auto mode.
 
 ### Verifying Health Signal Evaluation
 
@@ -1027,9 +1067,12 @@ sns:Publish
 ### Conditional Permissions
 
 ```
-kms:GenerateDataKey, kms:Decrypt          — Only if SNS topic is KMS-encrypted
-rds:FailoverGlobalCluster                 — Only if AURORA_AUTO_PROMOTE=true
-rds:SwitchoverGlobalCluster               — Only if AURORA_AUTO_PROMOTE=true and AURORA_PROMOTION_STRATEGY is SWITCHOVER_THEN_FAILOVER
+kms:GenerateDataKey, kms:Decrypt                      — Only if SNS topic is KMS-encrypted
+rds:FailoverGlobalCluster                             — Only if AURORA_AUTO_PROMOTE=true
+rds:SwitchoverGlobalCluster                           — Only if AURORA_AUTO_PROMOTE=true and AURORA_PROMOTION_STRATEGY is SWITCHOVER_THEN_FAILOVER
+elasticache:DescribeReplicationGroups                 — Only if ELASTICACHE_REPLICATION_GROUP_ID is set (health signal 6)
+elasticache:DescribeGlobalReplicationGroups           — Only if ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID is set (primary detection)
+elasticache:FailoverGlobalReplicationGroup            — Only if ELASTICACHE_AUTO_PROMOTE=true (auto-promote on failover)
 ```
 
 Note: When using guarded auto-promotion, the Lambda role will also need `cloudwatch:GetMetricStatistics` and `rds:DescribeDBClusters` permissions that can access resources in the secondary region to perform the pre-flight safety checks.
