@@ -217,7 +217,8 @@ Once you've verified the new system is publishing metrics and the Route 53 failo
 | `ECS_CLUSTER_NAME` | (optional) | ECS cluster name |
 | `ECS_SERVICE_NAME` | (optional) | ECS service name |
 | `API_GW_NAME` | (optional) | Private API Gateway ID |
-| `AURORA_CLUSTER_ID` | (required) | Aurora cluster ID in this region (same identifier in both regions) |
+| `AURORA_CLUSTER_ID` | (required) | Aurora cluster ID in this region |
+| `TARGET_AURORA_CLUSTER_ID` | (required) | Aurora cluster ID in the peer region |
 | `AURORA_GLOBAL_CLUSTER_ID` | (required) | Aurora Global Database cluster ID |
 | `AURORA_AUTO_PROMOTE` | `false` | Set to `true` to automatically call `SwitchoverGlobalCluster` (for app failures) or `FailoverGlobalCluster` (for region failures) during failover. If the API call fails, falls back to manual notification. |
 | `FAILOVER_MODE` | `auto` | `auto` = full automated failover. `manual` = detect and notify only, operator must run `execute_failover` command. |
@@ -252,9 +253,101 @@ The failback Lambda shares most config with the orchestrator. These are all requ
 
 **Stale threshold for passive region:** 3 minutes accounts for the 1-minute EventBridge interval plus potential CloudWatch metric publication delay plus one buffer cycle. Setting this lower risks false positive region-down detection.
 
+---
+
+## 3. ElastiCache Global Datastore
+
+This section covers deploying ElastiCache Redis with Global Datastore for cross-region replication. Skip this section if your application does not use ElastiCache.
+
+### When to Deploy
+
+ElastiCache is an optional 6th health signal. If `ELASTICACHE_REPLICATION_GROUP_ID` is set on the orchestrator Lambda, the replication group's availability status is evaluated every minute. When `ELASTICACHE_AUTO_PROMOTE=true`, the orchestrator automatically promotes the secondary replication group during failover.
+
+### Node Type Requirement
+
+ElastiCache Global Datastore **does not support T-series node types** (cache.t3.micro, cache.t4g.micro, etc.). Use M5, M6g, R5, or R6g families (e.g., `cache.m5.large`). Attempting to create a Global Datastore with a T-series node will fail with a validation error.
+
+### Deployment Sequence
+
+**Order matters.** The primary stack creates the Global Datastore. The secondary stack's replication group joins it — but the secondary's subnet group must already exist when AWS provisions the secondary's nodes.
+
+**Step 1: Deploy the primary region stack (creates subnet group + primary RG + Global Datastore):**
+
+```bash
+aws cloudformation deploy \
+  --stack-name <app>-elasticache \
+  --template-file cfn/elasticache.yaml \
+  --region us-west-1 \
+  --parameter-overrides \
+    Env=<env> \
+    NetworkStack=<network-stack-name> \
+    AppStack=<app-stack-name> \
+    LocalReplicationGroupId=<app>-redis-w1 \
+    GlobalReplicationGroupIdSuffix=<app>-redis-global \
+    NodeType=cache.m5.large \
+    EngineVersion=7.1 \
+    CreatePrimaryResources=true
+```
+
+This takes 10-20 minutes. AWS creates the primary replication group and a Global Datastore object.
+
+**Step 2: Capture the auto-prefixed Global RG ID from the CFN output:**
+
+```bash
+GLOBAL_RG_ID=$(aws cloudformation describe-stacks \
+  --stack-name <app>-elasticache --region us-west-1 \
+  --query "Stacks[0].Outputs[?OutputKey=='GlobalReplicationGroupId'].OutputValue" \
+  --output text)
+echo $GLOBAL_RG_ID
+# Example: ldgnf-<app>-redis-global  (AWS prepends a random 5-char prefix)
+```
+
+AWS always prepends a random prefix to the suffix you specify. Always capture from the CFN output — do not construct the ID manually.
+
+**Step 3: Deploy the secondary region stack (creates subnet group + secondary RG that joins the Global Datastore):**
+
+```bash
+aws cloudformation deploy \
+  --stack-name <app>-elasticache \
+  --template-file cfn/elasticache.yaml \
+  --region us-west-2 \
+  --parameter-overrides \
+    Env=<env> \
+    NetworkStack=<network-stack-name> \
+    AppStack=<app-stack-name> \
+    LocalReplicationGroupId=<app>-redis-w2 \
+    GlobalReplicationGroupId=$GLOBAL_RG_ID \
+    CreatePrimaryResources=false
+```
+
+**Step 4: Verify both members are available:**
+
+```bash
+aws elasticache describe-global-replication-groups \
+  --global-replication-group-id $GLOBAL_RG_ID \
+  --show-member-info --region us-west-1
+# Expect: us-west-1 = PRIMARY (available), us-west-2 = SECONDARY (available)
+```
+
+### Wiring ElastiCache to the Failover Stack
+
+The `cfn/failover.yaml` template has three ElastiCache parameters. Set them when deploying or updating the failover stack:
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| `ElastiCacheReplicationGroupId` | `<app>-redis-w1` (us-west-1) / `<app>-redis-w2` (us-west-2) | Local replication group ID — differs per region |
+| `ElastiCacheGlobalReplicationGroupId` | `$GLOBAL_RG_ID` | Same in both regions |
+| `ElastiCacheAutoPromote` | `true` / `false` | Auto-promote on failover (requires `elasticache:FailoverGlobalReplicationGroup` IAM) |
+
+These parameters set the corresponding Lambda environment variables (`ELASTICACHE_REPLICATION_GROUP_ID`, `ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID`, `ELASTICACHE_AUTO_PROMOTE`) automatically.
+
+### Security Group
+
+The `cfn/elasticache.yaml` template creates a security group that allows inbound TCP 6379 from the Lambda security group (`${AppStack}-LambdaSGId`). The Lambda's VPC security group does not need a new outbound rule — TCP 443 to 0.0.0.0/0 (for AWS APIs) is already required, and port 6379 is allowed by the Redis SG's inbound rule.
+
 --- 
 
-## 3. Networking and VPC Requirements
+## 4. Networking and VPC Requirements
 
 ### Why the Lambda Must Be VPC-Attached
 
