@@ -148,6 +148,7 @@ Runtime dependencies: `boto3`, `botocore` (provided by Lambda runtime). Portal a
 | `cfn/network.yaml` | CloudFormation: VPC, subnets, NAT Gateway. |
 | `cfn/app.yaml` | CloudFormation: ECS, ALB, security groups, VPC endpoints. |
 | `cfn/aurora.yaml` | CloudFormation: Aurora Global Database cluster. |
+| `cfn/elasticache.yaml` | CloudFormation: ElastiCache Redis with Global Datastore (one stack per region). Primary stack creates subnet group + RG + Global Datastore; secondary stack joins via `GlobalReplicationGroupId`. Requires M5/M6g/R5/R6g node types. |
 | `cfn/failover.yaml` | CloudFormation: Orchestrator Lambda, EventBridge, CloudWatch alarms, Route 53 health checks. |
 
 ### Deployed Infrastructure (Shared Demo Environment)
