@@ -917,3 +917,120 @@ class TestFormatSubject:
             long_subject = "X" * 200
             result = orch._format_subject(long_subject)
             assert len(result) <= 100
+
+
+# ===========================================================================
+# 15. Parked mode — staged deployment gate
+# ===========================================================================
+
+class TestParkedMode:
+    """Tests for FAILOVER_MODE=parked early-exit behavior."""
+
+    def test_parked_mode_returns_immediately(self):
+        """Handler returns 200 with 'Parked' body, no further processing."""
+        with patch.dict(os.environ, {"FAILOVER_MODE": "parked"}):
+            result = orch.handler({}, None)
+        assert result["statusCode"] == 200
+        assert "Parked" in result["body"]
+
+    @patch.object(orch, "get_failover_state")
+    def test_parked_mode_no_state_access(self, mock_get_state):
+        """State backend is never accessed in parked mode."""
+        with patch.dict(os.environ, {"FAILOVER_MODE": "parked"}):
+            orch.handler({}, None)
+        mock_get_state.assert_not_called()
+
+    @patch.object(orch, "publish_region_health_metric")
+    def test_parked_mode_no_metric_published(self, mock_publish):
+        """No CloudWatch metrics are published in parked mode."""
+        with patch.dict(os.environ, {"FAILOVER_MODE": "parked"}):
+            orch.handler({}, None)
+        mock_publish.assert_not_called()
+
+    @patch.object(orch, "_reload_dynamic_config")
+    def test_parked_mode_no_reload_dynamic_config(self, mock_reload):
+        """_reload_dynamic_config() is not called — avoids state backend init."""
+        with patch.dict(os.environ, {"FAILOVER_MODE": "parked"}):
+            orch.handler({}, None)
+        mock_reload.assert_not_called()
+
+    def test_parked_mode_works_without_state_bucket(self):
+        """Parked mode succeeds even when STATE_BUCKET is missing (S3 mode).
+
+        This is the key scenario: Lambda deployed but S3 bucket not created yet.
+        Without parked mode, _reload_dynamic_config() → create_backend() would
+        raise ValueError for missing STATE_BUCKET.
+        """
+        env = {"FAILOVER_MODE": "parked", "STATE_BACKEND": "s3"}
+        with patch.dict(os.environ, env):
+            # Remove STATE_BUCKET if present
+            os.environ.pop("STATE_BUCKET", None)
+            result = orch.handler({}, None)
+        assert result["statusCode"] == 200
+        assert "Parked" in result["body"]
+
+
+# ===========================================================================
+# 16. Pre-flight checks — resource validation before activation
+# ===========================================================================
+
+class TestPreflightChecks:
+    """Tests for the {"preflight": true} resource validation handler."""
+
+    @patch.object(orch, "sns")
+    @patch.object(orch, "publish_region_health_metric")
+    @patch.object(orch, "_state_backend")
+    def test_preflight_all_pass(self, mock_backend, mock_publish, mock_sns):
+        """All required resources accessible → ready=True."""
+        mock_backend.get_state.return_value = _make_state()
+        mock_sns.get_topic_attributes.return_value = {}
+        with patch.dict(os.environ, {"FAILOVER_MODE": "auto"}):
+            result = orch.handler({"preflight": True}, None)
+        assert result["ready"] is True
+        assert result["statusCode"] == 200
+        assert result["checks"]["state_backend"]["status"] == "PASS"
+        assert result["checks"]["cloudwatch_metric"]["status"] == "PASS"
+        assert result["checks"]["sns_topic"]["status"] == "PASS"
+
+    @patch.object(orch, "sns")
+    @patch.object(orch, "publish_region_health_metric")
+    def test_preflight_state_backend_fail(self, mock_publish, mock_sns):
+        """State backend unreachable → ready=False with error detail."""
+        mock_sns.get_topic_attributes.return_value = {}
+        with patch.object(orch, "_reload_dynamic_config",
+                          side_effect=Exception("table not found")), \
+             patch.dict(os.environ, {"FAILOVER_MODE": "auto"}):
+            result = orch.handler({"preflight": True}, None)
+        assert result["ready"] is False
+        assert result["checks"]["state_backend"]["status"] == "FAIL"
+        assert "table not found" in result["checks"]["state_backend"]["error"]
+
+    @patch.object(orch, "sns")
+    @patch.object(orch, "publish_region_health_metric",
+                  side_effect=Exception("AccessDenied"))
+    @patch.object(orch, "_state_backend")
+    def test_preflight_cloudwatch_fail(self, mock_backend, mock_publish, mock_sns):
+        """CloudWatch permission denied → ready=False."""
+        mock_backend.get_state.return_value = _make_state()
+        mock_sns.get_topic_attributes.return_value = {}
+        with patch.dict(os.environ, {"FAILOVER_MODE": "auto"}):
+            result = orch.handler({"preflight": True}, None)
+        assert result["ready"] is False
+        assert result["checks"]["cloudwatch_metric"]["status"] == "FAIL"
+
+    @patch.object(orch, "sns")
+    @patch.object(orch, "publish_region_health_metric")
+    @patch.object(orch, "_state_backend")
+    def test_preflight_optional_signals_reported(self, mock_backend, mock_publish, mock_sns):
+        """Non-configured optional signals show SKIPPED, don't block readiness."""
+        mock_backend.get_state.return_value = _make_state()
+        mock_sns.get_topic_attributes.return_value = {}
+        with patch.dict(os.environ, {"FAILOVER_MODE": "auto",
+                                     "AURORA_CLUSTER_ID": "",
+                                     "ECS_CLUSTER_NAME": "",
+                                     "HEALTH_CHECK_URL": ""}):
+            result = orch.handler({"preflight": True}, None)
+        assert result["ready"] is True
+        assert result["checks"]["aurora"]["status"] == "SKIPPED"
+        assert result["checks"]["ecs"]["status"] == "SKIPPED"
+        assert result["checks"]["health_endpoint"]["status"] == "SKIPPED"

@@ -156,14 +156,17 @@ ACTIVE_REGION_STALE_THRESHOLD_MINUTES = int(
 # Failover Mode
 # "auto"   = full automated failover (default for production steady state)
 # "manual" = detect and notify only, wait for operator to trigger failover
+# "parked" = system inactive during staged deployment — handler exits
+#            immediately without accessing state backend, evaluating health,
+#            or publishing metrics. Activate by changing env var to "auto".
 #
 # In manual mode, the Lambda does everything the same (health evaluation,
 # consecutive failure counting, cooldown checking) but when it reaches the
 # point of triggering failover, it sends a CRITICAL notification instead
 # and includes the exact CLI command to execute the failover.
 #
-# Start with "manual" for initial deployment validation, switch to "auto"
-# once the team has confidence in the system.
+# Start with "parked" during initial deployment, switch to "manual" for
+# validation, then "auto" once the team has confidence in the system.
 # ---------------------------------------------------------------------------
 FAILOVER_MODE = os.environ.get("FAILOVER_MODE", "auto").lower()
 
@@ -1398,6 +1401,10 @@ def _reload_dynamic_config():
 
     Static values (regions, SNS topic, cluster names, health check URLs)
     are read once at module import time and don't change.
+
+    Note: FAILOVER_MODE "parked" is handled BEFORE this function runs
+    (in handler()) to avoid state backend init errors during staged deployment.
+    Valid FAILOVER_MODE values: "auto", "manual", "parked".
     """
     global ROUTING_MODE, PASSIVE_PUBLISH_ZERO, FAILOVER_MODE
     global _state_backend, _remote_state_backend, _REMOTE_STATE_BUCKET
@@ -1444,18 +1451,93 @@ def _reload_dynamic_config():
         )
 
 
+def _run_preflight_checks() -> dict:
+    """Validate required resources are accessible before activation.
+
+    Invoke from the AWS console Test tab with: {"preflight": true}
+    Returns a diagnostic report showing what's ready and what's missing.
+    No activation side effects — purely diagnostic (publishes one test metric).
+    """
+    checks = {}
+
+    # 1. State backend reachable
+    try:
+        _reload_dynamic_config()
+        _state_backend.get_state()
+        checks["state_backend"] = {"status": "PASS"}
+    except Exception as e:
+        checks["state_backend"] = {"status": "FAIL", "error": str(e)}
+
+    # 2. CloudWatch metric writable
+    try:
+        publish_region_health_metric(CURRENT_REGION, True)
+        checks["cloudwatch_metric"] = {"status": "PASS"}
+    except Exception as e:
+        checks["cloudwatch_metric"] = {"status": "FAIL", "error": str(e)}
+
+    # 3. SNS topic exists
+    try:
+        sns.get_topic_attributes(TopicArn=SNS_TOPIC_ARN)
+        checks["sns_topic"] = {"status": "PASS"}
+    except Exception as e:
+        checks["sns_topic"] = {"status": "FAIL", "error": str(e)}
+
+    # 4. Optional health signals — report configured vs skipped
+    for name, var, val in [
+        ("aurora", "AURORA_CLUSTER_ID", AURORA_CLUSTER_ID),
+        ("ecs", "ECS_CLUSTER_NAME", ECS_CLUSTER_NAME),
+        ("health_endpoint", "HEALTH_CHECK_URL", HEALTH_CHECK_URL),
+        ("elasticache", "ELASTICACHE_REPLICATION_GROUP_ID",
+         os.environ.get("ELASTICACHE_REPLICATION_GROUP_ID", "")),
+    ]:
+        checks[name] = (
+            {"status": "CONFIGURED"} if val
+            else {"status": "SKIPPED", "note": f"{var} not set"}
+        )
+
+    required = ["state_backend", "cloudwatch_metric", "sns_topic"]
+    all_pass = all(checks[k]["status"] == "PASS" for k in required)
+
+    return {
+        "statusCode": 200 if all_pass else 400,
+        "ready": all_pass,
+        "checks": checks,
+        "region": CURRENT_REGION,
+    }
+
+
 def handler(event, context):
     """
     Main Lambda handler — runs every 1 minute via EventBridge in BOTH regions.
+
+    Behavior depends on FAILOVER_MODE:
+      "parked"  → system inactive, exits immediately (staged deployment)
+      "auto"    → full automated failover
+      "manual"  → detect and notify only
 
     Behavior depends on ROUTING_MODE:
       "failover"      → active/passive roles, latch, manual failback
       "active-active"  → each region evaluates own health, auto-recovery
 
-    Manual invocations (failover mode only):
+    Manual invocations:
+      {"preflight": true}         — validate resources before activation
       {"execute_failover": true}  — trigger failover when FAILOVER_MODE=manual
       {"reset_state": true}       — reset state to PRIMARY_ACTIVE
     """
+    # ── Parked mode gate ──────────────────────────────────────────────
+    # FAILOVER_MODE=parked: system inactive during staged deployment.
+    # Checked BEFORE _reload_dynamic_config() to avoid state backend
+    # init errors when infrastructure doesn't exist yet.
+    if os.environ.get("FAILOVER_MODE", "auto").lower() == "parked":
+        logger.info("PARKED mode - system inactive, skipping all evaluation")
+        return {"statusCode": 200, "body": "Parked - activation pending"}
+
+    # ── Pre-flight check ──────────────────────────────────────────────
+    # Invoke with {"preflight": true} from the AWS console to validate
+    # resources before changing FAILOVER_MODE to "auto".
+    if event.get("preflight", False):
+        return _run_preflight_checks()
+
     # Re-read dynamic config (portal may have changed env vars)
     _reload_dynamic_config()
 
