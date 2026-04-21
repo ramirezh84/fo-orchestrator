@@ -1,6 +1,14 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: 'FO Demo - ElastiCache Redis with Global Datastore (one stack per region)'
 
+# Deployment sequence:
+#   1. Deploy primary stack (us-west-1) with CreatePrimaryResources=true
+#      → creates subnet group + primary RG + Global Datastore (single PRIMARY member)
+#   2. Get full GlobalReplicationGroupId from us-west-1 stack Outputs (AWS prepends a prefix)
+#   3. Deploy secondary stack (us-west-2) with CreatePrimaryResources=false,
+#      GlobalReplicationGroupId=<full-id> → creates subnet group + secondary RG that joins
+#      the Global Datastore automatically
+
 Parameters:
   Env:
     Type: String
@@ -17,18 +25,15 @@ Parameters:
   GlobalReplicationGroupIdSuffix:
     Type: String
     Default: 'fo-demo-s3-redis-global'
-    Description: Suffix for the Global Datastore ID (AWS prepends a random prefix)
-  SecondaryReplicationGroupId:
+    Description: Suffix for Global Datastore ID (AWS prepends a random prefix). Used by primary only.
+  GlobalReplicationGroupId:
     Type: String
-    Default: 'fo-demo-s3-redis-w2'
-    Description: Replication group ID for the secondary region (auto-created by AWS in that region)
-  SecondaryRegion:
-    Type: String
-    Default: 'us-west-2'
-    Description: Secondary region for the Global Datastore
+    Default: ''
+    Description: Full Global Datastore ID (with AWS prefix). Required for secondary region stack.
   NodeType:
     Type: String
-    Default: 'cache.t3.micro'
+    Default: 'cache.m5.large'
+    Description: Node type — Global Datastore requires M5/M6g/R5/R6g families (T-series not supported)
   EngineVersion:
     Type: String
     Default: '7.1'
@@ -40,6 +45,7 @@ Parameters:
 
 Conditions:
   IsPrimary: !Equals [!Ref CreatePrimaryResources, 'true']
+  IsSecondary: !Not [!Equals [!Ref CreatePrimaryResources, 'true']]
 
 Resources:
 
@@ -61,7 +67,7 @@ Resources:
         - Key: Name
           Value: !Sub 'fo-${Env}-redis-sg'
 
-  # Subnet group — created in both regions (required before Global Datastore creates secondary RG)
+  # Subnet group — created in both regions
   RedisSubnetGroup:
     Type: AWS::ElastiCache::SubnetGroup
     Properties:
@@ -77,7 +83,8 @@ Resources:
           Value: !Sub 'fo-${Env}-redis-subnet-group'
 
   # Primary replication group — created only in primary region
-  RedisReplicationGroup:
+  # Note: cache.t3.micro single-node requires AutomaticFailoverEnabled=false
+  RedisReplicationGroupPrimary:
     Type: AWS::ElastiCache::ReplicationGroup
     Condition: IsPrimary
     DependsOn: RedisSubnetGroup
@@ -98,12 +105,12 @@ Resources:
         - Key: Name
           Value: !Sub 'fo-${Env}-redis-${AWS::Region}'
 
-  # Global Datastore — created only in primary region
-  # AWS auto-creates the secondary RG in SecondaryRegion using the subnet group deployed there
+  # Global Datastore — created only in primary region, with single PRIMARY member
+  # The secondary RG (created separately in us-west-2) joins via GlobalReplicationGroupId
   RedisGlobalReplicationGroup:
     Type: AWS::ElastiCache::GlobalReplicationGroup
     Condition: IsPrimary
-    DependsOn: RedisReplicationGroup
+    DependsOn: RedisReplicationGroupPrimary
     Properties:
       GlobalReplicationGroupIdSuffix: !Ref GlobalReplicationGroupIdSuffix
       GlobalReplicationGroupDescription: !Sub 'fo-${Env} Redis Global Datastore'
@@ -111,14 +118,29 @@ Resources:
         - ReplicationGroupId: !Ref LocalReplicationGroupId
           ReplicationGroupRegion: !Ref AWS::Region
           Role: PRIMARY
-        - ReplicationGroupId: !Ref SecondaryReplicationGroupId
-          ReplicationGroupRegion: !Ref SecondaryRegion
-          Role: SECONDARY
       AutomaticFailoverEnabled: false
+
+  # Secondary replication group — created only in secondary region
+  # Joins the existing Global Datastore by referencing its full ID
+  # Node type, engine version, encryption settings are inherited from the global group
+  RedisReplicationGroupSecondary:
+    Type: AWS::ElastiCache::ReplicationGroup
+    Condition: IsSecondary
+    DependsOn: RedisSubnetGroup
+    Properties:
+      ReplicationGroupId: !Ref LocalReplicationGroupId
+      ReplicationGroupDescription: !Sub 'fo-${Env} Redis secondary (${AWS::Region})'
+      GlobalReplicationGroupId: !Ref GlobalReplicationGroupId
+      CacheSubnetGroupName: !Ref RedisSubnetGroup
+      SecurityGroupIds:
+        - !Ref RedisSG
+      Tags:
+        - Key: Name
+          Value: !Sub 'fo-${Env}-redis-${AWS::Region}'
 
 Outputs:
   GlobalReplicationGroupId:
-    Value: !If [IsPrimary, !Ref RedisGlobalReplicationGroup, 'n/a']
+    Value: !If [IsPrimary, !Ref RedisGlobalReplicationGroup, !Ref GlobalReplicationGroupId]
     Export:
       Name: !Sub '${AWS::StackName}-GlobalReplicationGroupId'
   LocalReplicationGroupId:
