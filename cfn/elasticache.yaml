@@ -1,0 +1,135 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'FO Demo - ElastiCache Redis with Global Datastore (one stack per region)'
+
+Parameters:
+  Env:
+    Type: String
+    Default: demo-s3
+  AppStack:
+    Type: String
+    Description: Name of the app CloudFormation stack
+  NetworkStack:
+    Type: String
+    Description: Name of the network CloudFormation stack
+  LocalReplicationGroupId:
+    Type: String
+    Description: Unique identifier for this region's Redis replication group (e.g. fo-demo-s3-redis-w1)
+  GlobalReplicationGroupIdSuffix:
+    Type: String
+    Default: 'fo-demo-s3-redis-global'
+    Description: Suffix for the Global Datastore ID (AWS prepends a random prefix)
+  SecondaryReplicationGroupId:
+    Type: String
+    Default: 'fo-demo-s3-redis-w2'
+    Description: Replication group ID for the secondary region (auto-created by AWS in that region)
+  SecondaryRegion:
+    Type: String
+    Default: 'us-west-2'
+    Description: Secondary region for the Global Datastore
+  NodeType:
+    Type: String
+    Default: 'cache.t3.micro'
+  EngineVersion:
+    Type: String
+    Default: '7.1'
+  CreatePrimaryResources:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Set true only for primary (us-west-1) stack
+
+Conditions:
+  IsPrimary: !Equals [!Ref CreatePrimaryResources, 'true']
+
+Resources:
+
+  # Security group for Redis — open port 6379 from the orchestrator Lambda
+  RedisSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub 'fo-${Env} ElastiCache Redis cluster'
+      VpcId: !ImportValue
+        Fn::Sub: '${NetworkStack}-VpcId'
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          SourceSecurityGroupId: !ImportValue
+            Fn::Sub: '${AppStack}-LambdaSGId'
+          Description: 'From failover/failback Lambda'
+      Tags:
+        - Key: Name
+          Value: !Sub 'fo-${Env}-redis-sg'
+
+  # Subnet group — created in both regions (required before Global Datastore creates secondary RG)
+  RedisSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      CacheSubnetGroupName: !Sub 'fo-${Env}-redis-subnet-group'
+      Description: !Sub 'fo-${Env} Redis subnet group'
+      SubnetIds:
+        - !ImportValue
+          Fn::Sub: '${NetworkStack}-PrivateSubnet1Id'
+        - !ImportValue
+          Fn::Sub: '${NetworkStack}-PrivateSubnet2Id'
+      Tags:
+        - Key: Name
+          Value: !Sub 'fo-${Env}-redis-subnet-group'
+
+  # Primary replication group — created only in primary region
+  RedisReplicationGroup:
+    Type: AWS::ElastiCache::ReplicationGroup
+    Condition: IsPrimary
+    DependsOn: RedisSubnetGroup
+    Properties:
+      ReplicationGroupId: !Ref LocalReplicationGroupId
+      ReplicationGroupDescription: !Sub 'fo-${Env} Redis primary (${AWS::Region})'
+      NumCacheClusters: 1
+      CacheNodeType: !Ref NodeType
+      Engine: redis
+      EngineVersion: !Ref EngineVersion
+      CacheSubnetGroupName: !Ref RedisSubnetGroup
+      SecurityGroupIds:
+        - !Ref RedisSG
+      AtRestEncryptionEnabled: true
+      TransitEncryptionEnabled: false
+      AutomaticFailoverEnabled: false
+      Tags:
+        - Key: Name
+          Value: !Sub 'fo-${Env}-redis-${AWS::Region}'
+
+  # Global Datastore — created only in primary region
+  # AWS auto-creates the secondary RG in SecondaryRegion using the subnet group deployed there
+  RedisGlobalReplicationGroup:
+    Type: AWS::ElastiCache::GlobalReplicationGroup
+    Condition: IsPrimary
+    DependsOn: RedisReplicationGroup
+    Properties:
+      GlobalReplicationGroupIdSuffix: !Ref GlobalReplicationGroupIdSuffix
+      GlobalReplicationGroupDescription: !Sub 'fo-${Env} Redis Global Datastore'
+      Members:
+        - ReplicationGroupId: !Ref LocalReplicationGroupId
+          ReplicationGroupRegion: !Ref AWS::Region
+          Role: PRIMARY
+        - ReplicationGroupId: !Ref SecondaryReplicationGroupId
+          ReplicationGroupRegion: !Ref SecondaryRegion
+          Role: SECONDARY
+      AutomaticFailoverEnabled: false
+
+Outputs:
+  GlobalReplicationGroupId:
+    Value: !If [IsPrimary, !Ref RedisGlobalReplicationGroup, 'n/a']
+    Export:
+      Name: !Sub '${AWS::StackName}-GlobalReplicationGroupId'
+  LocalReplicationGroupId:
+    Value: !Ref LocalReplicationGroupId
+    Export:
+      Name: !Sub '${AWS::StackName}-LocalReplicationGroupId'
+  RedisSGId:
+    Value: !Ref RedisSG
+    Export:
+      Name: !Sub '${AWS::StackName}-RedisSGId'
+  RedisSubnetGroupName:
+    Value: !Ref RedisSubnetGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-RedisSubnetGroupName'
