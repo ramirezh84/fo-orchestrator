@@ -178,6 +178,20 @@ Resources:
                 Action:
                   - apigateway:GET
                 Resource: '*'
+              # S3 — state backend (when STATE_BACKEND=s3)
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:HeadObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource: '*'
+              # SNS — topic validation (preflight check)
+              - Effect: Allow
+                Action:
+                  - sns:GetTopicAttributes
+                Resource: '*'
       Tags:
         - Key: Name
           Value: !Sub '${Env}-lambda-role'
