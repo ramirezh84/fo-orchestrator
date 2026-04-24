@@ -20,6 +20,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | v1.4 | `v1.4` | + Staged deployment: `FAILOVER_MODE=parked` activation gate, pre-flight resource validation |
 | v1.4.2 | `v1.4.2` | + CFN resource naming fix: restore `fo-${Env}` prefix in `cfn/failover.yaml` |
 | v1.4.3 | `v1.4.3` | + Comprehensive SNS notification validation: 50 tests across all config variants (S3/DDB, ElastiCache on/off, API GW on/off, active/passive + active/active) |
+| v1.5 | `v1.5` | + Three-state CW staleness logic: network-layer CW failures now inconclusive (cw_stale=None) instead of confirming; heartbeat alone requires 2× deep staleness to fire failover when CW unreachable. Fixes false-failover on borderline heartbeat + transient CW timeout. |
 
 ### Demo Environment (v2.0 Platform)
 
@@ -296,6 +297,7 @@ All configuration is via Lambda environment variables. Key variables:
 - **ElastiCache Global Datastore tracking** (v1.3): `redis_promotion_pending` state field tracks ElastiCache promotion independently from Aurora. When `ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID` is empty, the field is never set to `True` and existing behavior is unchanged. State transitions to `SECONDARY_ACTIVE` only when both `aurora_promotion_pending` and `redis_promotion_pending` are `False`. Apps poll the S3 state file to determine when all data tier promotions are complete.
 - **v1.0 is production-stable**: v1.0 code at the `v1.0` git tag must not be modified. If a bug is found, create v1.0.1 with a minimal fix. The demo portal uses v1.2.1 code for all versions — the v1.0 behavior is identical when AI features are disabled via env vars.
 - **Staged deployment with parked mode** (v1.4): `FAILOVER_MODE=parked` causes the handler to exit immediately before `_reload_dynamic_config()`, avoiding state backend init errors when infrastructure doesn't exist yet. Engineers deploy components in any order with the Lambda parked, then change the env var to `auto` to activate. Pre-flight validation available via `{"preflight": true}` Lambda test event.
+- **Three-state CW staleness logic** (v1.5): `check_active_region_staleness()` returns `cw_stale` as tri-state — `True` (confirming), `False` (fresh), or `None` (inconclusive). Network-layer failures (`EndpointConnectionError`, `HTTPClientError` — connect/read timeouts, DNS, socket errors) set `cw_stale=None` instead of `True`, because an unreachable CW endpoint tells us nothing about the active region's health. When inconclusive, failover only fires if the heartbeat is deeply stale (> 2× `ACTIVE_REGION_STALE_THRESHOLD_MINUTES`). `ClientError` and empty-datapoints paths remain confirming. Closes the false-failover mode where a borderline heartbeat + transient CW timeout collapsed into a region-down verdict.
 
 ## Prerequisites & Dependency Settings
 
