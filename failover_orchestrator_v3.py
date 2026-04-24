@@ -51,7 +51,11 @@ from urllib.error import URLError, HTTPError
 
 import boto3
 from botocore.config import Config as BotoConfig
-from botocore.exceptions import ClientError
+from botocore.exceptions import (
+    ClientError,
+    EndpointConnectionError,
+    HTTPClientError,
+)
 
 from state_backend import create_backend, ConditionalCheckFailedError
 
@@ -958,15 +962,24 @@ def check_active_region_staleness(active_region: str, state: dict) -> dict:
       the local replica (DynamoDB Global Table or S3 CRR) is independent.
       No cross-region API call needed.
 
-    Method 2 - Cross-region CloudWatch API (SECONDARY, fallback):
+    Method 2 - Cross-region CloudWatch API (SECONDARY, corroborating):
       Query the active region's CloudWatch for its RegionActiveStatus metric.
-      This requires a cross-region API call, which may itself fail if the active
-      region is down. A failed call is treated as stale (region unreachable).
+      This requires a cross-region API call, which may itself fail. Failures
+      are classified into two categories:
+        - Confirming failure (ClientError, empty datapoints): CW responded
+          but said the region is not publishing. Counts as "stale".
+        - Inconclusive failure (network timeout, endpoint unreachable): we
+          could not reach CW at all, so we have no information about the
+          active region. Counts as "inconclusive" (cw_stale=None), NOT as
+          confirming staleness.
 
-    The region is considered stale if BOTH methods detect staleness.
-    AND logic prevents false positives in VPCs where cross-region calls
-    are blocked by network configuration. Method 1 (state heartbeat) is the
-    primary signal; Method 2 (CloudWatch) confirms it.
+    Decision (three-state cw_stale):
+      - cw_stale=True  → both methods agree region is stale → failover
+      - cw_stale=False → CW says region is fresh → not stale (AND blocks)
+      - cw_stale=None  → CW inconclusive → fall back to heartbeat alone, but
+        require DEEP staleness (2× threshold) before firing without CW
+        corroboration. Prevents a transient network blip from upgrading a
+        borderline heartbeat into a false failover.
     """
     now = datetime.now(timezone.utc)
 
@@ -976,11 +989,12 @@ def check_active_region_staleness(active_region: str, state: dict) -> dict:
     heartbeat_stale = False
     heartbeat_reason = ""
     last_active_ts_str = state.get("last_active_metric_ts", "1970-01-01T00:00:00Z")
+    stale_threshold_seconds = ACTIVE_REGION_STALE_THRESHOLD_MINUTES * 60
+    age_seconds = 0.0
 
     try:
         last_active_ts = datetime.fromisoformat(last_active_ts_str.replace("Z", "+00:00"))
         age_seconds = (now - last_active_ts).total_seconds()
-        stale_threshold_seconds = ACTIVE_REGION_STALE_THRESHOLD_MINUTES * 60
 
         if age_seconds > stale_threshold_seconds:
             heartbeat_stale = True
@@ -994,17 +1008,18 @@ def check_active_region_staleness(active_region: str, state: dict) -> dict:
                 f"Heartbeat last_active_metric_ts is fresh ({age_seconds:.0f}s old)"
             )
     except (ValueError, TypeError) as e:
+        # Unparseable timestamp is treated as maximally stale.
         heartbeat_stale = True
+        age_seconds = float("inf")
         heartbeat_reason = f"Cannot parse last_active_metric_ts: {last_active_ts_str} ({e})"
         logger.error(heartbeat_reason)
 
     # -----------------------------------------------------------------------
-    # Method 2: Cross-region CloudWatch API call (may fail if region is down)
-    # Uses a short timeout (5s connect, 10s read) so the Lambda doesn't hang
-    # for minutes if the cross-region endpoint is unreachable. A timeout is
-    # treated as stale, which is correct - we can't reach the other region.
+    # Method 2: Cross-region CloudWatch API call.
+    # cw_stale tri-state: True = stale confirmed, False = fresh, None = inconclusive.
+    # Uses short timeouts (5s connect, 10s read) so the Lambda doesn't hang.
     # -----------------------------------------------------------------------
-    cw_stale = False
+    cw_stale = False  # optimistic default; set to True on confirm, None on inconclusive
     cw_reason = ""
 
     try:
@@ -1031,6 +1046,7 @@ def check_active_region_staleness(active_region: str, state: dict) -> dict:
             cw_age = (now - latest["Timestamp"]).total_seconds()
             cw_reason = f"CloudWatch metric is fresh ({cw_age:.0f}s old)"
         else:
+            # CW responded but has no recent datapoints — confirming staleness.
             cw_stale = True
             cw_reason = (
                 f"No CloudWatch metric data from {active_region} in the last "
@@ -1038,16 +1054,28 @@ def check_active_region_staleness(active_region: str, state: dict) -> dict:
             )
 
     except ClientError as e:
-        # Cannot reach active region's CloudWatch - region is likely down
+        # CW API responded but rejected us (throttled, auth, 4xx/5xx). The API
+        # is reachable — this is a CONFIRMING signal that something is wrong.
         cw_stale = True
         cw_reason = f"Cannot reach CloudWatch in {active_region}: {str(e)}"
         if heartbeat_stale:
             logger.error(cw_reason)
         else:
             logger.debug(cw_reason)
+    except (EndpointConnectionError, HTTPClientError) as e:
+        # Network-layer failure (connect timeout, read timeout, DNS, socket).
+        # We could not reach CW at all — we have NO information about the active
+        # region. INCONCLUSIVE, not confirming. Prevents a transient network
+        # blip from collapsing into a false failover (see 2026-04-24 incident).
+        cw_stale = None
+        cw_reason = f"Cross-region CW call inconclusive ({type(e).__name__}): {str(e)}"
+        if heartbeat_stale:
+            logger.warning(cw_reason)
+        else:
+            logger.debug(cw_reason)
     except Exception as e:
-        # Catch connection timeouts, DNS failures, and any other network errors.
-        # These are not ClientError - they're lower-level socket/connection issues.
+        # Unknown failure class. Err on the side of confirming staleness
+        # (preserves pre-v1.5 behavior for any exception we didn't anticipate).
         cw_stale = True
         cw_reason = f"Cross-region CW call failed ({type(e).__name__}): {str(e)}"
         if heartbeat_stale:
@@ -1056,31 +1084,34 @@ def check_active_region_staleness(active_region: str, state: dict) -> dict:
             logger.debug(cw_reason)
 
     # -----------------------------------------------------------------------
-    # Decision: stale if BOTH methods agree the active region is down.
+    # Decision (three-state):
     #
-    # AND logic prevents false positives in VPCs where cross-region
-    # CloudWatch calls are blocked by network configuration (interface
-    # endpoints, firewalls, etc). In those environments, Method 2 always
-    # returns stale - without AND, every check would trigger failover.
+    #   cw_stale=True  → confirming signal. AND with heartbeat_stale.
+    #   cw_stale=False → CW says region is fresh. AND with heartbeat_stale
+    #                    (i.e. heartbeat alone cannot fire failover).
+    #   cw_stale=None  → inconclusive. Fall back to heartbeat alone, but
+    #                    require DEEP staleness (2× threshold) before firing
+    #                    without CW corroboration. This protects against a
+    #                    borderline heartbeat + simultaneous network blip.
     #
-    # Method 1 (state heartbeat) is the primary, most reliable signal.
-    # Method 2 (cross-region CloudWatch) is a confirming signal.
-    #
-    # When the active region truly goes down:
-    #   - Method 1: DDB timestamp ages past threshold → stale
-    #   - Method 2: cross-region call fails or returns no data → stale
-    #   - AND: True AND True → stale detected ✓
-    #
-    # When the active region is healthy but cross-region call is blocked:
-    #   - Method 1: heartbeat timestamp is fresh → not stale
-    #   - Method 2: cross-region call times out → stale
-    #   - AND: False AND True → NOT stale ✓ (false positive prevented)
+    # Rationale: the original AND logic assumed Method 2 always produced a
+    # yes/no answer, so any exception was treated as "yes, stale". That
+    # collapsed network-unreachability into confirmation, which is wrong —
+    # if we can't reach CW, we don't know anything. The inconclusive path
+    # preserves failover capability (via deep-staleness fallback) while
+    # removing the false-positive mode.
     # -----------------------------------------------------------------------
-    is_stale = heartbeat_stale and cw_stale
+    cw_inconclusive = cw_stale is None
+    if cw_inconclusive:
+        deep_stale_seconds = stale_threshold_seconds * 2
+        is_stale = heartbeat_stale and age_seconds > deep_stale_seconds
+    else:
+        is_stale = heartbeat_stale and cw_stale
 
     combined_reason = f"Heartbeat: {heartbeat_reason} | CW: {cw_reason}"
     logger.info(
-        f"Staleness result: stale={is_stale} (heartbeat={heartbeat_stale}, cw={cw_stale})"
+        f"Staleness result: stale={is_stale} (heartbeat={heartbeat_stale}, "
+        f"cw={cw_stale}, inconclusive={cw_inconclusive})"
     )
 
     if is_stale:
@@ -1092,6 +1123,7 @@ def check_active_region_staleness(active_region: str, state: dict) -> dict:
         "stale": is_stale,
         "heartbeat_stale": heartbeat_stale,
         "cw_stale": cw_stale,
+        "cw_inconclusive": cw_inconclusive,
         "reason": combined_reason,
         "heartbeat_reason": heartbeat_reason,
         "cw_reason": cw_reason,

@@ -897,6 +897,177 @@ class TestPassiveStalenessFailover:
 
 
 # ===========================================================================
+# 13b. Staleness check three-state logic (v1.5)
+#
+# Directly exercises check_active_region_staleness() rather than mocking it
+# wholesale. Verifies that:
+#   - A CW network timeout is INCONCLUSIVE (cw_stale=None), not confirming.
+#   - A borderline-stale heartbeat + CW timeout does NOT trigger failover
+#     (the 2026-04-24 prod incident regression).
+#   - A deeply-stale heartbeat (>2× threshold) fires failover even when CW is
+#     unreachable (preserves failover capability under simultaneous outages).
+#   - ClientError and empty-datapoints paths still CONFIRM staleness (unchanged).
+# ===========================================================================
+
+class TestStalenessCheckLogic:
+    """Direct tests of check_active_region_staleness() tri-state cw_stale logic."""
+
+    THRESHOLD_MIN = 3  # matches default ACTIVE_REGION_STALE_THRESHOLD_MINUTES
+
+    def _state_with_heartbeat_age(self, age_seconds: float) -> dict:
+        """Build a state dict whose last_active_metric_ts is `age_seconds` in the past."""
+        ts = datetime.now(timezone.utc) - timedelta(seconds=age_seconds)
+        return _make_state(last_active_metric_ts=ts.isoformat())
+
+    def _cw_client_with_fresh_datapoints(self):
+        mock_cw = MagicMock()
+        mock_cw.get_metric_statistics.return_value = {
+            "Datapoints": [{"Timestamp": datetime.now(timezone.utc), "Minimum": 1.0}]
+        }
+        return mock_cw
+
+    def _cw_client_raising(self, exc):
+        mock_cw = MagicMock()
+        mock_cw.get_metric_statistics.side_effect = exc
+        return mock_cw
+
+    def _cw_client_with_empty_datapoints(self):
+        mock_cw = MagicMock()
+        mock_cw.get_metric_statistics.return_value = {"Datapoints": []}
+        return mock_cw
+
+    # ---- Case 1: fresh heartbeat + CW fresh → not stale (baseline) -------
+
+    def test_fresh_heartbeat_and_cw_fresh_is_not_stale(self):
+        state = self._state_with_heartbeat_age(30)  # well under 180s threshold
+        with patch.object(orch, "ACTIVE_REGION_STALE_THRESHOLD_MINUTES", self.THRESHOLD_MIN), \
+             patch.object(orch.boto3, "client", return_value=self._cw_client_with_fresh_datapoints()):
+            result = orch.check_active_region_staleness("us-east-1", state)
+
+        assert result["stale"] is False
+        assert result["heartbeat_stale"] is False
+        assert result["cw_stale"] is False
+        assert result["cw_inconclusive"] is False
+
+    # ---- Case 2: fresh heartbeat + CW timeout → not stale, inconclusive --
+
+    def test_fresh_heartbeat_and_cw_timeout_is_not_stale(self):
+        """VPC-blocked CW + healthy heartbeat: inconclusive, but not stale."""
+        from botocore.exceptions import EndpointConnectionError as EndpointErr
+        state = self._state_with_heartbeat_age(30)
+        with patch.object(orch, "ACTIVE_REGION_STALE_THRESHOLD_MINUTES", self.THRESHOLD_MIN), \
+             patch.object(
+                orch.boto3, "client",
+                return_value=self._cw_client_raising(
+                    EndpointErr(endpoint_url="https://monitoring-us-east-1.amazonaws.com/")
+                ),
+             ):
+            result = orch.check_active_region_staleness("us-east-1", state)
+
+        assert result["stale"] is False
+        assert result["heartbeat_stale"] is False
+        assert result["cw_stale"] is None
+        assert result["cw_inconclusive"] is True
+
+    # ---- Case 3: borderline heartbeat + CW timeout → not stale -----------
+    # REGRESSION TEST for the 2026-04-24 prod incident.
+
+    def test_borderline_heartbeat_and_cw_timeout_is_not_stale(self):
+        """
+        Heartbeat just barely over threshold (205s old, 180s threshold) +
+        simultaneous CW network timeout. Under pre-v1.5 code this collapsed
+        into a false failover. Under v1.5 this must NOT fire.
+        """
+        from botocore.exceptions import HTTPClientError
+        state = self._state_with_heartbeat_age(205)  # 25s over 180s threshold
+        with patch.object(orch, "ACTIVE_REGION_STALE_THRESHOLD_MINUTES", self.THRESHOLD_MIN), \
+             patch.object(
+                orch.boto3, "client",
+                return_value=self._cw_client_raising(
+                    HTTPClientError(error="Connect timeout on endpoint URL")
+                ),
+             ):
+            result = orch.check_active_region_staleness("us-east-1", state)
+
+        assert result["heartbeat_stale"] is True, "heartbeat should be flagged stale"
+        assert result["cw_stale"] is None, "CW timeout must be inconclusive, not confirming"
+        assert result["cw_inconclusive"] is True
+        assert result["stale"] is False, (
+            "borderline heartbeat + CW timeout must NOT trigger failover "
+            "(regression for 2026-04-24 incident)"
+        )
+
+    # ---- Case 4: deeply stale heartbeat + CW timeout → stale -------------
+
+    def test_deeply_stale_heartbeat_and_cw_timeout_is_stale(self):
+        """
+        Heartbeat >2× threshold (e.g. 400s > 360s = 2×180s) + CW timeout.
+        Preserves failover capability when CW is unreachable but the
+        heartbeat is emphatically stale.
+        """
+        from botocore.exceptions import HTTPClientError
+        state = self._state_with_heartbeat_age(400)  # 2× threshold is 360s
+        with patch.object(orch, "ACTIVE_REGION_STALE_THRESHOLD_MINUTES", self.THRESHOLD_MIN), \
+             patch.object(
+                orch.boto3, "client",
+                return_value=self._cw_client_raising(
+                    HTTPClientError(error="Connect timeout on endpoint URL")
+                ),
+             ):
+            result = orch.check_active_region_staleness("us-east-1", state)
+
+        assert result["heartbeat_stale"] is True
+        assert result["cw_stale"] is None
+        assert result["cw_inconclusive"] is True
+        assert result["stale"] is True, (
+            "deep heartbeat staleness should fire failover even when CW is inconclusive"
+        )
+
+    # ---- Case 5: stale heartbeat + CW ClientError → stale (unchanged) ----
+
+    def test_stale_heartbeat_and_cw_client_error_is_stale(self):
+        """ClientError (CW API responded with error) is CONFIRMING, unchanged from v1.0."""
+        from botocore.exceptions import ClientError
+        err = ClientError({"Error": {"Code": "Throttling", "Message": "Rate exceeded"}}, "GetMetricStatistics")
+        state = self._state_with_heartbeat_age(300)
+        with patch.object(orch, "ACTIVE_REGION_STALE_THRESHOLD_MINUTES", self.THRESHOLD_MIN), \
+             patch.object(orch.boto3, "client", return_value=self._cw_client_raising(err)):
+            result = orch.check_active_region_staleness("us-east-1", state)
+
+        assert result["heartbeat_stale"] is True
+        assert result["cw_stale"] is True
+        assert result["cw_inconclusive"] is False
+        assert result["stale"] is True
+
+    # ---- Case 6: stale heartbeat + CW empty datapoints → stale (unchanged)
+
+    def test_stale_heartbeat_and_cw_empty_datapoints_is_stale(self):
+        state = self._state_with_heartbeat_age(300)
+        with patch.object(orch, "ACTIVE_REGION_STALE_THRESHOLD_MINUTES", self.THRESHOLD_MIN), \
+             patch.object(orch.boto3, "client", return_value=self._cw_client_with_empty_datapoints()):
+            result = orch.check_active_region_staleness("us-east-1", state)
+
+        assert result["heartbeat_stale"] is True
+        assert result["cw_stale"] is True
+        assert result["cw_inconclusive"] is False
+        assert result["stale"] is True
+
+    # ---- Case 7: fresh heartbeat + CW ClientError → not stale (AND holds)
+
+    def test_fresh_heartbeat_and_cw_client_error_is_not_stale(self):
+        from botocore.exceptions import ClientError
+        err = ClientError({"Error": {"Code": "AccessDenied", "Message": "nope"}}, "GetMetricStatistics")
+        state = self._state_with_heartbeat_age(30)
+        with patch.object(orch, "ACTIVE_REGION_STALE_THRESHOLD_MINUTES", self.THRESHOLD_MIN), \
+             patch.object(orch.boto3, "client", return_value=self._cw_client_raising(err)):
+            result = orch.check_active_region_staleness("us-east-1", state)
+
+        assert result["heartbeat_stale"] is False
+        assert result["cw_stale"] is True
+        assert result["stale"] is False
+
+
+# ===========================================================================
 # 14. APP_NAME in notification subjects
 # ===========================================================================
 
