@@ -224,7 +224,7 @@ AURORA_PROMOTION_REMINDER_INTERVAL_MINUTES = int(
 # are NEVER throttled.
 # ---------------------------------------------------------------------------
 WARNING_NOTIFICATION_COOLDOWN_MINUTES = int(
-    os.environ.get("WARNING_NOTIFICATION_COOLDOWN_MINUTES", "10")
+    os.environ.get("WARNING_NOTIFICATION_COOLDOWN_MINUTES", "5")
 )
 
 logger = logging.getLogger()
@@ -1165,7 +1165,12 @@ def send_notification(subject: str, message: str) -> None:
         logger.error(f"Notification failed: {type(e).__name__}: {e}")
 
 
-def send_warning_notification(subject: str, message: str, state: dict) -> None:
+def send_warning_notification(
+    subject: str,
+    message: str,
+    state: dict,
+    bypass_throttle: bool = False,
+) -> None:
     """
     Send a WARNING-level SNS notification with throttling.
 
@@ -1174,7 +1179,14 @@ def send_warning_notification(subject: str, message: str, state: dict) -> None:
     out immediately, then subsequent alerts are suppressed for N minutes.
 
     The first alert always sends (so the team knows something is wrong).
-    Subsequent alerts send only every WARNING_NOTIFICATION_COOLDOWN_MINUTES.
+    Subsequent alerts send only every WARNING_NOTIFICATION_COOLDOWN_MINUTES
+    (default 5min in v1.6, was 10min in v1.5).
+
+    Set ``bypass_throttle=True`` for notifications that must always reach the
+    operator regardless of recent traffic — e.g., the very first failure of an
+    incident, retry-attempt-N alerts during stuck data-tier promotion, or the
+    final escalation when retries exhaust. These signal-class events lose
+    information if collapsed under a cooldown window.
 
     CRITICAL one-time events (failover, region failure, failover failed) should
     use send_notification() directly - they are NEVER throttled.
@@ -1182,22 +1194,23 @@ def send_warning_notification(subject: str, message: str, state: dict) -> None:
     now = datetime.now(timezone.utc)
     last_warning_ts_str = state.get("last_warning_notification_ts", "1970-01-01T00:00:00Z")
 
-    try:
-        last_warning_ts = datetime.fromisoformat(last_warning_ts_str.replace("Z", "+00:00"))
-        seconds_since_last = (now - last_warning_ts).total_seconds()
-        cooldown_seconds = WARNING_NOTIFICATION_COOLDOWN_MINUTES * 60
+    if not bypass_throttle:
+        try:
+            last_warning_ts = datetime.fromisoformat(last_warning_ts_str.replace("Z", "+00:00"))
+            seconds_since_last = (now - last_warning_ts).total_seconds()
+            cooldown_seconds = WARNING_NOTIFICATION_COOLDOWN_MINUTES * 60
 
-        if seconds_since_last < cooldown_seconds:
-            remaining = (cooldown_seconds - seconds_since_last) / 60
-            logger.info(
-                f"Warning notification throttled. Last sent {seconds_since_last:.0f}s ago, "
-                f"cooldown {cooldown_seconds}s. Next in ~{remaining:.0f}m. "
-                f"Subject: {subject}"
-            )
-            return
-    except (ValueError, TypeError):
-        # Can't parse timestamp - send the notification to be safe
-        pass
+            if seconds_since_last < cooldown_seconds:
+                remaining = (cooldown_seconds - seconds_since_last) / 60
+                logger.info(
+                    f"Warning notification throttled. Last sent {seconds_since_last:.0f}s ago, "
+                    f"cooldown {cooldown_seconds}s. Next in ~{remaining:.0f}m. "
+                    f"Subject: {subject}"
+                )
+                return
+        except (ValueError, TypeError):
+            # Can't parse timestamp - send the notification to be safe
+            pass
 
     # Send the notification and update the timestamp
     try:
