@@ -1962,17 +1962,49 @@ def _handle_aurora_promotion_reminder(state: dict) -> dict:
         )
         update_failover_state({"aurora_promotion_pending": False})
 
-        send_notification(
-            subject=f"Aurora promotion confirmed - {active_region} is writer",
-            message=(
-                f"The Aurora Global Database has been promoted.\n\n"
-                f"Region {active_region} is now the writer.\n"
-                f"aurora_promotion_pending has been automatically cleared.\n"
-                f"The orchestrator will transition to steady state on the next cycle.\n\n"
-                f"Time: {now.isoformat()}\n"
-                f"Minutes since failover: {int(minutes_since_failover)}"
+        cfg = detect_data_tier_config()
+        redis_pending = bool(state.get("redis_promotion_pending"))
+        # Journey: Aurora is done; Redis step shown only when Redis is configured.
+        if cfg["redis_present"]:
+            journey = [
+                "[✓] Aurora promoted",
+                f"[{'→' if redis_pending else '✓'}] Redis promoting",
+                "[ ] Latch released",
+            ]
+            next_step = (
+                "No action — Aurora is ready. The orchestrator is now waiting for "
+                "ElastiCache promotion. You'll receive another email when Redis "
+                "completes (and a CRITICAL alert if it gets stuck)."
+                if redis_pending else
+                "No action — both data tiers are promoted. The orchestrator will "
+                "transition to SECONDARY_ACTIVE on the next cycle."
+            )
+        else:
+            journey = ["[✓] Aurora promoted", "[ ] Latch released"]
+            next_step = (
+                "No action — Aurora is ready. The orchestrator will transition to "
+                "SECONDARY_ACTIVE on the next cycle and the failover will be complete."
+            )
+
+        subject, body = compose_message(
+            severity=SEVERITY_INFO,
+            what=f"Aurora is now writer in {active_region}",
+            why=(
+                f"The Aurora Global Database promotion to {active_region} completed "
+                f"after {int(minutes_since_failover)} minute(s). Your app can now "
+                f"write to the database from this region."
             ),
+            next_step=next_step,
+            context={
+                "Active region": active_region,
+                "Aurora cluster": AURORA_CLUSTER_ID or "(not configured)",
+                "Promotion took": f"~{int(minutes_since_failover)} min from failover",
+            },
+            journey=journey,
+            source="failover-orchestrator",
+            region=CURRENT_REGION,
         )
+        send_notification(subject, body)
 
         publish_region_health_metric(CURRENT_REGION, True)
         return {"statusCode": 200, "body": "Aurora promotion detected and confirmed"}
@@ -2028,16 +2060,49 @@ def _handle_elasticache_promotion_reminder(state: dict) -> dict:
         )
         update_failover_state({"redis_promotion_pending": False})
 
-        send_notification(
-            subject=f"ElastiCache promotion confirmed - {active_region} is primary",
-            message=(
-                f"The ElastiCache Global Datastore has been promoted.\n\n"
-                f"Region {active_region} is now the primary.\n"
-                f"redis_promotion_pending has been automatically cleared.\n\n"
-                f"Time: {now.isoformat()}\n"
-                f"Minutes since failover: {int(minutes_since_failover)}"
+        cfg = detect_data_tier_config()
+        aurora_pending = bool(state.get("aurora_promotion_pending"))
+        # Journey: Redis is done; show Aurora step only if Aurora is configured.
+        if cfg["aurora_present"]:
+            journey = [
+                f"[{'→' if aurora_pending else '✓'}] Aurora promoting",
+                "[✓] Redis promoted",
+                "[ ] Latch released",
+            ]
+            next_step = (
+                "No action — Redis is ready. The orchestrator is now waiting for "
+                "Aurora promotion. You'll receive another email when Aurora "
+                "completes (and a CRITICAL alert if it gets stuck)."
+                if aurora_pending else
+                "No action — both data tiers are promoted. The orchestrator will "
+                "transition to SECONDARY_ACTIVE on the next cycle."
+            )
+        else:
+            journey = ["[✓] Redis promoted", "[ ] Latch released"]
+            next_step = (
+                "No action — Redis is ready. The orchestrator will transition to "
+                "SECONDARY_ACTIVE on the next cycle and the failover will be complete."
+            )
+
+        subject, body = compose_message(
+            severity=SEVERITY_INFO,
+            what=f"ElastiCache is now primary in {active_region}",
+            why=(
+                f"The ElastiCache Global Datastore promotion to {active_region} "
+                f"completed after {int(minutes_since_failover)} minute(s). Cache "
+                f"writes from this region are now served locally."
             ),
+            next_step=next_step,
+            context={
+                "Active region": active_region,
+                "ElastiCache RG": ELASTICACHE_REPLICATION_GROUP_ID or "(not configured)",
+                "Promotion took": f"~{int(minutes_since_failover)} min from failover",
+            },
+            journey=journey,
+            source="failover-orchestrator",
+            region=CURRENT_REGION,
         )
+        send_notification(subject, body)
         return {"statusCode": 200, "body": "ElastiCache promotion detected and confirmed"}
 
     # ElastiCache not yet promoted - send periodic reminders
@@ -2870,26 +2935,60 @@ def _handle_active_region(state: dict, active_region: str,
             aurora_result = _auto_promote_aurora(target_region, "app_failure")
             if aurora_result["success"]:
                 aurora_handled = True
-                send_notification(
-                    subject=f"FAILOVER: DNS moved to {target_region} - Aurora {aurora_result['method']} initiated",
-                    message=(
-                        f"Automated DNS failover triggered.\n\n"
-                        f"From: {active_region}\n"
-                        f"To: {target_region}\n"
-                        f"Time: {now.isoformat()}\n"
-                        f"Decision: {health.get('decision_reason', 'N/A')}\n\n"
-                        f"DNS has been moved. Route 53 is now routing traffic to {target_region}.\n\n"
-                        f"Aurora {aurora_result['method']} has been initiated AUTOMATICALLY.\n"
-                        f"Monitor progress with:\n\n"
-                        f"  aws rds describe-db-clusters \\\n"
-                        f"    --db-cluster-identifier {AURORA_CLUSTER_ID} \\\n"
-                        f"    --query 'DBClusters[0].{{Status:Status,ReplicationSource:ReplicationSourceIdentifier}}' \\\n"
-                        f"    --region {target_region}\n\n"
-                        f"Latch is ENGAGED. {active_region} will remain marked unhealthy.\n\n"
-                        f"Signals:\n{json.dumps(health['signals'], indent=2, default=str)}"
-                        f"{ai_appendix}"
-                    ),
+                cfg = detect_data_tier_config()
+                # Journey: failover step is happening NOW; data-tier steps follow.
+                journey_lines = ["[✓] Threshold reached", "[→] Failover IN PROGRESS"]
+                if cfg["aurora_present"]:
+                    journey_lines.append("[→] Aurora promoting")
+                if cfg["redis_present"]:
+                    journey_lines.append("[ ] Redis promoting" if cfg["redis_auto"]
+                                          else "[ ] Redis (manual — operator)")
+                ctx = {
+                    "From region": active_region,
+                    "To region": target_region,
+                    "Decision": health.get("decision_reason", "N/A"),
+                    "Aurora cluster": AURORA_CLUSTER_ID or "(not configured)",
+                    "Aurora action": f"{aurora_result['method']} (auto, in progress)",
+                }
+                if cfg["redis_present"]:
+                    ctx["ElastiCache action"] = (
+                        "failover (auto, in progress)" if cfg["redis_auto"]
+                        else "MANUAL — see follow-up email"
+                    )
+                signals_brief = ", ".join(
+                    f"{s['signal']}={'OK' if s.get('healthy') else 'FAIL'}"
+                    for s in health.get("signals", [])
+                    if not s.get("skipped")
                 )
+                if signals_brief:
+                    ctx["Health signals"] = signals_brief
+                next_step = (
+                    f"No immediate action. Aurora {aurora_result['method']} is in "
+                    f"flight; you'll receive a confirmation email when it completes "
+                    f"(typically 1–5 min). The latch is ENGAGED — once {target_region} "
+                    f"is fully active, traffic will stay there until you run failback "
+                    f"manually. Monitor Aurora progress with:\n"
+                    f"  aws rds describe-db-clusters --db-cluster-identifier "
+                    f"{AURORA_CLUSTER_ID or '<cluster-id>'} "
+                    f"--query 'DBClusters[0].{{Status:Status,ReplicationSource:ReplicationSourceIdentifier}}' "
+                    f"--region {target_region}"
+                )
+                subject, body = compose_message(
+                    severity=SEVERITY_CRITICAL,
+                    what=f"Failover triggered — traffic moving from {active_region} to {target_region}",
+                    why=(
+                        f"{health.get('decision_reason', 'health check failed')}. "
+                        f"This was the third consecutive failure and the cooldown "
+                        f"window had expired, so the orchestrator triggered an "
+                        f"automatic DNS failover."
+                    ),
+                    next_step=next_step + (ai_appendix or ""),
+                    context=ctx,
+                    journey=journey_lines,
+                    source="failover-orchestrator",
+                    region=CURRENT_REGION,
+                )
+                send_notification(subject, body)
             else:
                 logger.warning(
                     f"Auto Aurora promotion failed: {aurora_result['error']}. "
