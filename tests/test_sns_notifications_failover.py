@@ -235,8 +235,10 @@ class TestSNSDegradationWarnings:
     @patch.object(orch, "try_increment_failures", return_value=True)
     @patch.object(orch, "evaluate_region_health")
     @patch.object(orch, "sns")
-    def test_degraded_warning_s3_ec(self, mock_sns, mock_health, mock_inc, mock_pub, mock_upd):
-        """S3+ElastiCache: WARNING sent when failure count is 2/3 (below threshold)."""
+    def test_degraded_warning_subsequent_failure_s3_ec(
+        self, mock_sns, mock_health, mock_inc, mock_pub, mock_upd
+    ):
+        """v1.6: subsequent failure (2 of 3) — subject says 'health failure 2 of 3'."""
         mock_health.return_value = _unhealthy_health()
         state = _make_state(consecutive_failures=1)
 
@@ -244,12 +246,43 @@ class TestSNSDegradationWarnings:
 
         assert mock_sns.publish.called
         subject = _get_sns_subject(mock_sns)
-        assert "WARNING" in subject
-        assert "degraded" in subject
-        assert "2/3" in subject
+        assert subject.startswith("[Vigil] WARNING:")
         assert "us-east-1" in subject
-        assert subject.startswith("[Vigil]")
+        assert "2 of 3" in subject
+        assert "sustained" in subject.lower()
         assert len(subject) <= 100
+
+        # Body contains the v1.6 journey breadcrumb and explicit next-step.
+        body = _get_sns_message(mock_sns)
+        assert "WHAT IS HAPPENING" in body
+        assert "WHERE WE ARE IN THE INCIDENT" in body
+        assert "WHAT TO DO NEXT" in body
+        assert "[✓] First failure" in body
+        assert "Sustained (2/3)" in body
+        assert "investigate" in body.lower() or "Investigate" in body
+
+    @patch.object(orch, "update_failover_state")
+    @patch.object(orch, "publish_region_health_metric")
+    @patch.object(orch, "try_increment_failures", return_value=True)
+    @patch.object(orch, "evaluate_region_health")
+    @patch.object(orch, "sns")
+    def test_degraded_warning_first_failure_explicit(
+        self, mock_sns, mock_health, mock_inc, mock_pub, mock_upd
+    ):
+        """v1.6: first failure (1 of 3) — subject says 'FIRST health failure'."""
+        mock_health.return_value = _unhealthy_health()
+        state = _make_state(consecutive_failures=0)
+
+        orch._handle_active_region(state, "us-east-1", 0, "1970-01-01T00:00:00Z")
+
+        subject = _get_sns_subject(mock_sns)
+        assert "FIRST" in subject
+        assert "1 of 3" in subject
+
+        body = _get_sns_message(mock_sns)
+        assert "first failure of an incident" in body
+        # First-failure journey breadcrumb shows "[1]" for the active step.
+        assert "[1] First failure" in body
 
     @patch.object(orch, "update_failover_state")
     @patch.object(orch, "publish_region_health_metric")
@@ -257,18 +290,16 @@ class TestSNSDegradationWarnings:
     @patch.object(orch, "evaluate_region_health")
     @patch.object(orch, "sns")
     def test_degraded_warning_ddb_ec(self, mock_sns, mock_health, mock_inc, mock_pub, mock_upd):
-        """DynamoDB+ElastiCache: WARNING format identical to S3 variant."""
+        """DynamoDB+ElastiCache: same v1.6 contract as S3 variant."""
         mock_health.return_value = _unhealthy_health()
         state = _make_state(consecutive_failures=1)
 
-        # DynamoDB variant: same SNS format, only state backend differs
         with patch.object(orch, "ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID", "my-global-redis"):
             orch._handle_active_region(state, "us-east-1", 1, "1970-01-01T00:00:00Z")
 
         subject = _get_sns_subject(mock_sns)
+        assert "2 of 3" in subject
         assert "WARNING" in subject
-        assert "degraded" in subject
-        assert "2/3" in subject
 
     @patch.object(orch, "update_failover_state")
     @patch.object(orch, "publish_region_health_metric")
@@ -276,7 +307,7 @@ class TestSNSDegradationWarnings:
     @patch.object(orch, "evaluate_region_health")
     @patch.object(orch, "sns")
     def test_degraded_warning_no_elasticache(self, mock_sns, mock_health, mock_inc, mock_pub, mock_upd):
-        """S3, ElastiCache disabled: WARNING format unchanged when ElastiCache absent."""
+        """S3, ElastiCache disabled: warning body has no ElastiCache content."""
         mock_health.return_value = _unhealthy_health()
         state = _make_state(consecutive_failures=1)
 
@@ -285,9 +316,7 @@ class TestSNSDegradationWarnings:
 
         subject = _get_sns_subject(mock_sns)
         assert "WARNING" in subject
-        assert "degraded" in subject
-        assert "2/3" in subject
-        # No ElastiCache content in degradation warning
+        assert "2 of 3" in subject
         message = _get_sns_message(mock_sns)
         assert "elasticache" not in message.lower()
 
@@ -297,7 +326,7 @@ class TestSNSDegradationWarnings:
     @patch.object(orch, "evaluate_region_health")
     @patch.object(orch, "sns")
     def test_degraded_warning_with_api_gw(self, mock_sns, mock_health, mock_inc, mock_pub, mock_upd):
-        """API GW configured: WARNING format unchanged; API GW failure appears in decision reason."""
+        """API GW configured: decision reason (incl. API GW) flows into the body."""
         mock_health.return_value = {
             "healthy": False,
             "decision_reason": "api_gw_5xx: error rate 75.0% > 50.0%",
@@ -312,8 +341,7 @@ class TestSNSDegradationWarnings:
 
         subject = _get_sns_subject(mock_sns)
         assert "WARNING" in subject
-        assert "degraded" in subject
-        # Decision reason (including API GW) is included in message body
+        assert "2 of 3" in subject
         message = _get_sns_message(mock_sns)
         assert "api_gw_5xx" in message or "75%" in message
 
@@ -322,19 +350,25 @@ class TestSNSDegradationWarnings:
     @patch.object(orch, "try_increment_failures", return_value=True)
     @patch.object(orch, "evaluate_region_health")
     @patch.object(orch, "sns")
-    def test_cooldown_active_sends_critical_subject(self, mock_sns, mock_health, mock_inc, mock_pub, mock_upd):
-        """Threshold reached + cooldown active: subject is 'CRITICAL: ... cooldown active'."""
+    def test_cooldown_active_warning_subject(self, mock_sns, mock_health, mock_inc, mock_pub, mock_upd):
+        """v1.6: cooldown-blocking-failover is WARNING (not CRITICAL — that label was misleading)."""
         mock_health.return_value = _unhealthy_health()
-        # Recent failover keeps cooldown alive
         recent_ts = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
         state = _make_state(consecutive_failures=2)
 
         orch._handle_active_region(state, "us-east-1", 2, recent_ts)
 
         subject = _get_sns_subject(mock_sns)
-        assert "CRITICAL" in subject
+        assert "WARNING" in subject
         assert "cooldown" in subject.lower()
         assert "us-east-1" in subject
+        assert "blocked" in subject.lower()
+
+        body = _get_sns_message(mock_sns)
+        # Journey explicitly tells operator we're at the cooldown phase.
+        assert "Cooldown — failover deferred" in body
+        # Next-step explains the override path so operator isn't stuck guessing.
+        assert "execute_failover" in body
 
     @patch.object(orch, "update_failover_state")
     @patch.object(orch, "publish_region_health_metric")
