@@ -73,6 +73,12 @@ CURRENT_REGION = os.environ.get("AWS_REGION", "us-east-1")
 # is alerting when this solution is deployed across multiple applications.
 APP_NAME = os.environ.get("APP_NAME", "")
 
+# Deployment environment (e.g., "prod", "staging", "demo"). When set together
+# with APP_NAME, notification subjects are prefixed [ENVIRONMENT-APP_NAME] so
+# operators can immediately tell which environment is alerting. Empty falls
+# back to [APP_NAME] only (backwards-compat with v1.0–v1.5 deployments).
+ENVIRONMENT = os.environ.get("ENVIRONMENT", "")
+
 STATE_TABLE = os.environ.get("STATE_TABLE", "failover-state")
 SNS_TOPIC_ARN = os.environ["SNS_TOPIC_ARN"]
 CW_NAMESPACE = os.environ.get("CW_NAMESPACE", "Custom/RegionFailover")
@@ -1135,9 +1141,17 @@ def check_active_region_staleness(active_region: str, state: dict) -> dict:
 # ===========================================================================
 
 def _format_subject(subject: str) -> str:
-    """Prepend APP_NAME to notification subject if configured. Truncates to 100 chars (SNS limit)."""
-    if APP_NAME:
-        return f"[{APP_NAME}] {subject}"[:100]
+    """Prepend [ENVIRONMENT-APP_NAME] to notification subject. SNS limit is 100 chars.
+
+    Composition rules (so operators can immediately tell which environment is alerting):
+      ENVIRONMENT="prod" + APP_NAME="critical-app"  -> [prod-critical-app] {subject}
+      ENVIRONMENT=""     + APP_NAME="critical-app"  -> [critical-app] {subject}
+      ENVIRONMENT="prod" + APP_NAME=""              -> [prod] {subject}
+      both empty                                    -> {subject} (unchanged)
+    """
+    parts = [p for p in (ENVIRONMENT, APP_NAME) if p]
+    if parts:
+        return f"[{'-'.join(parts)}] {subject}"[:100]
     return subject[:100]
 
 
@@ -1447,6 +1461,7 @@ def _reload_dynamic_config():
     global MIN_HEALTHY_HOST_COUNT, API_GW_5XX_THRESHOLD_PERCENT
     global ACTIVE_REGION_STALE_THRESHOLD_MINUTES
     global CW_NAMESPACE
+    global ENVIRONMENT
 
     # All dynamic config — re-read from os.environ every invocation
     ROUTING_MODE = os.environ.get("ROUTING_MODE", "failover").lower()
@@ -1465,6 +1480,7 @@ def _reload_dynamic_config():
     API_GW_5XX_THRESHOLD_PERCENT = float(os.environ.get("API_GW_5XX_THRESHOLD_PERCENT", "50.0"))
     ACTIVE_REGION_STALE_THRESHOLD_MINUTES = int(os.environ.get("ACTIVE_REGION_STALE_THRESHOLD_MINUTES", "3"))
     CW_NAMESPACE = os.environ.get("CW_NAMESPACE", "Custom/RegionFailover")
+    ENVIRONMENT = os.environ.get("ENVIRONMENT", "")
 
     # Reinitialize state backend (DynamoDB or S3)
     _state_backend = create_backend(region=CURRENT_REGION, client_config=_client_config)
@@ -1481,6 +1497,32 @@ def _reload_dynamic_config():
             prefix=os.environ.get("STATE_PREFIX", "failover-state/"),
             client_config=_client_config,
         )
+
+
+def detect_data_tier_config() -> dict:
+    """Inspect env to determine which data tiers are configured and how.
+
+    Returns a dict with four boolean flags driving configuration-aware
+    behavior (notification suppression, failback gates, retry policies):
+
+      aurora_present : Aurora cluster ID is set (tier exists)
+      aurora_auto    : Aurora present AND AURORA_AUTO_PROMOTE=true
+      redis_present  : ElastiCache global RG ID is set (tier exists)
+      redis_auto     : Redis present AND ELASTICACHE_AUTO_PROMOTE=true
+
+    The nine combinations of (aurora ∈ {absent, manual, auto}) ×
+    (redis ∈ {absent, manual, auto}) cover all supported deployments
+    from app-only stacks (C1) to fully automated dual-tier (C9).
+
+    Read at invocation time — do not cache; the portal can flip these
+    env vars between cycles. Call after _reload_dynamic_config().
+    """
+    return {
+        "aurora_present": bool(AURORA_CLUSTER_ID),
+        "aurora_auto":    bool(AURORA_CLUSTER_ID) and AURORA_AUTO_PROMOTE,
+        "redis_present":  bool(ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID),
+        "redis_auto":     bool(ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID) and ELASTICACHE_AUTO_PROMOTE,
+    }
 
 
 def _run_preflight_checks() -> dict:

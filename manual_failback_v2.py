@@ -61,13 +61,20 @@ CW_METRIC_NAME = os.environ.get("CW_METRIC_NAME", "RegionActiveStatus")
 AURORA_GLOBAL_CLUSTER_ID = os.environ.get("AURORA_GLOBAL_CLUSTER_ID", "")
 AURORA_CLUSTER_ID = os.environ.get("AURORA_CLUSTER_ID", "")
 TARGET_AURORA_CLUSTER_ID = os.environ.get("TARGET_AURORA_CLUSTER_ID", "")
+AURORA_AUTO_PROMOTE = os.environ.get("AURORA_AUTO_PROMOTE", "false").lower() == "true"
 ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID = os.environ.get("ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID", "")
+ELASTICACHE_REPLICATION_GROUP_ID = os.environ.get("ELASTICACHE_REPLICATION_GROUP_ID", "")
+ELASTICACHE_AUTO_PROMOTE = os.environ.get("ELASTICACHE_AUTO_PROMOTE", "false").lower() == "true"
 
 # Derive AWS account ID from the SNS topic ARN
 _AWS_ACCOUNT_ID = SNS_TOPIC_ARN.split(":")[4] if ":" in SNS_TOPIC_ARN else ""
 
 # Application name - included in all SNS notifications
 APP_NAME = os.environ.get("APP_NAME", "")
+
+# Deployment environment (e.g., "prod", "staging", "demo"). Composed with
+# APP_NAME into the [ENVIRONMENT-APP_NAME] subject prefix when both are set.
+ENVIRONMENT = os.environ.get("ENVIRONMENT", "")
 
 HEALTH_CHECK_URL = os.environ.get("HEALTH_CHECK_URL", "")
 HEALTH_ENDPOINT = os.environ.get("HEALTH_ENDPOINT", "/actuator/health")
@@ -181,10 +188,36 @@ def publish_region_health_metric(region: str, is_healthy: bool) -> None:
 
 
 def _format_subject(subject: str) -> str:
-    """Prepend APP_NAME to notification subject if configured."""
-    if APP_NAME:
-        return f"[{APP_NAME}] {subject}"[:100]
+    """Prepend [ENVIRONMENT-APP_NAME] to notification subject. SNS limit is 100 chars.
+
+    Composition rules (matches orchestrator's _format_subject):
+      ENVIRONMENT="prod" + APP_NAME="critical-app"  -> [prod-critical-app] {subject}
+      ENVIRONMENT=""     + APP_NAME="critical-app"  -> [critical-app] {subject}
+      ENVIRONMENT="prod" + APP_NAME=""              -> [prod] {subject}
+      both empty                                    -> {subject}
+    """
+    parts = [p for p in (ENVIRONMENT, APP_NAME) if p]
+    if parts:
+        return f"[{'-'.join(parts)}] {subject}"[:100]
     return subject[:100]
+
+
+def detect_data_tier_config() -> dict:
+    """Inspect env to determine which data tiers are present and how they promote.
+
+    Returns the same shape as the orchestrator's helper. The failback Lambda
+    uses this to decide which gates to enforce on the operator's payload
+    (aurora_confirmed, redis_confirmed, etc.) and to suppress notifications
+    for absent tiers.
+
+    See failover_orchestrator_v3.py:detect_data_tier_config for full docs.
+    """
+    return {
+        "aurora_present": bool(AURORA_CLUSTER_ID),
+        "aurora_auto":    bool(AURORA_CLUSTER_ID) and AURORA_AUTO_PROMOTE,
+        "redis_present":  bool(ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID),
+        "redis_auto":     bool(ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID) and ELASTICACHE_AUTO_PROMOTE,
+    }
 
 
 def send_notification(subject: str, message: str) -> None:
