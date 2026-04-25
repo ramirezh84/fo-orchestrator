@@ -58,6 +58,12 @@ from botocore.exceptions import (
 )
 
 from state_backend import create_backend, ConditionalCheckFailedError
+from notifications import (
+    compose_message,
+    SEVERITY_INFO,
+    SEVERITY_WARNING,
+    SEVERITY_CRITICAL,
+)
 
 # AI modules are imported lazily inside functions to support v1.0 mode
 # (where AI_RCA_ENABLED=false and AI modules may not be needed)
@@ -2571,20 +2577,69 @@ def _handle_active_region(state: dict, active_region: str,
 
     if new_failure_count < CONSECUTIVE_FAILURES_THRESHOLD:
         publish_region_health_metric(CURRENT_REGION, True)
-        send_warning_notification(
-            subject=(
-                f"WARNING: {CURRENT_REGION} degraded "
-                f"({new_failure_count}/{CONSECUTIVE_FAILURES_THRESHOLD})"
-            ),
-            message=(
-                f"Region {CURRENT_REGION} health check failed.\n"
-                f"Consecutive failures: {new_failure_count}/{CONSECUTIVE_FAILURES_THRESHOLD}\n"
-                f"Decision: {health.get('decision_reason', 'N/A')}\n\n"
-                f"Failover triggers at {CONSECUTIVE_FAILURES_THRESHOLD} consecutive failures.\n\n"
-                f"Signals:\n{json.dumps(health['signals'], indent=2, default=str)}"
-            ),
-            state=state,
+        target_region = SECONDARY_REGION if active_region == PRIMARY_REGION else PRIMARY_REGION
+        is_first = new_failure_count == 1
+        if is_first:
+            what = (
+                f"Region {CURRENT_REGION} reported its FIRST health failure "
+                f"(1 of {CONSECUTIVE_FAILURES_THRESHOLD})"
+            )
+            why = (
+                f"{health.get('decision_reason', 'health check failed')}. "
+                f"This is the first failure of an incident — traffic is still flowing "
+                f"normally to {CURRENT_REGION}."
+            )
+            next_step = (
+                f"No action required. The orchestrator will keep evaluating health "
+                f"every 60s. You will receive a follow-up email if the failure "
+                f"persists. If {CONSECUTIVE_FAILURES_THRESHOLD} consecutive failures occur "
+                f"and the cooldown window has expired, traffic will move to "
+                f"{target_region} automatically."
+            )
+        else:
+            what = (
+                f"Region {CURRENT_REGION} health failure "
+                f"{new_failure_count} of {CONSECUTIVE_FAILURES_THRESHOLD} — "
+                f"sustained but below threshold"
+            )
+            why = (
+                f"{health.get('decision_reason', 'health check failed')}. "
+                f"This is failure {new_failure_count} in a row — one more and the "
+                f"orchestrator will move traffic to {target_region}."
+            )
+            next_step = (
+                f"Investigate the root cause in {CURRENT_REGION} now. If the next "
+                f"cycle (in ~60s) also fails, automatic failover will fire."
+            )
+        ctx = {
+            "Active region": CURRENT_REGION,
+            "Standby region": target_region,
+            "Consecutive failures": f"{new_failure_count} of {CONSECUTIVE_FAILURES_THRESHOLD}",
+            "Decision": health.get("decision_reason", "N/A"),
+        }
+        signals_brief = ", ".join(
+            f"{s['signal']}={'OK' if s.get('healthy') else 'FAIL'}"
+            for s in health.get("signals", [])
+            if not s.get("skipped")
         )
+        if signals_brief:
+            ctx["Health signals"] = signals_brief
+        journey = [
+            f"[{'1' if is_first else '✓'}] First failure",
+            f"[{'→' if not is_first else ' '}] Sustained ({new_failure_count}/{CONSECUTIVE_FAILURES_THRESHOLD})",
+            "[ ] Failover",
+        ]
+        subject, body = compose_message(
+            severity=SEVERITY_WARNING,
+            what=what,
+            why=why,
+            next_step=next_step,
+            context=ctx,
+            journey=journey,
+            source="failover-orchestrator",
+            region=CURRENT_REGION,
+        )
+        send_warning_notification(subject, body, state, bypass_throttle=is_first)
         return {"statusCode": 200, "body": "Below threshold, monitoring"}
 
     last_ts = datetime.fromisoformat(last_failover_ts.replace("Z", "+00:00"))
@@ -2594,18 +2649,53 @@ def _handle_active_region(state: dict, active_region: str,
         remaining = (cooldown_expiry - now).total_seconds() / 60
         logger.warning(f"Cooldown active, {remaining:.1f} min remaining. NOT failing over.")
         publish_region_health_metric(CURRENT_REGION, True)
-        send_warning_notification(
-            subject=f"CRITICAL: {CURRENT_REGION} unhealthy, cooldown active",
-            message=(
-                f"Region {CURRENT_REGION} has hit the failure threshold but cooldown "
-                f"prevents failover.\n"
-                f"Cooldown expires in {remaining:.1f} minutes.\n"
-                f"Manual intervention may be required.\n\n"
-                f"Decision: {health.get('decision_reason', 'N/A')}\n"
-                f"Signals:\n{json.dumps(health['signals'], indent=2, default=str)}"
-            ),
-            state=state,
+        target_region = SECONDARY_REGION if active_region == PRIMARY_REGION else PRIMARY_REGION
+        what = (
+            f"Region {CURRENT_REGION} unhealthy but failover blocked by cooldown "
+            f"({remaining:.0f} min remaining)"
         )
+        why = (
+            f"{health.get('decision_reason', 'health check failed')}. The "
+            f"{CONSECUTIVE_FAILURES_THRESHOLD}-failure threshold has been reached, "
+            f"but a previous failover happened within the {COOLDOWN_MINUTES}-minute "
+            f"cooldown window so the orchestrator will NOT fail over again right now."
+        )
+        next_step = (
+            f"Investigate {CURRENT_REGION} immediately — the app is degraded but "
+            f"traffic is still routed here. If the region cannot be restored before "
+            f"the cooldown expires (in {remaining:.0f} min), failover will fire on "
+            f"the next cycle. To override the cooldown, an operator can manually "
+            f"invoke the failover Lambda with {{\"execute_failover\": true}}."
+        )
+        ctx = {
+            "Active region": CURRENT_REGION,
+            "Standby region": target_region,
+            "Cooldown remaining": f"{remaining:.0f} min",
+            "Decision": health.get("decision_reason", "N/A"),
+        }
+        signals_brief = ", ".join(
+            f"{s['signal']}={'OK' if s.get('healthy') else 'FAIL'}"
+            for s in health.get("signals", [])
+            if not s.get("skipped")
+        )
+        if signals_brief:
+            ctx["Health signals"] = signals_brief
+        journey = [
+            "[✓] First failure",
+            f"[✓] Sustained ({CONSECUTIVE_FAILURES_THRESHOLD}/{CONSECUTIVE_FAILURES_THRESHOLD})",
+            "[⏸] Cooldown — failover deferred",
+        ]
+        subject, body = compose_message(
+            severity=SEVERITY_WARNING,
+            what=what,
+            why=why,
+            next_step=next_step,
+            context=ctx,
+            journey=journey,
+            source="failover-orchestrator",
+            region=CURRENT_REGION,
+        )
+        send_warning_notification(subject, body, state)
         return {"statusCode": 200, "body": "Cooldown active"}
 
     # =====================================================================
