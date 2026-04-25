@@ -57,7 +57,7 @@ _ENV = {
     "ROUTING_MODE": "failover",
     "FAILOVER_MODE": "auto",
     # App identity
-    "APP_NAME": "SentinelFO",
+    "APP_NAME": "Vigil",
     # Timing
     "COOLDOWN_MINUTES": "30",
     "CONSECUTIVE_FAILURES_THRESHOLD": "3",
@@ -103,7 +103,7 @@ _mock_create_backend_patcher.stop()
 
 
 # ===========================================================================
-# Autouse fixture: ensure APP_NAME is "SentinelFO" for every test in this file.
+# Autouse fixture: ensure APP_NAME is "Vigil" for every test in this file.
 # Other test files set APP_NAME="" via os.environ.setdefault, which silently
 # wins when they run first. Patch the module attribute directly so our tests
 # are isolated from load-order effects.
@@ -111,8 +111,8 @@ _mock_create_backend_patcher.stop()
 
 @pytest.fixture(autouse=True)
 def patch_app_name():
-    with patch.object(orch, "APP_NAME", "SentinelFO"), \
-         patch.object(failback, "APP_NAME", "SentinelFO"):
+    with patch.object(orch, "APP_NAME", "Vigil"), \
+         patch.object(failback, "APP_NAME", "Vigil"):
         yield
 
 
@@ -248,7 +248,7 @@ class TestSNSDegradationWarnings:
         assert "degraded" in subject
         assert "2/3" in subject
         assert "us-east-1" in subject
-        assert subject.startswith("[SentinelFO]")
+        assert subject.startswith("[Vigil]")
         assert len(subject) <= 100
 
     @patch.object(orch, "update_failover_state")
@@ -405,7 +405,7 @@ class TestSNSRegionRecovery:
         assert "RECOVERED" in subject
         assert "us-east-1" in subject
         assert "rejoining" in subject.lower() or "healthy" in subject.lower()
-        assert subject.startswith("[SentinelFO]")
+        assert subject.startswith("[Vigil]")
         assert len(subject) <= 100
 
     @patch.object(orch, "update_failover_state")
@@ -543,7 +543,7 @@ class TestSNSFailoverExecution:
         assert "FAILOVER" in subject
         assert "us-east-2" in subject
         assert "PROMOTE DATA TIER NOW" in subject
-        assert subject.startswith("[SentinelFO]")
+        assert subject.startswith("[Vigil]")
         assert len(subject) <= 100
 
         assert "failover-global-replication-group" in message
@@ -642,7 +642,7 @@ class TestSNSFailoverExecution:
         subject = failover_calls[-1][1]["Subject"]
         assert "FAILOVER" in subject
         assert "PROMOTE DATA TIER NOW" in subject
-        assert subject.startswith("[SentinelFO]")
+        assert subject.startswith("[Vigil]")
 
     @patch.object(orch, "update_failover_state")
     @patch.object(orch, "publish_region_health_metric")
@@ -739,7 +739,7 @@ class TestSNSAuroraPromotionReminders:
         subject = _get_sns_subject(mock_sns)
         assert "Aurora promotion confirmed" in subject
         assert "us-east-2" in subject
-        assert subject.startswith("[SentinelFO]")
+        assert subject.startswith("[Vigil]")
         assert len(subject) <= 100
         # Flag must be cleared
         mock_upd.assert_called_with({"aurora_promotion_pending": False})
@@ -770,7 +770,7 @@ class TestSNSAuroraPromotionReminders:
         assert "Aurora" in subject
         assert "pending" in subject
         assert "5m" in subject
-        assert subject.startswith("[SentinelFO]")
+        assert subject.startswith("[Vigil]")
 
     @patch.object(orch, "update_failover_state")
     @patch.object(orch, "publish_region_health_metric")
@@ -844,7 +844,7 @@ class TestSNSElasticachePromotionReminders:
         subject = _get_sns_subject(mock_sns)
         assert "ElastiCache promotion confirmed" in subject
         assert "us-east-2" in subject
-        assert subject.startswith("[SentinelFO]")
+        assert subject.startswith("[Vigil]")
         assert len(subject) <= 100
         mock_upd.assert_called_with({"redis_promotion_pending": False})
 
@@ -977,7 +977,7 @@ class TestSNSPassiveRegionNotifications:
         assert "Passive" in subject
         assert "us-east-2" in subject
         assert "unhealthy" in subject.lower()
-        assert subject.startswith("[SentinelFO]")
+        assert subject.startswith("[Vigil]")
         assert len(subject) <= 100
 
     @patch.object(orch, "update_failover_state")
@@ -1033,7 +1033,7 @@ class TestSNSPassiveRegionNotifications:
         assert "CRITICAL" in subject
         assert "Dual-Region" in subject
         assert "Outage" in subject
-        assert subject.startswith("[SentinelFO]")
+        assert subject.startswith("[Vigil]")
 
     @patch.object(orch, "update_failover_state")
     @patch.object(orch, "publish_region_health_metric")
@@ -1098,12 +1098,12 @@ class TestSNSSubjectAndThrottling:
 
     @patch.object(orch, "sns")
     def test_subject_prefixed_with_app_name(self, mock_sns):
-        """Subject is prefixed with [SentinelFO] when APP_NAME is configured."""
-        with patch.object(orch, "APP_NAME", "SentinelFO"):
+        """Subject is prefixed with [Vigil] when APP_NAME is configured."""
+        with patch.object(orch, "APP_NAME", "Vigil"):
             orch.send_notification("FAILOVER: test subject", "body")
 
         subject = _get_sns_subject(mock_sns)
-        assert subject.startswith("[SentinelFO]")
+        assert subject.startswith("[Vigil]")
         assert "FAILOVER" in subject
 
     @patch.object(orch, "sns")
@@ -1120,7 +1120,7 @@ class TestSNSSubjectAndThrottling:
     def test_subject_truncated_to_100_chars(self, mock_sns):
         """Subject is truncated to 100 characters maximum."""
         long_subject = "X" * 200
-        with patch.object(orch, "APP_NAME", "SentinelFO"):
+        with patch.object(orch, "APP_NAME", "Vigil"):
             orch.send_notification(long_subject, "body")
 
         subject = _get_sns_subject(mock_sns)
@@ -1341,7 +1341,7 @@ class TestSNSFailback:
         assert "FAILBACK BLOCKED" in subject
         assert "us-east-1" in subject
         assert "not ready" in subject
-        assert subject.startswith("[SentinelFO]")
+        assert subject.startswith("[Vigil]")
         assert len(subject) <= 100
 
     @patch.object(failback, "create_backend")
@@ -1363,7 +1363,7 @@ class TestSNSFailback:
         subject = _get_sns_subject(mock_sns)
         assert "FAILBACK COMPLETE" in subject
         assert "us-east-1" in subject
-        assert subject.startswith("[SentinelFO]")
+        assert subject.startswith("[Vigil]")
         assert len(subject) <= 100
 
         message = _get_sns_message(mock_sns)
@@ -1401,7 +1401,7 @@ class TestSNSFailback:
         assert len(failed_calls) == 1
         subject = failed_calls[0][1]["Subject"]
         assert "us-east-1" in subject
-        assert subject.startswith("[SentinelFO]")
+        assert subject.startswith("[Vigil]")
 
     @patch.object(failback, "create_backend")
     @patch.object(failback, "publish_region_health_metric")
@@ -1425,4 +1425,4 @@ class TestSNSFailback:
         subject = _get_sns_subject(mock_sns)
         assert "FAILBACK COMPLETE" in subject
         assert "us-east-1" in subject
-        assert subject.startswith("[SentinelFO]")
+        assert subject.startswith("[Vigil]")

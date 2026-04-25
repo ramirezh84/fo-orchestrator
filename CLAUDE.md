@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**SentinelFO** (Sentinel Failover Orchestrator) — AI-enhanced multi-region failover platform for AWS infrastructure. Lambda-based system that manages automated failover and manual failback between us-west-1 (primary) and us-west-2 (secondary), with progressive AI intelligence for root cause analysis, failback readiness, and Aurora promotion decisions.
+**Vigil** — AI-enhanced multi-region failover platform for AWS infrastructure. Lambda-based system that manages automated failover and manual failback between us-west-1 (primary) and us-west-2 (secondary), with progressive AI intelligence for root cause analysis, failback readiness, and Aurora promotion decisions.
 
 **Core problem solved:** Route 53 failover records are stateless and can flip traffic back and forth rapidly. This system adds a decision layer with consecutive-failure thresholds, cooldowns, and an explicit latch that keeps the old region marked unhealthy until an operator manually runs failback.
 
@@ -24,7 +24,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ### Demo Environment (v2.0 Platform)
 
-Single shared infrastructure controlled by the SentinelFO portal. Aurora and ECS run permanently. Lambda versioning with aliases enables switching between v1.0/v1.1/v1.2 behavior via env vars.
+Single shared infrastructure controlled by the Vigil portal. Aurora and ECS run permanently. Lambda versioning with aliases enables switching between v1.0/v1.1/v1.2 behavior via env vars.
 
 - **Portal:** `python3 portal/app.py` → http://localhost:5001 (login: eramirez)
 - **Lambda aliases:** `v1-0`, `v1-1`, `v1-2`, `active` — all point to the same code (v1.2.1). Version behavior controlled by env vars.
@@ -76,7 +76,7 @@ Before merging any PR:
 # Run the full test suite (REQUIRED before every commit)
 python3 -m pytest tests/ -v
 
-# Run the SentinelFO control portal (http://localhost:5001)
+# Run the Vigil control portal (http://localhost:5001)
 python3 portal/app.py
 
 # Publish Lambda version and update alias (demo environment)
@@ -130,7 +130,7 @@ Runtime dependencies: `boto3`, `botocore` (provided by Lambda runtime). Portal a
 | `ai/stability_collector.py` | Time-series stability data: Aurora replication lag, ECS task trends, ALB error rates. |
 | `ai/failback_readiness.py` | LLM-powered GO/NO-GO/CAUTION assessment before failback. |
 | `ai/aurora_advisor.py` | Progressive Aurora promotion advisor: advisory → guided → autonomous modes. |
-| `portal/app.py` | SentinelFO control portal (Flask). Test configuration, activation, demo visualization. |
+| `portal/app.py` | Vigil control portal (Flask). Test configuration, activation, demo visualization. |
 | `portal/aws_ops.py` | Portal AWS operations: Lambda alias switching, ECS scaling, Aurora management, state reset. |
 | `portal/config.py` | Portal configuration: version definitions, feature matrix, AWS resource names. |
 | `portal/lock.py` | DynamoDB-based test locking (prevents concurrent tests). |

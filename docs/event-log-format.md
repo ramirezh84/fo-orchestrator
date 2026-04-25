@@ -1,4 +1,4 @@
-# SentinelFO Event Log Format
+# Vigil Event Log Format
 
 All structured events are emitted to CloudWatch Logs as JSON lines. The ingestion filter for P1 alerting is:
 

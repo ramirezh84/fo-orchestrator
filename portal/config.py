@@ -1,4 +1,4 @@
-"""SentinelFO Portal configuration — version definitions, feature matrix, AWS resource names."""
+"""Vigil Portal configuration — version definitions, feature matrix, AWS resource names."""
 
 # ── Regions ──────────────────────────────────────────────────────────────────
 

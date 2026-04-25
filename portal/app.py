@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SentinelFO Control Portal — stack-aware."""
+"""Vigil Control Portal — stack-aware."""
 
 import json
 import logging

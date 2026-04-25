@@ -1,6 +1,6 @@
 ---
 name: Feature Request
-about: Propose a new feature or enhancement for SentinelFO
+about: Propose a new feature or enhancement for Vigil
 labels: enhancement
 ---
 
