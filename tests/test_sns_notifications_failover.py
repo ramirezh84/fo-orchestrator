@@ -628,6 +628,59 @@ class TestSNSFailoverExecution:
     @patch.object(orch, "publish_region_health_metric")
     @patch.object(orch, "evaluate_region_health")
     @patch.object(orch, "sns")
+    def test_failover_auto_promote_v16_template(
+        self, mock_sns, mock_health, mock_pub, mock_upd
+    ):
+        """v1.6 PR3b: AURORA_AUTO_PROMOTE=true path emits the new structured template.
+
+        Subject is severity-prefixed with "From → To" framing; body has the
+        WHAT/WHY/CONTEXT/JOURNEY/NEXT shape and explains the latch + monitor command.
+        """
+        mock_health.return_value = _unhealthy_health()
+        state = _make_state(consecutive_failures=2)
+        aurora_result = {"success": True, "method": "switchover"}
+
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(orch, "try_increment_failures", return_value=True))
+            stack.enter_context(patch.object(orch, "try_claim_failover", return_value=True))
+            stack.enter_context(patch.object(orch, "_emit_failover_event"))
+            stack.enter_context(patch.object(orch, "_run_rca_analysis", return_value=""))
+            stack.enter_context(patch.object(orch, "_run_aurora_advisor", return_value=("", None)))
+            stack.enter_context(patch.object(orch, "_auto_promote_aurora", return_value=aurora_result))
+            stack.enter_context(patch.dict(os.environ, {"AURORA_AUTO_PROMOTE": "true"}))
+            stack.enter_context(config_variant(elasticache=True))
+
+            orch._handle_active_region(state, "us-east-1", 2, "1970-01-01T00:00:00Z")
+
+        failover_calls = [
+            c for c in mock_sns.publish.call_args_list
+            if "Failover triggered" in c[1].get("Subject", "")
+        ]
+        assert len(failover_calls) == 1, "Exactly one v1.6-templated failover email expected"
+        subject = failover_calls[0][1]["Subject"]
+        body = failover_calls[0][1]["Message"]
+
+        # Subject: severity prefix + From→To framing.
+        assert subject.startswith("[Vigil] CRITICAL:")
+        assert "us-east-1 to us-east-2" in subject
+        assert len(subject) <= 100
+
+        # Body has all four required sections in order.
+        for heading in ("WHAT IS HAPPENING", "WHERE WE ARE IN THE INCIDENT",
+                        "CONTEXT", "WHAT TO DO NEXT"):
+            assert heading in body, f"Missing section: {heading}"
+
+        # Journey breadcrumb shows we're at the failover step.
+        assert "[→] Failover IN PROGRESS" in body
+        # Next-step gives the operator the actual monitor command.
+        assert "describe-db-clusters" in body
+        # Latch context surfaced explicitly so operator knows traffic stays put.
+        assert "latch is engaged" in body.lower()
+
+    @patch.object(orch, "update_failover_state")
+    @patch.object(orch, "publish_region_health_metric")
+    @patch.object(orch, "evaluate_region_health")
+    @patch.object(orch, "sns")
     def test_failover_with_api_gw_decision_reason_in_message(
         self, mock_sns, mock_health, mock_pub, mock_upd
     ):
@@ -755,10 +808,12 @@ class TestSNSAuroraPromotionReminders:
     @patch.object(orch, "publish_region_health_metric")
     @patch.object(orch, "_check_if_aurora_writer", return_value=True)
     @patch.object(orch, "sns")
-    def test_aurora_confirmed_sends_critical(
+    def test_aurora_confirmed_sends_info(
         self, mock_sns, mock_check, mock_pub, mock_upd
     ):
-        """Aurora promotion confirmed: CRITICAL notification sent (line 1872)."""
+        """v1.6: Aurora promotion confirmed is INFO (was CRITICAL — promotion success
+        is good news, not an alert). Subject names the new writer; body explains
+        the app can write again."""
         state = _make_state(
             active_region="us-east-2",
             state="WAITING_AURORA_PROMOTION",
@@ -771,12 +826,15 @@ class TestSNSAuroraPromotionReminders:
 
         assert mock_sns.publish.called
         subject = _get_sns_subject(mock_sns)
-        assert "Aurora promotion confirmed" in subject
-        assert "us-east-2" in subject
-        assert subject.startswith("[Vigil]")
+        assert subject.startswith("[Vigil] INFO:")
+        assert "Aurora is now writer in us-east-2" in subject
         assert len(subject) <= 100
         # Flag must be cleared
         mock_upd.assert_called_with({"aurora_promotion_pending": False})
+
+        body = _get_sns_message(mock_sns)
+        assert "your app can now write" in body.lower()
+        assert "[✓] Aurora promoted" in body
 
     @patch.object(orch, "update_failover_state")
     @patch.object(orch, "publish_region_health_metric")
@@ -862,8 +920,9 @@ class TestSNSElasticachePromotionReminders:
     @patch.object(orch, "update_failover_state")
     @patch.object(orch, "_check_if_elasticache_primary", return_value=True)
     @patch.object(orch, "sns")
-    def test_ec_confirmed_sends_critical(self, mock_sns, mock_check, mock_upd):
-        """ElastiCache confirmed: CRITICAL notification sent (line 1938)."""
+    def test_ec_confirmed_sends_info(self, mock_sns, mock_check, mock_upd):
+        """v1.6: ElastiCache promotion confirmed is INFO (was CRITICAL — same
+        rationale as Aurora confirmed)."""
         state = _make_state(
             active_region="us-east-2",
             state="WAITING_AURORA_PROMOTION",
@@ -876,11 +935,14 @@ class TestSNSElasticachePromotionReminders:
 
         assert mock_sns.publish.called
         subject = _get_sns_subject(mock_sns)
-        assert "ElastiCache promotion confirmed" in subject
-        assert "us-east-2" in subject
-        assert subject.startswith("[Vigil]")
+        assert subject.startswith("[Vigil] INFO:")
+        assert "ElastiCache is now primary in us-east-2" in subject
         assert len(subject) <= 100
         mock_upd.assert_called_with({"redis_promotion_pending": False})
+
+        body = _get_sns_message(mock_sns)
+        assert "[✓] Redis promoted" in body
+        assert "served locally" in body.lower()
 
     @patch.object(orch, "update_failover_state")
     @patch.object(orch, "_check_if_elasticache_primary", return_value=False)
