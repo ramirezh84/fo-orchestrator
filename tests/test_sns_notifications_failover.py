@@ -648,7 +648,11 @@ class TestSNSFailoverExecution:
     def test_failover_no_ec_excludes_elasticache_commands(
         self, mock_sns, mock_health, mock_pub, mock_upd
     ):
-        """Without ElastiCache (C2 config): v1.6 message has no Redis content."""
+        """Without ElastiCache (C2 config): v1.6 message has no Redis content.
+
+        Issue #96: also assert ElastiCache is absent from the WHY paragraph.
+        Pre-fix this test passed because it only checked for 'Redis', but
+        the WHY text actually used 'Aurora and/or ElastiCache' verbatim."""
         self._run_failover(mock_sns, mock_health, mock_pub, mock_upd, elasticache=False)
 
         failover_calls = [
@@ -658,9 +662,12 @@ class TestSNSFailoverExecution:
         assert len(failover_calls) == 1
         message = failover_calls[-1][1]["Message"]
 
-        # No ElastiCache in body; no Redis row in journey.
+        # No ElastiCache or Redis in body; no Redis row in journey.
         assert "failover-global-replication-group" not in message
         assert "Redis" not in message
+        assert "ElastiCache" not in message
+        # WHY paragraph names only Aurora as the manual-promote target.
+        assert "promote Aurora manually" in message
         # Aurora commands and journey row still present.
         assert "switchover-global-cluster" in message or "aurora" in message.lower()
         assert "Aurora — operator action required" in message
@@ -1918,6 +1925,115 @@ class TestSNSFailback:
         assert subject.startswith("[Vigil] INFO:")
         assert "back to normal" in subject.lower()
         assert "us-east-1" in subject
+
+    # ----- v1.7.3 (issue #96): config-aware "all back to normal" body ----
+
+    @patch.object(failback, "create_backend")
+    @patch.object(failback, "publish_region_health_metric")
+    @patch.object(failback, "update_failover_state")
+    @patch.object(failback, "get_failover_state")
+    @patch.object(failback, "sns")
+    def test_failback_complete_aurora_only_omits_redis(
+        self, mock_sns, mock_get_state, mock_upd, mock_pub, mock_cb
+    ):
+        """Issue #96: Aurora-only stack — 'all back to normal' body must NOT
+        mention Redis/ElastiCache anywhere (was hedged with 'where applicable')."""
+        mock_cb.return_value = MagicMock()
+        mock_get_state.return_value = _make_failback_state()
+
+        with patch.dict(os.environ, {
+            "AURORA_CLUSTER_ID": "test-aurora-e1",
+            "ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID": "",
+        }):
+            result = failback.handler(self._run_failback(), None)
+
+        assert result["statusCode"] == 200
+        complete_calls = [
+            c for c in mock_sns.publish.call_args_list
+            if "back to normal" in c[1].get("Subject", "").lower()
+        ]
+        assert len(complete_calls) == 1
+        body = complete_calls[0][1]["Message"]
+        assert "Aurora writer in us-east-1" in body
+        assert "Redis" not in body
+        assert "ElastiCache" not in body
+        # Journey must not have a Redis switchover step.
+        assert "Redis switchover" not in body
+        # Aurora switchover step is still present.
+        assert "Aurora switchover" in body
+
+    @patch.object(failback, "create_backend")
+    @patch.object(failback, "publish_region_health_metric")
+    @patch.object(failback, "update_failover_state")
+    @patch.object(failback, "get_failover_state")
+    @patch.object(failback, "sns")
+    def test_failback_complete_aurora_and_redis_lists_both(
+        self, mock_sns, mock_get_state, mock_upd, mock_pub, mock_cb
+    ):
+        """Issue #96: both tiers configured — body lists Aurora writer AND
+        Redis primary explicitly; journey has both switchover steps."""
+        mock_cb.return_value = MagicMock()
+        mock_get_state.return_value = _make_failback_state()
+
+        with patch.dict(os.environ, {
+            "AURORA_CLUSTER_ID": "test-aurora-e1",
+            "ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID": "test-redis-global",
+        }):
+            result = failback.handler(
+                self._run_failback({"redis_confirmed": True}), None
+            )
+
+        assert result["statusCode"] == 200
+        complete_calls = [
+            c for c in mock_sns.publish.call_args_list
+            if "back to normal" in c[1].get("Subject", "").lower()
+        ]
+        assert len(complete_calls) == 1
+        body = complete_calls[0][1]["Message"]
+        assert "Aurora writer in us-east-1" in body
+        assert "Redis primary in us-east-1" in body
+        assert "Aurora switchover" in body
+        assert "Redis switchover" in body
+        # The hedging "where applicable" wording must be gone.
+        assert "where applicable" not in body
+
+    @patch.object(failback, "create_backend")
+    @patch.object(failback, "publish_region_health_metric")
+    @patch.object(failback, "update_failover_state")
+    @patch.object(failback, "get_failover_state")
+    @patch.object(failback, "sns")
+    def test_failback_complete_app_only_no_data_tier_terms(
+        self, mock_sns, mock_get_state, mock_upd, mock_pub, mock_cb
+    ):
+        """Issue #96: app-only stack — no Aurora, no Redis — body's validation
+        list must contain only 'HTTP 200, ECS healthy' and journey must skip
+        both data-tier switchover steps."""
+        mock_cb.return_value = MagicMock()
+        mock_get_state.return_value = _make_failback_state()
+
+        with patch.dict(os.environ, {
+            "AURORA_CLUSTER_ID": "",
+            "ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID": "",
+        }):
+            result = failback.handler({
+                "target_region": "us-east-1",
+                "operator": "test-operator",
+                "skip_health_check": True,
+                "skip_readiness_check": True,
+            }, None)
+
+        assert result["statusCode"] == 200
+        complete_calls = [
+            c for c in mock_sns.publish.call_args_list
+            if "back to normal" in c[1].get("Subject", "").lower()
+        ]
+        assert len(complete_calls) == 1
+        body = complete_calls[0][1]["Message"]
+        assert "HTTP 200" in body
+        assert "ECS healthy" in body
+        assert "Aurora" not in body
+        assert "Redis" not in body
+        assert "ElastiCache" not in body
 
 
 # ===========================================================================

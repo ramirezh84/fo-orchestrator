@@ -270,3 +270,98 @@ class TestAllStableOnSecondary:
             if "stable" in c[1].get("Subject", "").lower()
         ]
         assert len(stable_calls) == 0
+
+
+# ---------------------------------------------------------------------------
+# 4. v1.7.3 (issue #96): "all stable" body must reflect actual tier config
+# ---------------------------------------------------------------------------
+
+class TestAllStableConfigAware:
+    """Issue #96: when ElastiCache is not configured the 'all stable' email
+    must NOT mention ElastiCache/Redis in its WHY paragraph. Was hardcoded
+    to 'Aurora and ElastiCache promotions completed successfully' regardless
+    of what the deployment actually had — confusing for app-only or Aurora-
+    only stacks."""
+
+    def _drive_transition(self, mock_sns, mock_health):
+        mock_health.return_value = {"healthy": True, "decision_reason": "ok", "signals": []}
+        state = _state(
+            active_region="us-east-2",
+            state="WAITING_AURORA_PROMOTION",
+            aurora_promotion_pending=False,
+            redis_promotion_pending=False,
+            latch_engaged=True,
+        )
+        with patch.object(orch, "CURRENT_REGION", "us-east-2"):
+            orch._handle_active_region(state, "us-east-2", 0, "1970-01-01T00:00:00Z")
+        stable_calls = [
+            c for c in mock_sns.publish.call_args_list
+            if "stable" in c[1].get("Subject", "").lower()
+            or "failover complete" in c[1].get("Subject", "").lower()
+        ]
+        assert len(stable_calls) == 1
+        return stable_calls[0][1]["Message"]
+
+    @patch.object(orch, "update_failover_state")
+    @patch.object(orch, "publish_region_health_metric")
+    @patch.object(orch, "try_increment_failures", return_value=False)
+    @patch.object(orch, "evaluate_region_health")
+    @patch.object(orch, "sns")
+    def test_aurora_and_redis_mentions_both(
+        self, mock_sns, mock_health, mock_inc, mock_pub, mock_upd
+    ):
+        """Both tiers configured: WHY paragraph names both."""
+        with patch.dict(os.environ, {
+            "AURORA_CLUSTER_ID": "test-aurora-e1",
+            "ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID": "test-redis-global",
+        }):
+            body = self._drive_transition(mock_sns, mock_health)
+        assert "Aurora and ElastiCache promotions completed successfully" in body
+        # CONTEXT block has both data-tier lines.
+        assert "Aurora writer: us-east-2" in body
+        assert "Redis primary: us-east-2" in body
+
+    @patch.object(orch, "update_failover_state")
+    @patch.object(orch, "publish_region_health_metric")
+    @patch.object(orch, "try_increment_failures", return_value=False)
+    @patch.object(orch, "evaluate_region_health")
+    @patch.object(orch, "sns")
+    def test_aurora_only_omits_elasticache(
+        self, mock_sns, mock_health, mock_inc, mock_pub, mock_upd
+    ):
+        """Aurora-only stack (no ElastiCache): WHY must say 'Aurora promotion
+        completed' singular and must NOT mention ElastiCache or Redis. CONTEXT
+        Data-tier line must omit the Redis row."""
+        with patch.dict(os.environ, {
+            "AURORA_CLUSTER_ID": "test-aurora-e1",
+            "ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID": "",
+        }):
+            body = self._drive_transition(mock_sns, mock_health)
+        assert "Aurora promotion completed successfully" in body
+        assert "ElastiCache" not in body
+        assert "Redis" not in body
+
+    @patch.object(orch, "update_failover_state")
+    @patch.object(orch, "publish_region_health_metric")
+    @patch.object(orch, "try_increment_failures", return_value=False)
+    @patch.object(orch, "evaluate_region_health")
+    @patch.object(orch, "sns")
+    def test_no_data_tier_uses_generic_phrase(
+        self, mock_sns, mock_health, mock_inc, mock_pub, mock_upd
+    ):
+        """App-only stack (no Aurora, no ElastiCache): WHY uses a generic
+        'failover completed successfully' phrase and the CONTEXT block has
+        no Data-tier line at all."""
+        with patch.dict(os.environ, {
+            "AURORA_CLUSTER_ID": "",
+            "ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID": "",
+        }):
+            body = self._drive_transition(mock_sns, mock_health)
+        assert "the failover completed successfully" in body
+        assert "Aurora" not in body
+        assert "ElastiCache" not in body
+        assert "Redis" not in body
+        # The CONTEXT block must NOT have a "Data tier :" row (compose_message
+        # renders k/v pairs as "  <label> : <value>"). The journey line
+        # "[✓] Data tier promoted" is unrelated and is allowed to remain.
+        assert "Data tier  :" not in body and "Data tier :" not in body
