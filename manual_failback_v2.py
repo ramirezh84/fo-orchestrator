@@ -83,7 +83,12 @@ APP_NAME = os.environ.get("APP_NAME", "")
 ENVIRONMENT = os.environ.get("ENVIRONMENT", "")
 
 HEALTH_CHECK_URL = os.environ.get("HEALTH_CHECK_URL", "")
-HEALTH_ENDPOINT = os.environ.get("HEALTH_ENDPOINT", "/actuator/health")
+# Default to /healthcheck (shallow, app-only) per CLAUDE.md recommendation.
+# /actuator/health and /deep-healthcheck typically include DB connectivity
+# checks, which can return 503 from DB-config issues unrelated to the actual
+# app health — those false positives blocked the v1.5 drill's failback step.
+# Operators who genuinely want deep validation can override via env var.
+HEALTH_ENDPOINT = os.environ.get("HEALTH_ENDPOINT", "/healthcheck")
 HEALTH_CHECK_TIMEOUT_SECONDS = int(os.environ.get("HEALTH_CHECK_TIMEOUT_SECONDS", "5"))
 ECS_CLUSTER_NAME = os.environ.get("ECS_CLUSTER_NAME", "")
 ECS_SERVICE_NAME = os.environ.get("ECS_SERVICE_NAME", "")
