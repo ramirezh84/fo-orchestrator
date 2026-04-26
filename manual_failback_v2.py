@@ -735,30 +735,69 @@ def _auto_failover_redis(target_region: str) -> dict:
     if not target_rg_id:
         return {"success": False, "error": "Cannot determine target RG ID"}
 
-    try:
-        ec = boto3.client("elasticache", region_name=CURRENT_REGION, config=_client_config)
-        ec.failover_global_replication_group(
-            GlobalReplicationGroupId=ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID,
-            PrimaryRegion=target_region,
-            PrimaryReplicationGroupId=target_rg_id,
-        )
-        logger.info(
-            f"ElastiCache failover initiated: "
-            f"{ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID} → {target_region}/{target_rg_id}"
-        )
-    except ClientError as e:
-        # Idempotency: if target region is already primary, treat as success
-        # and let wait_for_redis_primary confirm.
-        msg = str(e)
-        if "already primary" in msg.lower() or "in-eligible" in msg.lower():
-            logger.info(
-                f"ElastiCache target region {target_region} is already primary; "
-                f"falling through to wait-for-completion."
+    # F11 (v1.7.2): Global Datastore can be in a transient "modifying" state for
+    # several minutes after a recent failover/disassociation. The API surfaces
+    # this as InvalidGlobalReplicationGroupState. Retry the API call a few times
+    # with backoff before giving up. The wait loop after the API call still
+    # protects against the role-flip latency once the API accepts the call.
+    max_initiate_attempts = 5
+    initiate_backoff = 30  # seconds between retries on InvalidState
+
+    initiated = False
+    last_invalid_state_error = None
+    ec = boto3.client("elasticache", region_name=CURRENT_REGION, config=_client_config)
+    for attempt in range(1, max_initiate_attempts + 1):
+        try:
+            ec.failover_global_replication_group(
+                GlobalReplicationGroupId=ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID,
+                PrimaryRegion=target_region,
+                PrimaryReplicationGroupId=target_rg_id,
             )
-        else:
+            logger.info(
+                f"ElastiCache failover initiated: "
+                f"{ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID} → {target_region}/{target_rg_id} "
+                f"(attempt {attempt}/{max_initiate_attempts})"
+            )
+            initiated = True
+            break
+        except ClientError as e:
+            msg = str(e)
+            # Idempotency: if target region is already primary, treat as success
+            # and let wait_for_redis_primary confirm.
+            if "already primary" in msg.lower() or "in-eligible" in msg.lower():
+                logger.info(
+                    f"ElastiCache target region {target_region} is already primary; "
+                    f"falling through to wait-for-completion."
+                )
+                initiated = True
+                break
+            # F11: InvalidGlobalReplicationGroupState — transient, the Global
+            # Datastore is still settling from a recent operation. Wait + retry.
+            if "InvalidGlobalReplicationGroupState" in msg or "not in a valid state" in msg.lower():
+                last_invalid_state_error = msg
+                logger.info(
+                    f"ElastiCache Global Datastore in transient state on attempt "
+                    f"{attempt}/{max_initiate_attempts} (will retry in {initiate_backoff}s): {msg}"
+                )
+                if attempt < max_initiate_attempts:
+                    time.sleep(initiate_backoff)
+                    continue
+                # Exhausted retries on InvalidState — give up with a clear error
+                full_msg = (
+                    f"ElastiCache Global Datastore stayed in transient state for "
+                    f"~{(max_initiate_attempts - 1) * initiate_backoff}s "
+                    f"({max_initiate_attempts} retries): {last_invalid_state_error}"
+                )
+                logger.error(full_msg)
+                return {"success": False, "error": full_msg, "elapsed_seconds": 0}
+            # Any other error — fail immediately
             full_msg = f"ElastiCache failover-global-replication-group API failed: {e}"
             logger.error(full_msg)
             return {"success": False, "error": full_msg, "elapsed_seconds": 0}
+
+    if not initiated:
+        # Defensive — should be unreachable
+        return {"success": False, "error": "ElastiCache failover not initiated", "elapsed_seconds": 0}
 
     timeout = int(os.environ.get("FAILBACK_PROMOTION_WAIT_TIMEOUT_SECONDS", "480"))
     return wait_for_redis_primary(target_region, timeout)
@@ -1177,20 +1216,29 @@ def handler(event, context):
             journey.append("[✓] Redis switchover (operator)")
         journey.append("[✓] Latch released — system back to PRIMARY_ACTIVE")
         next_step = (
-            f"No action required. The orchestrator's automated health monitoring "
-            f"is active again in both regions. Confirm Route 53 traffic is flowing "
-            f"to {target_region} and watch for any sustained-failure WARNINGs in "
-            f"the next 5–10 minutes to verify the underlying issue is resolved."
+            f"No action required — the system is fully back to normal. The "
+            f"orchestrator's automated health monitoring is active again in both "
+            f"regions. The latch has been released, so if {target_region} fails "
+            f"again, automatic failover to {active_region} will fire normally. "
+            f"Confirm Route 53 traffic is flowing to {target_region} (DNS TTL "
+            f"~60s) and watch for any sustained-failure WARNINGs in the next "
+            f"5–10 minutes to confirm the underlying issue is fully resolved."
             + (readiness_appendix or "")
         )
         subject, body = compose_message(
-            severity=SEVERITY_CRITICAL,
-            what=f"Failback COMPLETE — traffic returned to {target_region}",
+            severity=SEVERITY_INFO,
+            what=(
+                f"All back to normal — traffic returned to {target_region}, "
+                f"failback complete"
+            ),
             why=(
                 f"Operator {operator} initiated and completed manual failback "
                 f"from {active_region} back to {target_region}. The orchestrator "
-                f"validated target health, released the latch, and updated state "
-                f"to PRIMARY_ACTIVE."
+                f"validated target health (HTTP 200, ECS healthy, Aurora writer in "
+                f"{target_region}, Redis primary in {target_region} where applicable), "
+                f"released the latch, and updated state to PRIMARY_ACTIVE. The "
+                f"system is in steady state with {target_region} fully serving "
+                f"traffic and the failover safety net armed."
             ),
             next_step=next_step,
             context={
@@ -1198,7 +1246,7 @@ def handler(event, context):
                 "From region": active_region,
                 "To region": target_region,
                 "New state": new_state,
-                "Latch": "RELEASED",
+                "Latch": "RELEASED — failover safety net armed",
             },
             journey=journey,
             source="failover-failback",
