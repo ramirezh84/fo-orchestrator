@@ -441,9 +441,8 @@ class TestSNSRegionRecovery:
     def test_region_recovered_active_active(
         self, mock_sns, mock_health, mock_emit, mock_inc, mock_pub, mock_upd
     ):
-        """Active/active: RECOVERED notification sent when region returns to healthy."""
+        """v1.6: Active/active recovery → INFO with rejoin journey."""
         mock_health.return_value = _healthy_health()
-        # consecutive_failures=3 means it was at threshold (unhealthy), now recovering
         state = _make_state(consecutive_failures=3)
 
         with config_variant(routing="active-active"):
@@ -451,11 +450,13 @@ class TestSNSRegionRecovery:
 
         assert mock_sns.publish.called
         subject = _get_sns_subject(mock_sns)
-        assert "RECOVERED" in subject
-        assert "us-east-1" in subject
-        assert "rejoining" in subject.lower() or "healthy" in subject.lower()
-        assert subject.startswith("[SentinelFO]")
+        assert subject.startswith("[SentinelFO] INFO:")
+        assert "us-east-1 recovered" in subject
+        assert "rejoining traffic pool" in subject
         assert len(subject) <= 100
+
+        body = _get_sns_message(mock_sns)
+        assert "[✓] Rejoined Route 53 traffic pool" in body
 
     @patch.object(orch, "update_failover_state")
     @patch.object(orch, "publish_region_health_metric")
@@ -507,7 +508,7 @@ class TestSNSRegionRecovery:
     def test_degraded_warning_active_active_below_threshold(
         self, mock_sns, mock_health, mock_inc, mock_pub, mock_upd
     ):
-        """Active/active: WARNING notification when below threshold (line 1314)."""
+        """v1.6: Active/active degradation → WARNING with active-active framing."""
         mock_health.return_value = _unhealthy_health()
         state = _make_state(consecutive_failures=1)
 
@@ -515,9 +516,9 @@ class TestSNSRegionRecovery:
             orch._handle_active_active(state)
 
         subject = _get_sns_subject(mock_sns)
-        assert "WARNING" in subject
-        assert "degraded" in subject
-        assert "2/3" in subject
+        assert subject.startswith("[SentinelFO] WARNING:")
+        assert "(active-active)" in subject
+        assert "2 of 3" in subject
 
     @patch.object(orch, "update_failover_state")
     @patch.object(orch, "publish_region_health_metric")
@@ -819,15 +820,20 @@ class TestSNSFailoverExecution:
             with pytest.raises(Exception, match="CloudWatch unavailable"):
                 orch._handle_active_region(state, "us-east-1", 2, "1970-01-01T00:00:00Z")
 
-        # FAILOVER FAILED notification must have been sent
+        # v1.6: subject is "Auto-failover FAILED — X → Y did not complete"
         failed_calls = [
             c for c in mock_sns.publish.call_args_list
-            if "FAILOVER FAILED" in c[1].get("Subject", "")
+            if "Auto-failover FAILED" in c[1].get("Subject", "")
         ]
         assert len(failed_calls) == 1
         subject = failed_calls[0][1]["Subject"]
         assert "us-east-1" in subject
         assert "us-east-2" in subject
+
+        # Body explains the state was reverted and what to investigate.
+        body = failed_calls[0][1]["Message"]
+        assert "[✗] Failover handler FAILED" in body
+        assert "state reverted" in body.lower()
 
 
 # ===========================================================================
