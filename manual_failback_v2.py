@@ -36,6 +36,7 @@ import os
 import json
 import logging
 import ssl
+import time
 from datetime import datetime, timezone
 from typing import Optional
 from urllib.request import urlopen, Request
@@ -623,17 +624,23 @@ def _resolve_target_aurora_arn(target_region: str) -> Optional[str]:
 
 
 def _auto_switchover_aurora(target_region: str) -> dict:
-    """Trigger Aurora switchover-global-cluster from the failback Lambda itself.
+    """Trigger Aurora switchover-global-cluster AND wait for completion.
 
     Used in the C3/C6/C9 paths where AURORA_AUTO_PROMOTE=true. Mirror of the
     orchestrator's _auto_promote_aurora but tailored to failback (planned
     switchover, never failover-with-data-loss).
 
-    Returns: ``{"success": bool, "error": str}``.
+    v1.7.1 (F10): now blocks on writer-flip completion before returning. The
+    SwitchoverGlobalCluster API returns immediately, but the actual writer
+    role flip takes 1–3 minutes — without this, validate_target_region_health
+    runs too early and refuses the failback. Configurable timeout via
+    FAILBACK_PROMOTION_WAIT_TIMEOUT_SECONDS (default 480s).
+
+    Returns: ``{"success": bool, "error": str, "elapsed_seconds": int}``.
     """
     target_arn = _resolve_target_aurora_arn(target_region)
     if not target_arn:
-        return {"success": False, "error": "Cannot determine target cluster ARN — set AURORA_GLOBAL_CLUSTER_ID + AURORA_CLUSTER_ID"}
+        return {"success": False, "error": "Cannot determine target cluster ARN — set AURORA_GLOBAL_CLUSTER_ID + AURORA_CLUSTER_ID", "elapsed_seconds": 0}
 
     try:
         rds = boto3.client("rds", region_name=CURRENT_REGION, config=_client_config)
@@ -644,11 +651,66 @@ def _auto_switchover_aurora(target_region: str) -> dict:
         logger.info(
             f"Aurora switchover initiated: {AURORA_GLOBAL_CLUSTER_ID} → {target_arn}"
         )
-        return {"success": True, "error": ""}
     except ClientError as e:
-        msg = f"Aurora switchover-global-cluster API failed: {e}"
-        logger.error(msg)
-        return {"success": False, "error": msg}
+        # Idempotency: if a switchover to this same target is already running
+        # (e.g. operator re-invoked the Lambda), treat it as success and fall
+        # through to the wait loop — it'll converge naturally.
+        msg = str(e)
+        if "already switching over" in msg.lower():
+            logger.info(
+                f"Aurora switchover to {target_arn} is already in progress; "
+                f"falling through to wait-for-completion."
+            )
+        else:
+            full_msg = f"Aurora switchover-global-cluster API failed: {e}"
+            logger.error(full_msg)
+            return {"success": False, "error": full_msg, "elapsed_seconds": 0}
+
+    # Block until target_region is the writer (or until timeout).
+    timeout = int(os.environ.get("FAILBACK_PROMOTION_WAIT_TIMEOUT_SECONDS", "480"))
+    return wait_for_aurora_writer(target_region, timeout)
+
+
+def wait_for_aurora_writer(target_region: str, timeout_seconds: int) -> dict:
+    """Poll the global cluster until target_region's member is writer.
+
+    F10 (v1.7.1): SwitchoverGlobalCluster returns immediately but the actual
+    writer flip takes 1-3 minutes. Without this wait,
+    validate_target_region_health runs too early and refuses the failback.
+
+    Returns: ``{"success": bool, "elapsed_seconds": int, "error": str}``.
+    """
+    if not AURORA_GLOBAL_CLUSTER_ID:
+        return {"success": False, "elapsed_seconds": 0,
+                "error": "AURORA_GLOBAL_CLUSTER_ID not configured"}
+
+    deadline = time.monotonic() + timeout_seconds
+    start = time.monotonic()
+    poll_interval = 10  # seconds
+    rds = boto3.client("rds", region_name=CURRENT_REGION, config=_client_config)
+
+    while True:
+        try:
+            resp = rds.describe_global_clusters(GlobalClusterIdentifier=AURORA_GLOBAL_CLUSTER_ID)
+            for gc in resp.get("GlobalClusters", []):
+                for member in gc.get("GlobalClusterMembers", []):
+                    arn = member.get("DBClusterArn", "")
+                    if f":{target_region}:" in arn and member.get("IsWriter"):
+                        elapsed = int(time.monotonic() - start)
+                        logger.info(
+                            f"Aurora writer is now in {target_region} after {elapsed}s"
+                        )
+                        return {"success": True, "elapsed_seconds": elapsed, "error": ""}
+        except ClientError as e:
+            logger.warning(f"describe_global_clusters during wait: {e}")
+
+        if time.monotonic() >= deadline:
+            elapsed = int(time.monotonic() - start)
+            return {
+                "success": False, "elapsed_seconds": elapsed,
+                "error": f"Aurora switchover did not complete in {elapsed}s",
+            }
+        time.sleep(poll_interval)
 
 
 def _auto_failover_redis(target_region: str) -> dict:
@@ -684,11 +746,66 @@ def _auto_failover_redis(target_region: str) -> dict:
             f"ElastiCache failover initiated: "
             f"{ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID} → {target_region}/{target_rg_id}"
         )
-        return {"success": True, "error": ""}
     except ClientError as e:
-        msg = f"ElastiCache failover-global-replication-group API failed: {e}"
-        logger.error(msg)
-        return {"success": False, "error": msg}
+        # Idempotency: if target region is already primary, treat as success
+        # and let wait_for_redis_primary confirm.
+        msg = str(e)
+        if "already primary" in msg.lower() or "in-eligible" in msg.lower():
+            logger.info(
+                f"ElastiCache target region {target_region} is already primary; "
+                f"falling through to wait-for-completion."
+            )
+        else:
+            full_msg = f"ElastiCache failover-global-replication-group API failed: {e}"
+            logger.error(full_msg)
+            return {"success": False, "error": full_msg, "elapsed_seconds": 0}
+
+    timeout = int(os.environ.get("FAILBACK_PROMOTION_WAIT_TIMEOUT_SECONDS", "480"))
+    return wait_for_redis_primary(target_region, timeout)
+
+
+def wait_for_redis_primary(target_region: str, timeout_seconds: int) -> dict:
+    """Poll the Global Datastore until target_region's RG has Role=PRIMARY.
+
+    F10 (v1.7.1): same shape as wait_for_aurora_writer — failover_global_replication_group
+    returns immediately but the role flip takes 30s-3min.
+
+    Returns: ``{"success": bool, "elapsed_seconds": int, "error": str}``.
+    """
+    if not ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID:
+        return {"success": False, "elapsed_seconds": 0,
+                "error": "ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID not configured"}
+
+    deadline = time.monotonic() + timeout_seconds
+    start = time.monotonic()
+    poll_interval = 10
+    ec = boto3.client("elasticache", region_name=CURRENT_REGION, config=_client_config)
+
+    while True:
+        try:
+            resp = ec.describe_global_replication_groups(
+                GlobalReplicationGroupId=ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID,
+                ShowMemberInfo=True,
+            )
+            for grg in resp.get("GlobalReplicationGroups", []):
+                for member in grg.get("Members", []):
+                    if (member.get("ReplicationGroupRegion") == target_region
+                            and member.get("Role") == "PRIMARY"):
+                        elapsed = int(time.monotonic() - start)
+                        logger.info(
+                            f"ElastiCache primary is now in {target_region} after {elapsed}s"
+                        )
+                        return {"success": True, "elapsed_seconds": elapsed, "error": ""}
+        except ClientError as e:
+            logger.warning(f"describe_global_replication_groups during wait: {e}")
+
+        if time.monotonic() >= deadline:
+            elapsed = int(time.monotonic() - start)
+            return {
+                "success": False, "elapsed_seconds": elapsed,
+                "error": f"ElastiCache failover did not complete in {elapsed}s",
+            }
+        time.sleep(poll_interval)
 
 
 def _reload_dynamic_config():
@@ -801,8 +918,16 @@ def handler(event, context):
     if cfg["aurora_present"]:
         if cfg["aurora_auto"] and not aurora_confirmed and not skip_aurora_check:
             logger.info("Step 2a: Aurora auto-switchover from failback Lambda...")
+            # _auto_switchover_aurora now blocks until the switchover completes
+            # (F10 / v1.7.1). It returns success only after target_region is the
+            # writer per describe_global_clusters, or fails with a 504-style
+            # timeout error if the flip didn't happen in
+            # FAILBACK_PROMOTION_WAIT_TIMEOUT_SECONDS (default 480s).
             result = _auto_switchover_aurora(target_region)
             if not result["success"]:
+                # Distinguish initiate-failure vs wait-timeout for status code.
+                is_timeout = "did not complete" in result.get("error", "")
+                status_code = 504 if is_timeout else 500
                 msg = (
                     f"Aurora auto-switchover FAILED.\n"
                     f"Error: {result['error']}\n\n"
@@ -813,9 +938,12 @@ def handler(event, context):
                     f"{build_aurora_switchover_commands(target_region)}"
                 )
                 logger.error(msg)
-                return {"statusCode": 500, "body": msg}
-            logger.info("Aurora auto-switchover initiated by Lambda")
-            aurora_confirmed = True  # we just did it
+                return {"statusCode": status_code, "body": msg}
+            logger.info(
+                f"Aurora switchover confirmed in "
+                f"{result.get('elapsed_seconds', 0)}s"
+            )
+            aurora_confirmed = True  # we just did it AND verified completion
         elif not cfg["aurora_auto"] and not aurora_confirmed and not skip_aurora_check:
             commands = build_aurora_switchover_commands(target_region)
             msg = (
@@ -853,8 +981,11 @@ def handler(event, context):
                 )
                 logger.error(msg)
                 return {"statusCode": 500, "body": msg}
-            logger.info("ElastiCache auto-failover initiated by Lambda")
-            redis_confirmed = True  # we just did it
+            logger.info(
+                f"ElastiCache failover confirmed in "
+                f"{result.get('elapsed_seconds', 0)}s"
+            )
+            redis_confirmed = True  # we just did it AND verified completion
         elif not cfg["redis_auto"] and not redis_confirmed and not skip_redis_check:
             commands = build_redis_failover_commands(target_region)
             msg = (
