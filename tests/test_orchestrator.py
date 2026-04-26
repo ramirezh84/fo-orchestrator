@@ -565,8 +565,12 @@ class TestFailoverTrigger:
         mock_publish.assert_any_call("us-east-1", False)
         # Notification sent
         mock_notify.assert_called_once()
-        subject = mock_notify.call_args[1].get("subject", "")
-        assert "PROMOTE DATA TIER" in subject or "PROMOTE AURORA" in subject
+        # v1.6 compose_message-based path uses positional args (subject, body).
+        subject = mock_notify.call_args.args[0] if mock_notify.call_args.args else \
+                  mock_notify.call_args.kwargs.get("subject", "")
+        # v1.6 wording is config-aware; the manual data-tier path uses
+        # "operator action required to promote data tier".
+        assert "promote" in subject.lower() and "data tier" in subject.lower()
 
     @patch.object(orch, "_run_rca_analysis", return_value="")
     @patch.object(orch, "send_warning_notification")

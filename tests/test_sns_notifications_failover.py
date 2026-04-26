@@ -190,15 +190,30 @@ def config_variant(
     routing: str = "failover",
     failover_mode: str = "auto",
 ):
-    """Apply per-test module-level patches for config variants."""
+    """Apply per-test module-level patches for config variants.
+
+    PR3c: also patches os.environ since detect_data_tier_config() now reads
+    env directly. Both module-attr and env patches are kept in lockstep so
+    the orchestrator's lazy-read paths (config_aware notifications) and
+    eager-read paths (existing imports) see consistent values.
+    """
+    redis_global = "my-global-redis" if elasticache else ""
+    redis_local = "my-redis-rg" if elasticache else ""
+    apigw = "my-api-gw-id" if api_gw else ""
+    env_patch = {
+        "ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID": redis_global,
+        "ELASTICACHE_REPLICATION_GROUP_ID": redis_local,
+        "API_GW_NAME": apigw,
+        "ROUTING_MODE": routing,
+        "FAILOVER_MODE": failover_mode,
+    }
     patches = [
-        patch.object(orch, "ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID",
-                     "my-global-redis" if elasticache else ""),
-        patch.object(orch, "ELASTICACHE_REPLICATION_GROUP_ID",
-                     "my-redis-rg" if elasticache else ""),
-        patch.object(orch, "API_GW_NAME", "my-api-gw-id" if api_gw else ""),
+        patch.object(orch, "ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID", redis_global),
+        patch.object(orch, "ELASTICACHE_REPLICATION_GROUP_ID", redis_local),
+        patch.object(orch, "API_GW_NAME", apigw),
         patch.object(orch, "ROUTING_MODE", routing),
         patch.object(orch, "FAILOVER_MODE", failover_mode),
+        patch.dict(os.environ, env_patch),
     ]
     with ExitStack() as stack:
         for p in patches:
@@ -537,7 +552,13 @@ class TestSNSFailoverExecution:
 
     def _run_failover(self, mock_sns, mock_health, mock_pub, mock_upd,
                       elasticache=True, region_health_override=None):
-        """Common helper: set up mocks and trigger failover in _handle_active_region."""
+        """Common helper: set up mocks and trigger failover in _handle_active_region.
+
+        PR3c: pins AURORA_CLUSTER_ID in os.environ so detect_data_tier_config()
+        sees Aurora as present. Other test files may have setdefault-ed
+        AURORA_CLUSTER_ID="" before this file's _ENV ran, so we have to patch
+        explicitly here rather than relying on module-load env state.
+        """
         mock_health.return_value = _unhealthy_health()
         state = _make_state(
             consecutive_failures=2,
@@ -550,6 +571,13 @@ class TestSNSFailoverExecution:
             stack.enter_context(patch.object(orch, "_emit_failover_event"))
             stack.enter_context(patch.object(orch, "_run_rca_analysis", return_value=""))
             stack.enter_context(patch.object(orch, "_run_aurora_advisor", return_value=("", None)))
+            # Pin Aurora env explicitly — _ENV setdefault doesn't override
+            # values another test file already set during pytest's collection
+            # phase, so we have to be explicit here.
+            stack.enter_context(patch.dict(os.environ, {
+                "AURORA_CLUSTER_ID": "my-aurora-w1",
+                "AURORA_AUTO_PROMOTE": "false",
+            }))
             stack.enter_context(config_variant(elasticache=elasticache))
 
             orch._handle_active_region(state, "us-east-1", 2, "1970-01-01T00:00:00Z")
@@ -561,28 +589,32 @@ class TestSNSFailoverExecution:
     def test_failover_s3_ec_includes_elasticache_commands(
         self, mock_sns, mock_health, mock_pub, mock_upd
     ):
-        """S3+ElastiCache: failover message includes ElastiCache CLI commands."""
+        """S3+ElastiCache, AURORA_AUTO_PROMOTE=false: v1.6 manual data-tier email
+        embeds Redis failover-global CLI command in the WHAT TO DO NEXT section."""
         self._run_failover(mock_sns, mock_health, mock_pub, mock_upd, elasticache=True)
 
         assert mock_sns.publish.called
-        # Find the FAILOVER notification (may be preceded by other calls)
+        # The v1.6 manual path uses "operator action required to promote data tier".
         failover_calls = [
             c for c in mock_sns.publish.call_args_list
-            if "FAILOVER" in c[1].get("Subject", "")
+            if "promote data tier" in c[1].get("Subject", "")
         ]
-        assert len(failover_calls) >= 1
+        assert len(failover_calls) == 1
         subject = failover_calls[-1][1]["Subject"]
         message = failover_calls[-1][1]["Message"]
 
-        assert "FAILOVER" in subject
+        assert subject.startswith("[SentinelFO] CRITICAL:")
         assert "us-east-2" in subject
-        assert "PROMOTE DATA TIER NOW" in subject
-        assert subject.startswith("[SentinelFO]")
+        assert "data tier" in subject.lower()
         assert len(subject) <= 100
 
+        # Body has the structured shape; CLI commands embedded in next-step.
+        assert "WHAT TO DO NEXT" in message
         assert "failover-global-replication-group" in message
         assert "my-global-redis" in message
-        assert "ELASTICACHE PROMOTION REQUIRED" in message
+        # Journey distinguishes Aurora vs Redis manual steps.
+        assert "Aurora — operator action required" in message
+        assert "Redis — operator action required" in message
 
     @patch.object(orch, "update_failover_state")
     @patch.object(orch, "publish_region_health_metric")
@@ -609,20 +641,22 @@ class TestSNSFailoverExecution:
     def test_failover_no_ec_excludes_elasticache_commands(
         self, mock_sns, mock_health, mock_pub, mock_upd
     ):
-        """Without ElastiCache: failover message does NOT include ElastiCache CLI."""
+        """Without ElastiCache (C2 config): v1.6 message has no Redis content."""
         self._run_failover(mock_sns, mock_health, mock_pub, mock_upd, elasticache=False)
 
         failover_calls = [
             c for c in mock_sns.publish.call_args_list
-            if "FAILOVER" in c[1].get("Subject", "")
+            if "promote data tier" in c[1].get("Subject", "")
         ]
-        assert len(failover_calls) >= 1
+        assert len(failover_calls) == 1
         message = failover_calls[-1][1]["Message"]
 
+        # No ElastiCache in body; no Redis row in journey.
         assert "failover-global-replication-group" not in message
-        assert "ELASTICACHE PROMOTION REQUIRED" not in message
-        # Aurora commands are still present
+        assert "Redis" not in message
+        # Aurora commands and journey row still present.
         assert "switchover-global-cluster" in message or "aurora" in message.lower()
+        assert "Aurora — operator action required" in message
 
     @patch.object(orch, "update_failover_state")
     @patch.object(orch, "publish_region_health_metric")
@@ -704,11 +738,11 @@ class TestSNSFailoverExecution:
 
         failover_calls = [
             c for c in mock_sns.publish.call_args_list
-            if "FAILOVER" in c[1].get("Subject", "")
+            if "promote data tier" in c[1].get("Subject", "")
         ]
-        assert len(failover_calls) >= 1
+        assert len(failover_calls) == 1
         message = failover_calls[-1][1]["Message"]
-        # API GW decision reason surfaced in message body
+        # API GW decision reason surfaced in message body (Decision context line).
         assert "api_gw_5xx" in message or "75.0%" in message
 
     @patch.object(orch, "update_failover_state")
@@ -718,18 +752,18 @@ class TestSNSFailoverExecution:
     def test_failover_ddb_same_sns_format(
         self, mock_sns, mock_health, mock_pub, mock_upd
     ):
-        """DynamoDB backend: failover SNS subject/message format identical to S3."""
+        """DynamoDB backend: v1.6 manual data-tier subject identical to S3 (state
+        backend doesn't affect notification template)."""
         self._run_failover(mock_sns, mock_health, mock_pub, mock_upd)
 
         failover_calls = [
             c for c in mock_sns.publish.call_args_list
-            if "FAILOVER" in c[1].get("Subject", "")
+            if "promote data tier" in c[1].get("Subject", "")
         ]
-        assert len(failover_calls) >= 1
+        assert len(failover_calls) == 1
         subject = failover_calls[-1][1]["Subject"]
-        assert "FAILOVER" in subject
-        assert "PROMOTE DATA TIER NOW" in subject
-        assert subject.startswith("[SentinelFO]")
+        assert subject.startswith("[SentinelFO] CRITICAL:")
+        assert "data tier" in subject.lower()
 
     @patch.object(orch, "update_failover_state")
     @patch.object(orch, "publish_region_health_metric")
@@ -1419,7 +1453,9 @@ class TestSNSFailback:
     def test_failback_blocked_region_not_ready(
         self, mock_sns, mock_get_state, mock_upd, mock_pub, mock_validate, mock_cb
     ):
-        """Region not healthy: FAILBACK BLOCKED notification sent (line 623)."""
+        """v1.6: Failback blocked when target region health gate fails. Subject says
+        'BLOCKED — target region X is not ready'; body lists every issue and tells
+        the operator the override flag."""
         mock_cb.return_value = MagicMock()
         mock_get_state.return_value = _make_failback_state()
         mock_validate.return_value = {
@@ -1434,11 +1470,19 @@ class TestSNSFailback:
         assert result["statusCode"] == 400
         assert mock_sns.publish.called
         subject = _get_sns_subject(mock_sns)
-        assert "FAILBACK BLOCKED" in subject
-        assert "us-east-1" in subject
-        assert "not ready" in subject
-        assert subject.startswith("[SentinelFO]")
+        assert subject.startswith("[SentinelFO] CRITICAL:")
+        assert "Failback BLOCKED" in subject
+        assert "us-east-1 is not ready" in subject
         assert len(subject) <= 100
+
+        body = _get_sns_message(mock_sns)
+        # Both issues are listed in the CONTEXT block.
+        assert "HTTP health check failed" in body
+        assert "ECS tasks: 0/2 running" in body
+        # Operator gets the explicit override path in WHAT TO DO NEXT.
+        assert "skip_health_check=true" in body
+        # Journey shows we failed at the health gate, before Aurora switchover.
+        assert "[✗] Target region health gate" in body
 
     @patch.object(failback, "create_backend")
     @patch.object(failback, "publish_region_health_metric")
@@ -1448,7 +1492,8 @@ class TestSNSFailback:
     def test_failback_complete_sends_critical(
         self, mock_sns, mock_get_state, mock_upd, mock_pub, mock_cb
     ):
-        """Successful failback: FAILBACK COMPLETE notification sent (line 684)."""
+        """v1.6: Successful failback emits CRITICAL completion email with full
+        journey breadcrumb showing every recovery step is done."""
         mock_cb.return_value = MagicMock()
         mock_get_state.return_value = _make_failback_state()
 
@@ -1457,14 +1502,17 @@ class TestSNSFailback:
         assert result["statusCode"] == 200
         assert mock_sns.publish.called
         subject = _get_sns_subject(mock_sns)
-        assert "FAILBACK COMPLETE" in subject
+        assert subject.startswith("[SentinelFO] CRITICAL:")
+        assert "Failback COMPLETE" in subject
         assert "us-east-1" in subject
-        assert subject.startswith("[SentinelFO]")
         assert len(subject) <= 100
 
-        message = _get_sns_message(mock_sns)
-        assert "Latch" in message or "latch" in message
-        assert "RELEASED" in message or "released" in message
+        body = _get_sns_message(mock_sns)
+        # Latch released and full journey arc shown.
+        assert "Latch" in body and "RELEASED" in body
+        assert "[✓] Latch released" in body
+        # Next-step tells operator what to watch for after recovery.
+        assert "Confirm Route 53" in body or "confirm route 53" in body.lower()
 
     @patch.object(failback, "create_backend")
     @patch.object(failback, "publish_region_health_metric")
@@ -1492,12 +1540,17 @@ class TestSNSFailback:
 
         failed_calls = [
             c for c in mock_sns.publish.call_args_list
-            if "FAILBACK FAILED" in c[1].get("Subject", "")
+            if "Failback FAILED" in c[1].get("Subject", "")
         ]
         assert len(failed_calls) == 1
         subject = failed_calls[0][1]["Subject"]
         assert "us-east-1" in subject
-        assert subject.startswith("[SentinelFO]")
+        assert subject.startswith("[SentinelFO] CRITICAL:")
+        body = failed_calls[0][1]["Message"]
+        # Body explains the failure happened AFTER the health gate passed,
+        # so the operator knows where to focus debugging.
+        assert "[✓] Health gate passed" in body
+        assert "[✗] DNS/state update — FAILED" in body
 
     @patch.object(failback, "create_backend")
     @patch.object(failback, "publish_region_health_metric")
@@ -1507,7 +1560,8 @@ class TestSNSFailback:
     def test_failback_complete_s3_backend_same_format(
         self, mock_sns, mock_get_state, mock_upd, mock_pub, mock_cb
     ):
-        """S3 backend: FAILBACK COMPLETE SNS format identical to DynamoDB variant."""
+        """S3 backend: failback complete subject identical to DynamoDB variant
+        (state backend is invisible to the notification template)."""
         mock_cb.return_value = MagicMock()
         mock_get_state.return_value = _make_failback_state()
 
@@ -1519,6 +1573,6 @@ class TestSNSFailback:
 
         assert result["statusCode"] == 200
         subject = _get_sns_subject(mock_sns)
-        assert "FAILBACK COMPLETE" in subject
+        assert subject.startswith("[SentinelFO] CRITICAL:")
+        assert "Failback COMPLETE" in subject
         assert "us-east-1" in subject
-        assert subject.startswith("[SentinelFO]")
