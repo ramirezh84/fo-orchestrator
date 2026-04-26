@@ -1,6 +1,6 @@
 ---
 name: Bug Report
-about: Report a bug in SentinelFO
+about: Report a bug in Vigil
 labels: bug
 ---
 

@@ -1,4 +1,4 @@
-"""AWS operations for the SentinelFO portal — stack-aware.
+"""AWS operations for the Vigil portal — stack-aware.
 
 Every function takes a stack_id ('ddb' or 's3') to select which
 set of AWS resources to operate on. No runtime env var switching.

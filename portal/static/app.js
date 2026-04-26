@@ -1,4 +1,4 @@
-/* SentinelFO Portal — Shared JavaScript */
+/* Vigil Portal — Shared JavaScript */
 
 // ── API Layer ───────────────────────────────────────────────────────────────
 

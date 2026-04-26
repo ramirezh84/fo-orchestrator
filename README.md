@@ -1,4 +1,4 @@
-# SentinelFO — AI-Enhanced Failover Orchestration
+# Vigil — AI-Enhanced Failover Orchestration
 
 Automated multi-region failover for AWS infrastructure with progressive AI intelligence. Lambda-based system that evaluates health, manages DNS failover via Route 53, coordinates Aurora database promotion, and uses LLM analysis to provide root cause analysis, failback readiness assessment, and Aurora promotion recommendations.
 
