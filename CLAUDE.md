@@ -383,8 +383,28 @@ The following infrastructure must be configured correctly for Vigil to operate. 
 
 - Lambda must be VPC-attached to reach private ALB endpoints
 - Both backends auto-create `PRIMARY_ACTIVE` state on first EventBridge invocation (no manual seeding needed)
-- SNS notifications are throttled for WARNING level (every 10 min) but never throttled for CRITICAL level
+- SNS notifications are throttled for WARNING level (every 5 min in v1.6, was 10 min in v1.5) but never throttled for CRITICAL level. First-failure / retry / escalation notifications bypass the throttle entirely.
 - `FAILOVER_MODE=manual` is useful during deployments to suppress automatic DNS changes while still getting health alerts
+
+## Operational Hazards
+
+Document of known surprises in adjacent AWS services that have bitten this stack. Each entry has the symptom, root cause, and runbook fix.
+
+### Route 53 health-check staleness after CloudWatch alarm modification (F2)
+
+**Symptom.** A CloudWatch alarm correctly transitions to `ALARM` state when its underlying metric drops below threshold, but the Route 53 `CLOUDWATCH_METRIC` health check pointing at that alarm keeps reporting `Success` for many minutes — meaning Route 53 failover records do NOT see the alarm fire and do NOT redirect traffic.
+
+**Where this was first seen.** v1.5 drill, 2026-04-25. After modifying a CW alarm's `Namespace` from `Custom/FoDemo` to `Custom/fo-v10x-s1` (a real fix — alarms had been watching the wrong metric stream), the alarm transitioned `OK → ALARM` on metric=0.0 at 19:52:06Z. Route 53 health-check observations at 20:00:53Z (>9 minutes later) still said `Success: 2 datapoints were not less than the threshold (1.0), breached: 0`.
+
+**Suspected root cause.** Route 53 caches the alarm-evaluation context (namespace + dimensions + metric name) at health-check creation time and does not always refresh the cache when the alarm's configuration changes underneath. The cached evaluator continues reporting against the old metric stream until something forces R53 to refresh — a long quiet period, an unrelated alarm modification, or recreation of the health check.
+
+**Why this is dangerous.** Route 53 failover records react to the R53 health check, not directly to the underlying CloudWatch alarm. So an alarm that fires correctly can be invisible to traffic routing for the duration of the R53 cache lag.
+
+**Runbook fix.** Whenever you modify a CloudWatch alarm that backs a Route 53 health check (changing namespace, dimensions, threshold, or metric name), you MUST recreate the Route 53 health check afterwards. The DNS record set that points at the old health-check ID has to be updated in the same change. Do not rely on R53 picking up the change on its own.
+
+**Validation.** Run `python3 tools/validate_r53_alarm_wiring.py [--prefix fo-v10x-s1]` to audit every CW-metric R53 health check in the stack. The tool flags inconsistencies between the alarm's actual state and what R53 is observing — a non-zero exit code means at least one health check has a stale evaluation context. Use this as a pre-deploy gate after any alarm modification.
+
+**Future-proofing.** When this is wired into CI, run the validator after the alarm-deploy step but before declaring the deployment successful — it will catch the staleness window deterministically.
 
 ## S3 State Backend Setup
 

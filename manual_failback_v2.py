@@ -83,7 +83,12 @@ APP_NAME = os.environ.get("APP_NAME", "")
 ENVIRONMENT = os.environ.get("ENVIRONMENT", "")
 
 HEALTH_CHECK_URL = os.environ.get("HEALTH_CHECK_URL", "")
-HEALTH_ENDPOINT = os.environ.get("HEALTH_ENDPOINT", "/actuator/health")
+# Default to /healthcheck (shallow, app-only) per CLAUDE.md recommendation.
+# /actuator/health and /deep-healthcheck typically include DB connectivity
+# checks, which can return 503 from DB-config issues unrelated to the actual
+# app health — those false positives blocked the v1.5 drill's failback step.
+# Operators who genuinely want deep validation can override via env var.
+HEALTH_ENDPOINT = os.environ.get("HEALTH_ENDPOINT", "/healthcheck")
 HEALTH_CHECK_TIMEOUT_SECONDS = int(os.environ.get("HEALTH_CHECK_TIMEOUT_SECONDS", "5"))
 ECS_CLUSTER_NAME = os.environ.get("ECS_CLUSTER_NAME", "")
 ECS_SERVICE_NAME = os.environ.get("ECS_SERVICE_NAME", "")
@@ -517,6 +522,138 @@ STEP 3: Then run this Lambda IN THE TARGET REGION with aurora_confirmed=true:
 """
 
 
+def build_redis_failover_commands(target_region: str) -> str:
+    """Build the ElastiCache Global Datastore failover commands for the operator.
+
+    Mirror of build_aurora_switchover_commands. Used by the Redis manual gate
+    in C4/C5/C8 configs (Redis present, ELASTICACHE_AUTO_PROMOTE=false).
+    """
+    if not ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID:
+        return "ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID not configured."
+
+    target_rg_id = ELASTICACHE_REPLICATION_GROUP_ID or "<TARGET_RG_ID>"
+    # Suffix swap when target_rg appears to be the local-region RG and we're
+    # invoking from the other region's perspective (mirror of the Aurora trick).
+    if target_rg_id != "<TARGET_RG_ID>":
+        if target_region == "us-west-2" and target_rg_id.endswith("-w1"):
+            target_rg_id = target_rg_id[:-3] + "-w2"
+        elif target_region == "us-west-1" and target_rg_id.endswith("-w2"):
+            target_rg_id = target_rg_id[:-3] + "-w1"
+
+    return f"""
+========================================================================
+ELASTICACHE FAILOVER COMMANDS - RUN THESE BEFORE FAILBACK
+========================================================================
+
+STEP 1: Failover ElastiCache Global Datastore to {target_region}:
+
+  aws elasticache failover-global-replication-group \\
+    --global-replication-group-id {ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID} \\
+    --primary-region {target_region} \\
+    --primary-replication-group-id {target_rg_id}
+
+STEP 2: Wait for failover to complete. Monitor with:
+
+  aws elasticache describe-global-replication-groups \\
+    --global-replication-group-id {ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID} \\
+    --show-member-info
+
+  When the member in {target_region} shows Role=PRIMARY, failover is complete.
+
+STEP 3: Then re-invoke this Lambda with redis_confirmed=true (alongside
+        aurora_confirmed=true if Aurora is also configured):
+
+  aws lambda invoke \\
+    --function-name {os.environ.get('AWS_LAMBDA_FUNCTION_NAME', 'failover-manual-failback')} \\
+    --payload '{{"target_region": "{target_region}", "operator": "YOUR_NAME", "aurora_confirmed": true, "redis_confirmed": true}}' \\
+    --region {target_region} \\
+    response.json
+
+========================================================================
+"""
+
+
+def _auto_switchover_aurora(target_region: str) -> dict:
+    """Trigger Aurora switchover-global-cluster from the failback Lambda itself.
+
+    Used in the C3/C6/C9 paths where AURORA_AUTO_PROMOTE=true. Mirror of the
+    orchestrator's _auto_promote_aurora but tailored to failback (planned
+    switchover, never failover-with-data-loss).
+
+    Returns: ``{"success": bool, "error": str}``.
+    """
+    if not AURORA_GLOBAL_CLUSTER_ID:
+        return {"success": False, "error": "AURORA_GLOBAL_CLUSTER_ID not configured"}
+
+    target_cluster_id = TARGET_AURORA_CLUSTER_ID or AURORA_CLUSTER_ID
+    if not TARGET_AURORA_CLUSTER_ID and target_cluster_id:
+        if target_region == "us-west-2" and target_cluster_id.endswith("-w1"):
+            target_cluster_id = target_cluster_id[:-3] + "-w2"
+        elif target_region == "us-west-1" and target_cluster_id.endswith("-w2"):
+            target_cluster_id = target_cluster_id[:-3] + "-w1"
+
+    if not target_cluster_id or not _AWS_ACCOUNT_ID:
+        return {"success": False, "error": "Cannot determine target cluster ARN"}
+
+    target_arn = (
+        f"arn:aws:rds:{target_region}:{_AWS_ACCOUNT_ID}:cluster:{target_cluster_id}"
+    )
+    try:
+        rds = boto3.client("rds", region_name=CURRENT_REGION, config=_client_config)
+        rds.switchover_global_cluster(
+            GlobalClusterIdentifier=AURORA_GLOBAL_CLUSTER_ID,
+            TargetDbClusterIdentifier=target_arn,
+        )
+        logger.info(
+            f"Aurora switchover initiated: {AURORA_GLOBAL_CLUSTER_ID} → {target_arn}"
+        )
+        return {"success": True, "error": ""}
+    except ClientError as e:
+        msg = f"Aurora switchover-global-cluster API failed: {e}"
+        logger.error(msg)
+        return {"success": False, "error": msg}
+
+
+def _auto_failover_redis(target_region: str) -> dict:
+    """Trigger ElastiCache Global Datastore failover from the failback Lambda.
+
+    Used in the C7/C8/C9 paths where ELASTICACHE_AUTO_PROMOTE=true. Mirror of
+    the orchestrator's _auto_promote_elasticache.
+
+    Returns: ``{"success": bool, "error": str}``.
+    """
+    if not ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID:
+        return {"success": False, "error": "ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID not configured"}
+
+    target_rg_id = ELASTICACHE_REPLICATION_GROUP_ID
+    # Suffix swap when ELASTICACHE_REPLICATION_GROUP_ID is the local-region RG.
+    if target_rg_id:
+        if target_region == "us-west-2" and target_rg_id.endswith("-w1"):
+            target_rg_id = target_rg_id[:-3] + "-w2"
+        elif target_region == "us-west-1" and target_rg_id.endswith("-w2"):
+            target_rg_id = target_rg_id[:-3] + "-w1"
+
+    if not target_rg_id:
+        return {"success": False, "error": "Cannot determine target RG ID"}
+
+    try:
+        ec = boto3.client("elasticache", region_name=CURRENT_REGION, config=_client_config)
+        ec.failover_global_replication_group(
+            GlobalReplicationGroupId=ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID,
+            PrimaryRegion=target_region,
+            PrimaryReplicationGroupId=target_rg_id,
+        )
+        logger.info(
+            f"ElastiCache failover initiated: "
+            f"{ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID} → {target_region}/{target_rg_id}"
+        )
+        return {"success": True, "error": ""}
+    except ClientError as e:
+        msg = f"ElastiCache failover-global-replication-group API failed: {e}"
+        logger.error(msg)
+        return {"success": False, "error": msg}
+
+
 def _reload_dynamic_config():
     """Re-read config that the portal may change between invocations."""
     global _state_backend, _remote_state_backend, _REMOTE_STATE_BUCKET
@@ -543,7 +680,19 @@ def handler(event, context):
         "target_region": "us-east-1",
         "skip_health_check": false,
         "operator": "enrique",
-        "aurora_confirmed": true    <-- REQUIRED: operator confirms Aurora is switched
+
+        # Aurora gates (only checked when Aurora is configured per
+        # detect_data_tier_config). If AURORA_AUTO_PROMOTE=true the Lambda
+        # performs the switchover itself and aurora_confirmed is not needed;
+        # if AURORA_AUTO_PROMOTE=false the operator must run the switchover
+        # manually first and pass aurora_confirmed=true.
+        "aurora_confirmed": true,         # required when Aurora present + manual
+        "skip_aurora_check": false,       # break-glass for the Aurora gate
+
+        # Redis gates (only checked when ElastiCache is configured). Same
+        # auto-vs-manual contract as Aurora. New in v1.6 (PR5/F5).
+        "redis_confirmed": true,          # required when Redis present + manual
+        "skip_redis_check": false,        # break-glass for the Redis gate
     }
     """
     _reload_dynamic_config()
@@ -552,13 +701,19 @@ def handler(event, context):
     skip_health_check = event.get("skip_health_check", False)
     operator = event.get("operator", "unknown")
     aurora_confirmed = event.get("aurora_confirmed", False)
+    skip_aurora_check = event.get("skip_aurora_check", False)
+    redis_confirmed = event.get("redis_confirmed", False)
+    skip_redis_check = event.get("skip_redis_check", False)
+    cfg = detect_data_tier_config()
     now = datetime.now(timezone.utc)
 
     logger.info(
         f"Manual failback initiated by {operator} to {target_region} | "
         f"skip_health_check={skip_health_check}, "
-        f"aurora_confirmed={aurora_confirmed}, "
-        f"current_region={CURRENT_REGION}"
+        f"aurora_confirmed={aurora_confirmed}, skip_aurora_check={skip_aurora_check}, "
+        f"redis_confirmed={redis_confirmed}, skip_redis_check={skip_redis_check}, "
+        f"current_region={CURRENT_REGION}, "
+        f"data_tier_config={cfg}"
     )
 
     # Step 1: Validate current state
@@ -590,20 +745,98 @@ def handler(event, context):
         logger.error(msg)
         return {"statusCode": 409, "body": msg}
 
-    # Step 2: Check if Aurora has been confirmed by the operator
-    logger.info("Step 2: Checking Aurora confirmation...")
-    if not aurora_confirmed:
-        commands = build_aurora_switchover_commands(target_region)
-        msg = (
-            f"Aurora switchover has NOT been confirmed.\n\n"
-            f"You must switchover Aurora BEFORE running failback.\n\n"
-            f"{commands}\n\n"
-            f"Once Aurora switchover is complete, run this Lambda again "
-            f"with aurora_confirmed=true."
-        )
-        logger.info("Aurora not confirmed, returning switchover commands")
-        return {"statusCode": 400, "body": msg}
-    logger.info("Aurora confirmed by operator")
+    # Step 2: Config-aware data-tier gates (PR5 / F5)
+    #
+    # The failback Lambda has to behave differently for each of the 9 baseline
+    # configurations (C1–C9). detect_data_tier_config() returns the four flags
+    # that drive the per-tier branching below:
+    #
+    #   aurora_present + aurora_auto      → Lambda runs switchover itself
+    #   aurora_present + not aurora_auto  → require aurora_confirmed=true
+    #   not aurora_present                → no Aurora gate at all
+    #   (same shape for Redis)
+    #
+    # Either tier can be overridden with skip_*_check=true as a break-glass
+    # when the operator has human-verified the data tier is ready and just
+    # wants the latch released.
+
+    # Aurora gate
+    if cfg["aurora_present"]:
+        if cfg["aurora_auto"] and not aurora_confirmed and not skip_aurora_check:
+            logger.info("Step 2a: Aurora auto-switchover from failback Lambda...")
+            result = _auto_switchover_aurora(target_region)
+            if not result["success"]:
+                msg = (
+                    f"Aurora auto-switchover FAILED.\n"
+                    f"Error: {result['error']}\n\n"
+                    f"Either restore Aurora's switchover capability and re-invoke "
+                    f"this Lambda, or run the switchover manually and re-invoke "
+                    f"with aurora_confirmed=true (or skip_aurora_check=true to "
+                    f"bypass the gate entirely).\n\n"
+                    f"{build_aurora_switchover_commands(target_region)}"
+                )
+                logger.error(msg)
+                return {"statusCode": 500, "body": msg}
+            logger.info("Aurora auto-switchover initiated by Lambda")
+            aurora_confirmed = True  # we just did it
+        elif not cfg["aurora_auto"] and not aurora_confirmed and not skip_aurora_check:
+            commands = build_aurora_switchover_commands(target_region)
+            msg = (
+                f"Aurora switchover has NOT been confirmed and "
+                f"AURORA_AUTO_PROMOTE is not enabled.\n\n"
+                f"You must switchover Aurora manually BEFORE running failback, "
+                f"OR pass skip_aurora_check=true if you have human-verified "
+                f"that Aurora is already in {target_region}.\n\n"
+                f"{commands}"
+            )
+            logger.info("Aurora not confirmed (manual mode), returning switchover commands")
+            return {"statusCode": 400, "body": msg}
+        else:
+            logger.info(
+                f"Aurora gate cleared "
+                f"(aurora_confirmed={aurora_confirmed}, skip_aurora_check={skip_aurora_check})"
+            )
+    else:
+        logger.info("Aurora gate skipped — Aurora not configured")
+
+    # Redis gate (mirror of Aurora). Only fires when ElastiCache is configured.
+    if cfg["redis_present"]:
+        if cfg["redis_auto"] and not redis_confirmed and not skip_redis_check:
+            logger.info("Step 2b: Redis auto-failover from failback Lambda...")
+            result = _auto_failover_redis(target_region)
+            if not result["success"]:
+                msg = (
+                    f"ElastiCache auto-failover FAILED.\n"
+                    f"Error: {result['error']}\n\n"
+                    f"Either restore ElastiCache's failover capability and "
+                    f"re-invoke this Lambda, or run the failover manually and "
+                    f"re-invoke with redis_confirmed=true (or skip_redis_check="
+                    f"true to bypass the gate entirely).\n\n"
+                    f"{build_redis_failover_commands(target_region)}"
+                )
+                logger.error(msg)
+                return {"statusCode": 500, "body": msg}
+            logger.info("ElastiCache auto-failover initiated by Lambda")
+            redis_confirmed = True  # we just did it
+        elif not cfg["redis_auto"] and not redis_confirmed and not skip_redis_check:
+            commands = build_redis_failover_commands(target_region)
+            msg = (
+                f"ElastiCache failover has NOT been confirmed and "
+                f"ELASTICACHE_AUTO_PROMOTE is not enabled.\n\n"
+                f"You must failover ElastiCache manually BEFORE running "
+                f"failback, OR pass skip_redis_check=true if you have human-"
+                f"verified that ElastiCache is already primary in {target_region}.\n\n"
+                f"{commands}"
+            )
+            logger.info("Redis not confirmed (manual mode), returning failover commands")
+            return {"statusCode": 400, "body": msg}
+        else:
+            logger.info(
+                f"Redis gate cleared "
+                f"(redis_confirmed={redis_confirmed}, skip_redis_check={skip_redis_check})"
+            )
+    else:
+        logger.info("Redis gate skipped — ElastiCache not configured")
 
     # Step 2.5: AI Failback Readiness Assessment (non-blocking)
     readiness_appendix = ""

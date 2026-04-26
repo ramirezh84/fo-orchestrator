@@ -179,3 +179,27 @@ def test_redis_auto_requires_redis_present():
         cfg = orch.detect_data_tier_config()
         assert cfg["redis_present"] is False
         assert cfg["redis_auto"] is False
+
+
+# ---------------------------------------------------------------------------
+# F4 (PR4): failback Lambda's HEALTH_ENDPOINT default
+# ---------------------------------------------------------------------------
+
+def test_failback_health_endpoint_default_is_shallow():
+    """v1.6 F4: failback Lambda defaults HEALTH_ENDPOINT to /healthcheck (shallow).
+
+    The previous default `/actuator/health` is Spring Boot-specific and typically
+    includes DB connectivity checks. CLAUDE.md recommends `/healthcheck` (app-only)
+    to avoid the false-positives from DB-config issues that blocked the v1.5 drill's
+    failback step. Operators who genuinely want deep validation can override via env.
+    """
+    # Module-level constant reflects the default at import time (no env var set).
+    # Since other test files may have set HEALTH_ENDPOINT via setdefault, we
+    # verify the source-of-truth: the default literal in the os.environ.get call.
+    import inspect
+    src = inspect.getsource(failback)
+    # Look for the default in the literal getter (one line, deterministic).
+    assert 'os.environ.get("HEALTH_ENDPOINT", "/healthcheck")' in src, (
+        "Failback Lambda's HEALTH_ENDPOINT default must be /healthcheck per F4. "
+        "If you intentionally changed it, update this test."
+    )

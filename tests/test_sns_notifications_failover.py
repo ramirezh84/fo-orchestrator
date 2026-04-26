@@ -851,9 +851,8 @@ class TestSNSAuroraPromotionReminders:
     def test_aurora_confirmed_sends_info(
         self, mock_sns, mock_check, mock_pub, mock_upd
     ):
-        """v1.6: Aurora promotion confirmed is INFO (was CRITICAL — promotion success
-        is good news, not an alert). Subject names the new writer; body explains
-        the app can write again."""
+        """v1.6: Aurora promotion confirmed is INFO. Now also resets the
+        retry/escalation counters (PR6) so a future incident starts clean."""
         state = _make_state(
             active_region="us-east-2",
             state="WAITING_AURORA_PROMOTION",
@@ -869,8 +868,14 @@ class TestSNSAuroraPromotionReminders:
         assert subject.startswith("[Vigil] INFO:")
         assert "Aurora is now writer in us-east-2" in subject
         assert len(subject) <= 100
-        # Flag must be cleared
-        mock_upd.assert_called_with({"aurora_promotion_pending": False})
+
+        # PR6: success path resets all 4 retry-tracking fields, not just `pending`.
+        mock_upd.assert_called_with({
+            "aurora_promotion_pending": False,
+            "aurora_promotion_retry_count": 0,
+            "aurora_promotion_last_retry_ts": "1970-01-01T00:00:00Z",
+            "aurora_promotion_escalated": False,
+        })
 
         body = _get_sns_message(mock_sns)
         assert "your app can now write" in body.lower()
@@ -883,8 +888,10 @@ class TestSNSAuroraPromotionReminders:
     def test_aurora_reminder_fires_at_interval(
         self, mock_sns, mock_check, mock_pub, mock_upd
     ):
-        """v1.6: Aurora promotion reminder fires every N min while pending."""
-        # 5 minutes elapsed → int(5) % 5 == 0 → fires
+        """v1.6 PR6: Aurora reminder is now a retry-attempt WARNING. First cycle
+        while pending fires retry 1/3 immediately (retry_count==0 → always
+        triggers regardless of timing) so the operator never wonders why no
+        email arrived."""
         last_failover_ts = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
         state = _make_state(
             active_region="us-east-2",
@@ -893,9 +900,6 @@ class TestSNSAuroraPromotionReminders:
             last_failover_ts=last_failover_ts,
         )
 
-        # Pin Aurora env so build_aurora_promotion_commands renders an actual
-        # CLI rather than "no commands available". _ENV's setdefault may have
-        # been beaten by another file's import-time env priming.
         env_overrides = {
             "AURORA_GLOBAL_CLUSTER_ID": "my-aurora-global",
             "AURORA_CLUSTER_ID": "my-aurora-w1",
@@ -910,39 +914,58 @@ class TestSNSAuroraPromotionReminders:
 
         assert mock_sns.publish.called
         subject = _get_sns_subject(mock_sns)
-        assert subject.startswith("[Vigil] CRITICAL:")
+        # Severity reclassified WARNING (was CRITICAL in v1.5/PR3d) — retry
+        # attempts are NOT page-worthy on their own, only the escalation is.
+        assert subject.startswith("[Vigil] WARNING:")
         assert "Aurora promotion still pending" in subject
-        assert "5 min" in subject
-        assert "operator action required" in subject
+        # New "retry N/M" framing — operator can tell where in the recovery
+        # loop we are.
+        assert "retry 1/3" in subject
+        assert "5 min in" in subject
 
         body = _get_sns_message(mock_sns)
-        # Body explains DB writes are blocked + embeds the actual CLI command.
-        assert "CANNOT WRITE" in body
+        # "CANNOT WRITE" may be split by a newline in the embedded CLI block.
+        assert "CANNOT" in body and "WRITE" in body
         assert "switchover-global-cluster" in body
-        # Journey shows we're stuck waiting on operator.
-        assert "[→] Aurora — operator action required" in body
+        # Journey shows the retry counter, not just "operator action required".
+        assert "[→] Aurora retry 1/3" in body
+        # Body warns about escalation so operator can't ignore it.
+        assert "escalate to ON-CALL CRITICAL" in body or "ESCALATION" in body.upper()
+
+        # PR6: retry counter incremented in state.
+        update_calls = mock_upd.call_args_list
+        retry_update = next(
+            (c for c in update_calls
+             if "aurora_promotion_retry_count" in (c.args[0] if c.args else c.kwargs.get("updates", {}))),
+            None,
+        )
+        assert retry_update is not None, "Retry counter should have been bumped to 1"
 
     @patch.object(orch, "update_failover_state")
     @patch.object(orch, "publish_region_health_metric")
     @patch.object(orch, "_check_if_aurora_writer", return_value=False)
     @patch.object(orch, "sns")
-    def test_aurora_reminder_skipped_at_non_interval(
+    def test_aurora_silent_after_escalation(
         self, mock_sns, mock_check, mock_pub, mock_upd
     ):
-        """REMINDER NOT sent when elapsed minutes is not divisible by interval."""
-        # 3 minutes elapsed → int(3) % 5 != 0 → no reminder
-        last_failover_ts = (datetime.now(timezone.utc) - timedelta(minutes=3)).isoformat()
+        """PR6 / F6: once `aurora_promotion_escalated` is True, the orchestrator
+        STOPS firing reminders. This is the inbox-spam fix from F6."""
         state = _make_state(
             active_region="us-east-2",
             state="WAITING_AURORA_PROMOTION",
             aurora_promotion_pending=True,
-            last_failover_ts=last_failover_ts,
+            last_failover_ts=(datetime.now(timezone.utc) - timedelta(minutes=60)).isoformat(),
         )
+        # Simulate post-escalation state.
+        state["aurora_promotion_escalated"] = True
+        state["aurora_promotion_retry_count"] = 3
 
         with patch.object(orch, "CURRENT_REGION", "us-east-2"):
-            orch._handle_aurora_promotion_reminder(state)
+            result = orch._handle_aurora_promotion_reminder(state)
 
+        # No email sent — escalation already fired in a prior cycle.
         mock_sns.publish.assert_not_called()
+        assert "escalated" in result["body"].lower() or "silent" in result["body"].lower()
 
     @patch.object(orch, "update_failover_state")
     @patch.object(orch, "publish_region_health_metric")
@@ -951,7 +974,8 @@ class TestSNSAuroraPromotionReminders:
     def test_aurora_confirmed_with_s3_backend_updates_state(
         self, mock_sns, mock_check, mock_pub, mock_upd
     ):
-        """Aurora confirmed: state backend receives flag-cleared update (S3 variant)."""
+        """Aurora confirmed: state backend receives flag-cleared update PLUS the
+        retry-tracking fields are reset (PR6)."""
         last_failover_ts = (datetime.now(timezone.utc) - timedelta(minutes=8)).isoformat()
         state = _make_state(
             active_region="us-east-2",
@@ -964,7 +988,12 @@ class TestSNSAuroraPromotionReminders:
 
         assert result["statusCode"] == 200
         assert "confirmed" in result["body"].lower()
-        mock_upd.assert_called_with({"aurora_promotion_pending": False})
+        mock_upd.assert_called_with({
+            "aurora_promotion_pending": False,
+            "aurora_promotion_retry_count": 0,
+            "aurora_promotion_last_retry_ts": "1970-01-01T00:00:00Z",
+            "aurora_promotion_escalated": False,
+        })
 
 
 # ===========================================================================
@@ -979,8 +1008,8 @@ class TestSNSElasticachePromotionReminders:
     @patch.object(orch, "_check_if_elasticache_primary", return_value=True)
     @patch.object(orch, "sns")
     def test_ec_confirmed_sends_info(self, mock_sns, mock_check, mock_upd):
-        """v1.6: ElastiCache promotion confirmed is INFO (was CRITICAL — same
-        rationale as Aurora confirmed)."""
+        """v1.6: ElastiCache promotion confirmed is INFO. PR6 also resets retry
+        counters."""
         state = _make_state(
             active_region="us-east-2",
             state="WAITING_AURORA_PROMOTION",
@@ -996,7 +1025,12 @@ class TestSNSElasticachePromotionReminders:
         assert subject.startswith("[Vigil] INFO:")
         assert "ElastiCache is now primary in us-east-2" in subject
         assert len(subject) <= 100
-        mock_upd.assert_called_with({"redis_promotion_pending": False})
+        mock_upd.assert_called_with({
+            "redis_promotion_pending": False,
+            "redis_promotion_retry_count": 0,
+            "redis_promotion_last_retry_ts": "1970-01-01T00:00:00Z",
+            "redis_promotion_escalated": False,
+        })
 
         body = _get_sns_message(mock_sns)
         assert "[✓] Redis promoted" in body
@@ -1006,7 +1040,8 @@ class TestSNSElasticachePromotionReminders:
     @patch.object(orch, "_check_if_elasticache_primary", return_value=False)
     @patch.object(orch, "sns")
     def test_ec_reminder_fires_at_interval(self, mock_sns, mock_check, mock_upd):
-        """REMINDER sent when elapsed minutes divisible by interval (line 1952)."""
+        """v1.6 PR6: ElastiCache reminder is now retry-attempt WARNING (mirror
+        of the Aurora retry pattern)."""
         last_failover_ts = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
         state = _make_state(
             active_region="us-east-2",
@@ -1015,21 +1050,26 @@ class TestSNSElasticachePromotionReminders:
         )
 
         with patch.object(orch, "CURRENT_REGION", "us-east-2"), \
-             patch.object(orch, "ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID", "my-global-redis"):
+             patch.dict(os.environ, {
+                 "ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID": "my-global-redis",
+                 "ELASTICACHE_REPLICATION_GROUP_ID": "my-redis-rg",
+             }), \
+             patch.object(orch, "ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID", "my-global-redis"), \
+             patch.object(orch, "ELASTICACHE_REPLICATION_GROUP_ID", "my-redis-rg"):
             orch._handle_elasticache_promotion_reminder(state)
 
         assert mock_sns.publish.called
         subject = _get_sns_subject(mock_sns)
-        assert subject.startswith("[Vigil] CRITICAL:")
+        assert subject.startswith("[Vigil] WARNING:")
         assert "ElastiCache promotion still pending" in subject
-        assert "5 min" in subject
-        assert "operator action required" in subject
+        assert "retry 1/3" in subject
 
         body = _get_sns_message(mock_sns)
-        # Body explains writes go cross-region + embeds CLI.
-        assert "CANNOT WRITE" in body
+        # Redis next-step says cache ops go cross-region (or fail) rather than
+        # "CANNOT WRITE" — different framing than Aurora's hard-block message.
+        assert "cross-region (or fail)" in body or "CANNOT" in body
         assert "failover-global-replication-group" in body
-        assert "[→] Redis — operator action required" in body
+        assert "[→] Redis retry 1/3" in body
 
     @patch.object(orch, "update_failover_state")
     @patch.object(orch, "_check_if_elasticache_primary", return_value=False)
@@ -1101,6 +1141,234 @@ class TestSNSElasticachePromotionReminders:
         subjects = _sns_subjects(mock_sns)
         assert any("Aurora" in s for s in subjects)
         assert any("ElastiCache" in s for s in subjects)
+
+
+# ===========================================================================
+# 5b. TestSNSPromotionRetryCapAndEscalation (PR6 / F6)
+#     Tests the retry-then-escalate state machine added in v1.6.
+# ===========================================================================
+
+class TestSNSPromotionRetryCapAndEscalation:
+    """v1.6 PR6 / F6: cap promotion reminders at 3 retries, then ONE escalation,
+    then silent. Eliminates the v1.5 'inbox-spam forever' mode."""
+
+    @patch.object(orch, "update_failover_state")
+    @patch.object(orch, "publish_region_health_metric")
+    @patch.object(orch, "_check_if_aurora_writer", return_value=False)
+    @patch.object(orch, "_auto_promote_aurora")
+    @patch.object(orch, "sns")
+    def test_aurora_retry_cap_then_escalate(
+        self, mock_sns, mock_aurora, mock_check, mock_pub, mock_upd
+    ):
+        """After PROMOTION_RETRY_MAX_ATTEMPTS retries, the next cycle emits ONE
+        CRITICAL escalation and sets aurora_promotion_escalated=True."""
+        mock_aurora.return_value = {"success": False, "error": "API error"}
+
+        # State: 3 retries already done, escalated still False — next cycle
+        # should fire the escalation.
+        state = _make_state(
+            active_region="us-east-2",
+            state="WAITING_AURORA_PROMOTION",
+            aurora_promotion_pending=True,
+            last_failover_ts=(datetime.now(timezone.utc) - timedelta(minutes=35)).isoformat(),
+        )
+        state["aurora_promotion_retry_count"] = 3
+        state["aurora_promotion_escalated"] = False
+
+        with patch.object(orch, "CURRENT_REGION", "us-east-2"), \
+             patch.dict(os.environ, {
+                 "AURORA_GLOBAL_CLUSTER_ID": "my-aurora-global",
+                 "AURORA_CLUSTER_ID": "my-aurora-w1",
+             }):
+            orch._handle_aurora_promotion_reminder(state)
+
+        # Exactly ONE notification — the escalation.
+        assert mock_sns.publish.call_count == 1
+        subject = _get_sns_subject(mock_sns)
+        assert subject.startswith("[Vigil] CRITICAL:")
+        assert "FAILED after 3 attempts" in subject
+        assert "ON-CALL ALERT" in subject
+
+        body = _get_sns_message(mock_sns)
+        assert "ESCALATE TO ON-CALL DBA NOW" in body
+        assert "[—] Orchestrator silent until operator clears state" in body
+
+        # Escalation flag set so future cycles stay silent.
+        update_calls = [c for c in mock_upd.call_args_list]
+        assert any(
+            (c.args[0] if c.args else c.kwargs.get("updates", {})).get("aurora_promotion_escalated") is True
+            for c in update_calls
+        )
+
+    @patch.object(orch, "update_failover_state")
+    @patch.object(orch, "publish_region_health_metric")
+    @patch.object(orch, "_check_if_aurora_writer", return_value=False)
+    @patch.object(orch, "sns")
+    def test_aurora_silent_after_escalation_post_state(
+        self, mock_sns, mock_check, mock_pub, mock_upd
+    ):
+        """Once escalated=True is in state, no further emails. Verifies the
+        silence behavior persists across many cycles."""
+        state = _make_state(
+            active_region="us-east-2",
+            state="WAITING_AURORA_PROMOTION",
+            aurora_promotion_pending=True,
+            last_failover_ts=(datetime.now(timezone.utc) - timedelta(minutes=120)).isoformat(),
+        )
+        state["aurora_promotion_escalated"] = True
+        state["aurora_promotion_retry_count"] = 3
+
+        with patch.object(orch, "CURRENT_REGION", "us-east-2"):
+            for _ in range(5):  # simulate 5 cycles after escalation
+                orch._handle_aurora_promotion_reminder(state)
+
+        mock_sns.publish.assert_not_called()
+
+    @patch.object(orch, "update_failover_state")
+    @patch.object(orch, "publish_region_health_metric")
+    @patch.object(orch, "_check_if_aurora_writer", return_value=False)
+    @patch.object(orch, "_auto_promote_aurora")
+    @patch.object(orch, "sns")
+    def test_aurora_auto_path_re_calls_auto_promote(
+        self, mock_sns, mock_aurora, mock_check, mock_pub, mock_upd
+    ):
+        """When AURORA_AUTO_PROMOTE=true, each retry actually re-calls the
+        auto-promote API (so transient API errors get retried, not just
+        re-emailed)."""
+        mock_aurora.return_value = {"success": False, "error": "API error"}
+        state = _make_state(
+            active_region="us-east-2",
+            state="WAITING_AURORA_PROMOTION",
+            aurora_promotion_pending=True,
+            last_failover_ts=(datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat(),
+        )
+
+        with patch.object(orch, "CURRENT_REGION", "us-east-2"), \
+             patch.dict(os.environ, {
+                 "AURORA_AUTO_PROMOTE": "true",
+                 "AURORA_GLOBAL_CLUSTER_ID": "my-aurora-global",
+                 "AURORA_CLUSTER_ID": "my-aurora-w1",
+             }):
+            orch._handle_aurora_promotion_reminder(state)
+
+        # The Lambda actually re-calls the auto-promote API on each retry.
+        mock_aurora.assert_called_once()
+
+    @patch.object(orch, "update_failover_state")
+    @patch.object(orch, "publish_region_health_metric")
+    @patch.object(orch, "_check_if_aurora_writer", return_value=False)
+    @patch.object(orch, "_auto_promote_aurora")
+    @patch.object(orch, "sns")
+    def test_aurora_manual_path_does_not_call_auto_promote(
+        self, mock_sns, mock_aurora, mock_check, mock_pub, mock_upd
+    ):
+        """When AURORA_AUTO_PROMOTE=false, retries are reminder-only — the
+        Lambda does NOT call the auto-promote API (operator must do it)."""
+        state = _make_state(
+            active_region="us-east-2",
+            state="WAITING_AURORA_PROMOTION",
+            aurora_promotion_pending=True,
+            last_failover_ts=(datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat(),
+        )
+
+        with patch.object(orch, "CURRENT_REGION", "us-east-2"), \
+             patch.dict(os.environ, {
+                 "AURORA_AUTO_PROMOTE": "false",
+                 "AURORA_GLOBAL_CLUSTER_ID": "my-aurora-global",
+                 "AURORA_CLUSTER_ID": "my-aurora-w1",
+             }):
+            orch._handle_aurora_promotion_reminder(state)
+
+        # No auto-promote retry — reminder only.
+        mock_aurora.assert_not_called()
+        # But a reminder email DID fire.
+        assert mock_sns.publish.called
+
+    @patch.object(orch, "update_failover_state")
+    @patch.object(orch, "_check_if_elasticache_primary", return_value=False)
+    @patch.object(orch, "_auto_promote_elasticache")
+    @patch.object(orch, "sns")
+    def test_redis_retry_cap_then_escalate(
+        self, mock_sns, mock_redis, mock_check, mock_upd
+    ):
+        """Redis side: after 3 retries, ONE escalation, then silent. Mirror of
+        the Aurora test."""
+        mock_redis.return_value = {"success": False, "method": "failover", "error": "API error"}
+        state = _make_state(
+            active_region="us-east-2",
+            state="WAITING_AURORA_PROMOTION",
+            redis_promotion_pending=True,
+            last_failover_ts=(datetime.now(timezone.utc) - timedelta(minutes=35)).isoformat(),
+        )
+        state["redis_promotion_retry_count"] = 3
+        state["redis_promotion_escalated"] = False
+
+        with patch.object(orch, "CURRENT_REGION", "us-east-2"), \
+             patch.dict(os.environ, {
+                 "ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID": "my-global-redis",
+                 "ELASTICACHE_REPLICATION_GROUP_ID": "my-redis-rg",
+             }):
+            orch._handle_elasticache_promotion_reminder(state)
+
+        assert mock_sns.publish.call_count == 1
+        subject = _get_sns_subject(mock_sns)
+        assert subject.startswith("[Vigil] CRITICAL:")
+        assert "FAILED after 3 attempts" in subject
+        assert "ON-CALL ALERT" in subject
+
+        body = _get_sns_message(mock_sns)
+        assert "ESCALATE TO ON-CALL DBA NOW" in body
+
+    @patch.object(orch, "update_failover_state")
+    @patch.object(orch, "_check_if_elasticache_primary", return_value=False)
+    @patch.object(orch, "sns")
+    def test_redis_silent_after_escalation(
+        self, mock_sns, mock_check, mock_upd
+    ):
+        """Same silence-after-escalation contract for Redis."""
+        state = _make_state(
+            active_region="us-east-2",
+            state="WAITING_AURORA_PROMOTION",
+            redis_promotion_pending=True,
+            last_failover_ts=(datetime.now(timezone.utc) - timedelta(minutes=120)).isoformat(),
+        )
+        state["redis_promotion_escalated"] = True
+        state["redis_promotion_retry_count"] = 3
+
+        with patch.object(orch, "CURRENT_REGION", "us-east-2"), \
+             patch.dict(os.environ, {
+                 "ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID": "my-global-redis",
+             }):
+            for _ in range(5):
+                orch._handle_elasticache_promotion_reminder(state)
+
+        mock_sns.publish.assert_not_called()
+
+    @patch.object(orch, "update_failover_state")
+    @patch.object(orch, "publish_region_health_metric")
+    @patch.object(orch, "_check_if_aurora_writer", return_value=False)
+    @patch.object(orch, "sns")
+    def test_aurora_retry_only_after_interval_elapsed(
+        self, mock_sns, mock_check, mock_pub, mock_upd
+    ):
+        """When retry_count > 0 and last_retry_ts is recent (< RETRY_INTERVAL),
+        no email fires this cycle. This is what stops the 1-min cycle from
+        firing 3 retries in 3 minutes."""
+        # retry_count=1, last_retry_ts=now (just retried) → next retry must wait
+        state = _make_state(
+            active_region="us-east-2",
+            state="WAITING_AURORA_PROMOTION",
+            aurora_promotion_pending=True,
+            last_failover_ts=(datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat(),
+        )
+        state["aurora_promotion_retry_count"] = 1
+        state["aurora_promotion_last_retry_ts"] = datetime.now(timezone.utc).isoformat()
+
+        with patch.object(orch, "CURRENT_REGION", "us-east-2"):
+            orch._handle_aurora_promotion_reminder(state)
+
+        # No email — interval not yet elapsed.
+        mock_sns.publish.assert_not_called()
 
 
 # ===========================================================================
@@ -1622,3 +1890,208 @@ class TestSNSFailback:
         assert subject.startswith("[Vigil] CRITICAL:")
         assert "Failback COMPLETE" in subject
         assert "us-east-1" in subject
+
+
+# ===========================================================================
+# 9. TestSNSFailbackRedisGate (PR5 / F5)
+#    Tests the new Redis-confirmed / auto-failover gates added in v1.6.
+# ===========================================================================
+
+class TestSNSFailbackRedisGate:
+    """v1.6 PR5: failback Lambda's config-aware Redis gate.
+
+    Mirror of the Aurora gate. Required when ElastiCache is configured;
+    skipped entirely when it isn't (C1/C2/C3 stacks).
+    """
+
+    # C5 (Aurora manual + Redis manual): require BOTH _confirmed flags
+    _C5_ENV = {
+        "AURORA_CLUSTER_ID": "my-aurora-w1",
+        "AURORA_AUTO_PROMOTE": "false",
+        "AURORA_GLOBAL_CLUSTER_ID": "my-aurora-global",
+        "TARGET_AURORA_CLUSTER_ID": "my-aurora-w2",
+        "ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID": "my-global-redis",
+        "ELASTICACHE_REPLICATION_GROUP_ID": "my-redis-rg",
+        "ELASTICACHE_AUTO_PROMOTE": "false",
+    }
+
+    # C9 (Aurora auto + Redis auto): no _confirmed flags needed
+    _C9_ENV = {
+        **_C5_ENV,
+        "AURORA_AUTO_PROMOTE": "true",
+        "ELASTICACHE_AUTO_PROMOTE": "true",
+    }
+
+    @patch.object(failback, "create_backend")
+    @patch.object(failback, "publish_region_health_metric")
+    @patch.object(failback, "update_failover_state")
+    @patch.object(failback, "get_failover_state")
+    @patch.object(failback, "sns")
+    def test_redis_gate_rejects_when_redis_not_confirmed(
+        self, mock_sns, mock_get_state, mock_upd, mock_pub, mock_cb
+    ):
+        """C5 (both manual): aurora_confirmed=true alone is NOT enough — failback
+        must reject with the Redis failover commands until redis_confirmed=true."""
+        mock_cb.return_value = MagicMock()
+        mock_get_state.return_value = _make_failback_state()
+
+        with patch.dict(os.environ, self._C5_ENV):
+            result = failback.handler({
+                "target_region": "us-east-1",
+                "operator": "test",
+                "aurora_confirmed": True,
+                "skip_health_check": True,
+                "skip_readiness_check": True,
+                # redis_confirmed missing → should reject
+            }, None)
+
+        assert result["statusCode"] == 400
+        body = result["body"]
+        assert "ElastiCache failover has NOT been confirmed" in body
+        assert "failover-global-replication-group" in body
+        assert "redis_confirmed=true" in body or "skip_redis_check=true" in body
+
+    @patch.object(failback, "create_backend")
+    @patch.object(failback, "publish_region_health_metric")
+    @patch.object(failback, "update_failover_state")
+    @patch.object(failback, "get_failover_state")
+    @patch.object(failback, "sns")
+    def test_redis_gate_passes_when_redis_confirmed(
+        self, mock_sns, mock_get_state, mock_upd, mock_pub, mock_cb
+    ):
+        """C5: aurora_confirmed=true + redis_confirmed=true → failback proceeds."""
+        mock_cb.return_value = MagicMock()
+        mock_get_state.return_value = _make_failback_state()
+
+        with patch.dict(os.environ, self._C5_ENV):
+            result = failback.handler({
+                "target_region": "us-east-1",
+                "operator": "test",
+                "aurora_confirmed": True,
+                "redis_confirmed": True,
+                "skip_health_check": True,
+                "skip_readiness_check": True,
+            }, None)
+
+        assert result["statusCode"] == 200
+        subject = _get_sns_subject(mock_sns)
+        assert "Failback COMPLETE" in subject
+
+    @patch.object(failback, "create_backend")
+    @patch.object(failback, "publish_region_health_metric")
+    @patch.object(failback, "update_failover_state")
+    @patch.object(failback, "get_failover_state")
+    @patch.object(failback, "sns")
+    def test_skip_redis_check_break_glass(
+        self, mock_sns, mock_get_state, mock_upd, mock_pub, mock_cb
+    ):
+        """skip_redis_check=true bypasses the Redis gate even without redis_confirmed.
+
+        Use case: operator has manually verified Redis is in target_region but
+        doesn't want to bother with the explicit confirmation flag (e.g., Redis
+        was already in target_region from the start of the incident)."""
+        mock_cb.return_value = MagicMock()
+        mock_get_state.return_value = _make_failback_state()
+
+        with patch.dict(os.environ, self._C5_ENV):
+            result = failback.handler({
+                "target_region": "us-east-1",
+                "operator": "test",
+                "aurora_confirmed": True,
+                "skip_redis_check": True,  # break-glass
+                "skip_health_check": True,
+                "skip_readiness_check": True,
+            }, None)
+
+        assert result["statusCode"] == 200
+
+    @patch.object(failback, "_auto_failover_redis")
+    @patch.object(failback, "_auto_switchover_aurora")
+    @patch.object(failback, "create_backend")
+    @patch.object(failback, "publish_region_health_metric")
+    @patch.object(failback, "update_failover_state")
+    @patch.object(failback, "get_failover_state")
+    @patch.object(failback, "sns")
+    def test_c9_lambda_does_both_data_tier_actions_itself(
+        self, mock_sns, mock_get_state, mock_upd, mock_pub, mock_cb,
+        mock_aurora, mock_redis,
+    ):
+        """C9 (both auto): no _confirmed flags needed. Lambda invokes the
+        switchover-global-cluster + failover-global-replication-group APIs
+        itself."""
+        mock_cb.return_value = MagicMock()
+        mock_get_state.return_value = _make_failback_state()
+        mock_aurora.return_value = {"success": True, "error": ""}
+        mock_redis.return_value = {"success": True, "error": ""}
+
+        with patch.dict(os.environ, self._C9_ENV):
+            result = failback.handler({
+                "target_region": "us-east-1",
+                "operator": "test",
+                "skip_health_check": True,
+                "skip_readiness_check": True,
+                # No aurora_confirmed or redis_confirmed — Lambda handles both.
+            }, None)
+
+        assert result["statusCode"] == 200
+        # Lambda made both API calls itself.
+        mock_aurora.assert_called_once_with("us-east-1")
+        mock_redis.assert_called_once_with("us-east-1")
+
+    @patch.object(failback, "_auto_failover_redis")
+    @patch.object(failback, "_auto_switchover_aurora")
+    @patch.object(failback, "create_backend")
+    @patch.object(failback, "publish_region_health_metric")
+    @patch.object(failback, "update_failover_state")
+    @patch.object(failback, "get_failover_state")
+    @patch.object(failback, "sns")
+    def test_c9_redis_auto_failure_rejects_with_500(
+        self, mock_sns, mock_get_state, mock_upd, mock_pub, mock_cb,
+        mock_aurora, mock_redis,
+    ):
+        """C9: when the Redis auto-failover API call fails, Lambda must reject
+        with a 500 status code rather than silently complete the failback —
+        otherwise the F5 problem (Redis split-brain after failback) returns."""
+        mock_cb.return_value = MagicMock()
+        mock_get_state.return_value = _make_failback_state()
+        mock_aurora.return_value = {"success": True, "error": ""}
+        mock_redis.return_value = {"success": False, "error": "API timeout"}
+
+        with patch.dict(os.environ, self._C9_ENV):
+            result = failback.handler({
+                "target_region": "us-east-1",
+                "operator": "test",
+                "skip_health_check": True,
+                "skip_readiness_check": True,
+            }, None)
+
+        assert result["statusCode"] == 500
+        assert "ElastiCache auto-failover FAILED" in result["body"]
+        # Operator gets the manual override path in the rejection body.
+        assert "redis_confirmed=true" in result["body"] or "skip_redis_check=true" in result["body"]
+
+    @patch.object(failback, "create_backend")
+    @patch.object(failback, "publish_region_health_metric")
+    @patch.object(failback, "update_failover_state")
+    @patch.object(failback, "get_failover_state")
+    @patch.object(failback, "sns")
+    def test_c1_no_data_tier_no_gates(
+        self, mock_sns, mock_get_state, mock_upd, mock_pub, mock_cb
+    ):
+        """C1 (no Aurora, no Redis): app-only stack. Failback should succeed
+        without ANY confirmation flags — there's nothing to confirm."""
+        mock_cb.return_value = MagicMock()
+        mock_get_state.return_value = _make_failback_state()
+
+        with patch.dict(os.environ, {
+            "AURORA_CLUSTER_ID": "",
+            "ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID": "",
+        }):
+            result = failback.handler({
+                "target_region": "us-east-1",
+                "operator": "test",
+                "skip_health_check": True,
+                "skip_readiness_check": True,
+            }, None)
+
+        assert result["statusCode"] == 200
