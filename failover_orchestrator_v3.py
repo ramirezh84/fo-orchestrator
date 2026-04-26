@@ -222,6 +222,27 @@ AURORA_PROMOTION_REMINDER_INTERVAL_MINUTES = int(
 )
 
 # ---------------------------------------------------------------------------
+# Promotion Auto-Retry (PR6 / F6)
+#
+# When a data-tier auto-promote is enabled (AURORA_AUTO_PROMOTE / ELASTICACHE_
+# AUTO_PROMOTE) but the API call fails (transient throttle, IAM hiccup,
+# regional partition), the orchestrator retries on the next reminder cycle
+# instead of leaving the system stuck silently.
+#
+# After PROMOTION_RETRY_MAX_ATTEMPTS unsuccessful retries spaced
+# PROMOTION_RETRY_INTERVAL_MINUTES apart, the orchestrator emits ONE CRITICAL
+# escalation email and then stops firing reminders for that tier — the
+# operator must manually clear the *_promotion_pending flag (and run the
+# failover-global API themselves) to re-arm the auto-recovery.
+# ---------------------------------------------------------------------------
+PROMOTION_RETRY_MAX_ATTEMPTS = int(
+    os.environ.get("PROMOTION_RETRY_MAX_ATTEMPTS", "3")
+)
+PROMOTION_RETRY_INTERVAL_MINUTES = int(
+    os.environ.get("PROMOTION_RETRY_INTERVAL_MINUTES", "10")
+)
+
+# ---------------------------------------------------------------------------
 # Notification Throttling
 # WARNING-level notifications (degraded, cooldown active, passive unhealthy)
 # can fire every minute and flood the inbox. This cooldown ensures the team
@@ -2147,9 +2168,15 @@ def _handle_aurora_promotion_reminder(state: dict) -> dict:
     if aurora_promoted:
         logger.info(
             f"Aurora promotion detected! {active_region} is now the writer. "
-            f"Clearing aurora_promotion_pending."
+            f"Clearing aurora_promotion_pending and resetting retry counters."
         )
-        update_failover_state({"aurora_promotion_pending": False})
+        # Reset all retry/escalation tracking so the next incident starts clean.
+        update_failover_state({
+            "aurora_promotion_pending": False,
+            "aurora_promotion_retry_count": 0,
+            "aurora_promotion_last_retry_ts": "1970-01-01T00:00:00Z",
+            "aurora_promotion_escalated": False,
+        })
 
         cfg = detect_data_tier_config()
         redis_pending = bool(state.get("redis_promotion_pending"))
@@ -2199,49 +2226,156 @@ def _handle_aurora_promotion_reminder(state: dict) -> dict:
         return {"statusCode": 200, "body": "Aurora promotion detected and confirmed"}
 
     # -----------------------------------------------------------------
-    # Aurora not yet promoted - send periodic reminders
+    # Aurora not yet promoted — retry+escalation state machine (PR6/F6)
+    #
+    # Goal: stop the inbox-spam mode where reminders fire every 5 min
+    # forever. After PROMOTION_RETRY_MAX_ATTEMPTS attempts, emit ONE
+    # CRITICAL escalation and then go silent until an operator clears
+    # the state manually.
     # -----------------------------------------------------------------
-    if int(minutes_since_failover) % AURORA_PROMOTION_REMINDER_INTERVAL_MINUTES == 0:
+    cfg = detect_data_tier_config()
+    retry_count = int(state.get("aurora_promotion_retry_count", 0) or 0)
+    escalated = bool(state.get("aurora_promotion_escalated", False))
+    last_retry_ts_str = state.get("aurora_promotion_last_retry_ts", "1970-01-01T00:00:00Z")
+    try:
+        last_retry_ts = datetime.fromisoformat(last_retry_ts_str.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        last_retry_ts = datetime.fromtimestamp(0, tz=timezone.utc)
+    minutes_since_last_retry = (now - last_retry_ts).total_seconds() / 60
+
+    # Path 1: already escalated → silent. Only the operator clearing
+    # aurora_promotion_pending (or detecting promotion above) breaks the loop.
+    if escalated:
+        publish_region_health_metric(CURRENT_REGION, True)
+        return {"statusCode": 200, "body": "Aurora promotion escalated — silent"}
+
+    # Path 2: retries exhausted, ESCALATE once.
+    if retry_count >= PROMOTION_RETRY_MAX_ATTEMPTS:
         elapsed = int(minutes_since_failover)
+        update_failover_state({"aurora_promotion_escalated": True})
         cmds = build_aurora_promotion_commands(active_region, "app_failure")
+        what = (
+            f"Aurora promotion FAILED after {PROMOTION_RETRY_MAX_ATTEMPTS} "
+            f"attempts — ON-CALL ALERT"
+        )
+        why = (
+            f"DNS failover to {active_region} occurred {elapsed} min ago. "
+            f"The orchestrator " + (
+                f"retried the auto-promote API call {PROMOTION_RETRY_MAX_ATTEMPTS} "
+                f"times (every {PROMOTION_RETRY_INTERVAL_MINUTES} min) and each "
+                f"attempt failed."
+                if cfg["aurora_auto"] else
+                f"sent {PROMOTION_RETRY_MAX_ATTEMPTS} reminder emails to the operator "
+                f"and Aurora promotion has still not been detected."
+            ) + " The orchestrator will now go SILENT for this incident — no more reminders, no more retries — until an operator manually clears `aurora_promotion_escalated` (or successfully promotes Aurora and the next cycle detects it)."
+        )
         next_step = (
-            f"Promote Aurora to {active_region} now using the commands below. "
-            f"Until you do, every write attempt against the database will fail. "
-            f"The orchestrator polls every minute and will detect promotion "
-            f"automatically — you'll receive a confirmation email and this "
-            f"reminder will stop firing.\n\n{cmds}"
+            "**ESCALATE TO ON-CALL DBA NOW.** The auto-recovery loop has "
+            "given up. Every write to the database is failing in the new "
+            "active region. Run the commands below (or whatever recovery "
+            "your runbook calls for) and once Aurora is the writer in "
+            f"{active_region}, the next orchestrator cycle will auto-detect "
+            "the promotion and the system will recover.\n"
+            f"{cmds}\n"
+            "If you need to clear the escalation flag without promoting "
+            "Aurora (e.g., to retry the auto-promote loop), update the "
+            "state field `aurora_promotion_escalated` to false."
         )
         subject, body = compose_message(
             severity=SEVERITY_CRITICAL,
-            what=f"Aurora promotion still pending after {elapsed} min — operator action required",
-            why=(
-                f"DNS failover to {active_region} occurred {elapsed} minutes ago "
-                f"but the Aurora Global Database has not been promoted to "
-                f"{active_region} yet. Until promotion completes, the app in "
-                f"{active_region} CANNOT WRITE to the database. This reminder "
-                f"will fire every {AURORA_PROMOTION_REMINDER_INTERVAL_MINUTES} "
-                f"minutes until promotion is detected."
-            ),
+            what=what,
+            why=why,
             next_step=next_step,
             context={
                 "Active region": active_region,
                 "Aurora cluster": AURORA_CLUSTER_ID or "(local cluster)",
+                "Auto-promote": "enabled" if cfg["aurora_auto"] else "disabled",
+                "Attempts made": f"{retry_count} of {PROMOTION_RETRY_MAX_ATTEMPTS}",
                 "Time since failover": f"{elapsed} min",
-                "Reminder interval": f"every {AURORA_PROMOTION_REMINDER_INTERVAL_MINUTES} min",
             },
             journey=[
                 "[✓] Failover (DNS moved)",
-                "[→] Aurora — operator action required",
-                "[ ] Latch released (after failback)",
+                f"[✗] Aurora STUCK after {PROMOTION_RETRY_MAX_ATTEMPTS} attempts",
+                "[—] Orchestrator silent until operator clears state",
             ],
             source="failover-orchestrator",
             region=CURRENT_REGION,
         )
         send_notification(subject, body)
+        publish_region_health_metric(CURRENT_REGION, True)
+        return {"statusCode": 200, "body": "Aurora promotion ESCALATED"}
+
+    # Path 3: retry-or-remind window has elapsed → make another attempt.
+    if minutes_since_last_retry >= PROMOTION_RETRY_INTERVAL_MINUTES or retry_count == 0:
+        elapsed = int(minutes_since_failover)
+        new_count = retry_count + 1
+
+        # Only call the auto-promote API when AURORA_AUTO_PROMOTE=true.
+        # In manual mode, this loop just counts reminders.
+        if cfg["aurora_auto"]:
+            logger.info(
+                f"Aurora retry attempt {new_count}/{PROMOTION_RETRY_MAX_ATTEMPTS} "
+                f"(auto-promote): re-calling _auto_promote_aurora"
+            )
+            _ = _auto_promote_aurora(active_region, "app_failure")  # outcome surfaced via reminder body
+            why_action = (
+                f"Auto-promote attempt {new_count}/{PROMOTION_RETRY_MAX_ATTEMPTS}. "
+                f"The orchestrator just re-called rds:SwitchoverGlobalCluster — "
+                f"watch for the promotion-confirmed email next cycle, or another "
+                f"retry email in {PROMOTION_RETRY_INTERVAL_MINUTES} min."
+            )
+        else:
+            why_action = (
+                f"Reminder {new_count}/{PROMOTION_RETRY_MAX_ATTEMPTS}. "
+                f"Aurora is configured for manual promotion — the orchestrator "
+                f"is NOT retrying the API itself; the operator must run the "
+                f"commands below."
+            )
+
+        update_failover_state({
+            "aurora_promotion_retry_count": new_count,
+            "aurora_promotion_last_retry_ts": now.isoformat(),
+        })
+
+        cmds = build_aurora_promotion_commands(active_region, "app_failure")
+        next_step = (
+            f"Promote Aurora to {active_region} now using the commands below. "
+            f"Until you do, every write attempt against the database will fail. "
+            f"After {PROMOTION_RETRY_MAX_ATTEMPTS} attempts the orchestrator will "
+            f"escalate to ON-CALL CRITICAL and stop sending reminders for this "
+            f"incident, so don't ignore this email.\n\n{cmds}"
+        )
+        subject, body = compose_message(
+            severity=SEVERITY_WARNING,
+            what=(
+                f"Aurora promotion still pending — retry {new_count}/"
+                f"{PROMOTION_RETRY_MAX_ATTEMPTS} ({elapsed} min in)"
+            ),
+            why=(
+                f"DNS failover to {active_region} occurred {elapsed} min ago "
+                f"but Aurora has not been promoted yet. {why_action}"
+            ),
+            next_step=next_step,
+            context={
+                "Active region": active_region,
+                "Aurora cluster": AURORA_CLUSTER_ID or "(local cluster)",
+                "Auto-promote": "enabled" if cfg["aurora_auto"] else "disabled",
+                "Attempt": f"{new_count} of {PROMOTION_RETRY_MAX_ATTEMPTS}",
+                "Retry interval": f"{PROMOTION_RETRY_INTERVAL_MINUTES} min",
+                "Time since failover": f"{elapsed} min",
+            },
+            journey=[
+                "[✓] Failover (DNS moved)",
+                f"[→] Aurora retry {new_count}/{PROMOTION_RETRY_MAX_ATTEMPTS}",
+                "[ ] Escalation (after retries exhausted)",
+            ],
+            source="failover-orchestrator",
+            region=CURRENT_REGION,
+        )
+        # Bypass throttle — retry-attempt emails are signal-class, never collapse them.
+        send_warning_notification(subject, body, state, bypass_throttle=True)
 
     # Keep publishing ourselves as healthy for Route 53.
-    # The failed region's metric is handled by the CW alarm's TreatMissingData=breaching
-    # if the region is down, or by the latch in the passive handler if it's alive.
     publish_region_health_metric(CURRENT_REGION, True)
 
     return {"statusCode": 200, "body": "Waiting for Aurora promotion"}
@@ -2270,9 +2404,14 @@ def _handle_elasticache_promotion_reminder(state: dict) -> dict:
     if redis_promoted:
         logger.info(
             f"ElastiCache promotion detected! {active_region} is now the primary. "
-            f"Clearing redis_promotion_pending."
+            f"Clearing redis_promotion_pending and resetting retry counters."
         )
-        update_failover_state({"redis_promotion_pending": False})
+        update_failover_state({
+            "redis_promotion_pending": False,
+            "redis_promotion_retry_count": 0,
+            "redis_promotion_last_retry_ts": "1970-01-01T00:00:00Z",
+            "redis_promotion_escalated": False,
+        })
 
         cfg = detect_data_tier_config()
         aurora_pending = bool(state.get("aurora_promotion_pending"))
@@ -2319,44 +2458,140 @@ def _handle_elasticache_promotion_reminder(state: dict) -> dict:
         send_notification(subject, body)
         return {"statusCode": 200, "body": "ElastiCache promotion detected and confirmed"}
 
-    # ElastiCache not yet promoted - send periodic reminders
-    if int(minutes_since_failover) % AURORA_PROMOTION_REMINDER_INTERVAL_MINUTES == 0:
+    # -----------------------------------------------------------------
+    # ElastiCache not yet promoted — retry+escalation state machine (PR6/F6).
+    # Mirror of the Aurora handler above. See that function's comment for
+    # the full design rationale.
+    # -----------------------------------------------------------------
+    cfg = detect_data_tier_config()
+    retry_count = int(state.get("redis_promotion_retry_count", 0) or 0)
+    escalated = bool(state.get("redis_promotion_escalated", False))
+    last_retry_ts_str = state.get("redis_promotion_last_retry_ts", "1970-01-01T00:00:00Z")
+    try:
+        last_retry_ts = datetime.fromisoformat(last_retry_ts_str.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        last_retry_ts = datetime.fromtimestamp(0, tz=timezone.utc)
+    minutes_since_last_retry = (now - last_retry_ts).total_seconds() / 60
+
+    if escalated:
+        return {"statusCode": 200, "body": "Redis promotion escalated — silent"}
+
+    if retry_count >= PROMOTION_RETRY_MAX_ATTEMPTS:
         elapsed = int(minutes_since_failover)
+        update_failover_state({"redis_promotion_escalated": True})
         cmds = build_elasticache_promotion_commands(active_region)
+        why = (
+            f"DNS failover to {active_region} occurred {elapsed} min ago. "
+            f"The orchestrator " + (
+                f"retried the auto-failover API call {PROMOTION_RETRY_MAX_ATTEMPTS} "
+                f"times (every {PROMOTION_RETRY_INTERVAL_MINUTES} min) and each "
+                f"attempt failed."
+                if cfg["redis_auto"] else
+                f"sent {PROMOTION_RETRY_MAX_ATTEMPTS} reminder emails to the operator "
+                f"and ElastiCache promotion has still not been detected."
+            ) + " The orchestrator will now go SILENT for this incident until an operator manually clears `redis_promotion_escalated` (or successfully promotes ElastiCache and the next cycle detects it)."
+        )
         next_step = (
-            f"Promote ElastiCache to {active_region} now using the commands below. "
-            f"Until you do, every cache operation against the current writer will "
-            f"go cross-region (or fail). The orchestrator polls every minute and "
-            f"will detect promotion automatically — you'll receive a confirmation "
-            f"email and this reminder will stop firing.\n\n{cmds}"
+            "**ESCALATE TO ON-CALL DBA NOW.** The auto-recovery loop has "
+            "given up. Cache writes from the new active region either go "
+            "cross-region (high latency) or fail outright depending on your "
+            f"client config. Run the commands below.\n{cmds}\n"
+            "If you need to clear the escalation flag without promoting "
+            "ElastiCache (e.g., to retry the auto-failover loop), update "
+            "the state field `redis_promotion_escalated` to false."
         )
         subject, body = compose_message(
             severity=SEVERITY_CRITICAL,
-            what=f"ElastiCache promotion still pending after {elapsed} min — operator action required",
-            why=(
-                f"DNS failover to {active_region} occurred {elapsed} minutes ago "
-                f"but the ElastiCache Global Datastore has not been promoted to "
-                f"{active_region} yet. Until promotion completes, the app in "
-                f"{active_region} CANNOT WRITE to Redis locally. This reminder "
-                f"will fire every {AURORA_PROMOTION_REMINDER_INTERVAL_MINUTES} "
-                f"minutes until promotion is detected."
+            what=(
+                f"ElastiCache promotion FAILED after {PROMOTION_RETRY_MAX_ATTEMPTS} "
+                f"attempts — ON-CALL ALERT"
             ),
+            why=why,
             next_step=next_step,
             context={
                 "Active region": active_region,
                 "ElastiCache RG": ELASTICACHE_REPLICATION_GROUP_ID or "(local RG)",
+                "Auto-promote": "enabled" if cfg["redis_auto"] else "disabled",
+                "Attempts made": f"{retry_count} of {PROMOTION_RETRY_MAX_ATTEMPTS}",
                 "Time since failover": f"{elapsed} min",
-                "Reminder interval": f"every {AURORA_PROMOTION_REMINDER_INTERVAL_MINUTES} min",
             },
             journey=[
                 "[✓] Failover (DNS moved)",
-                "[→] Redis — operator action required",
-                "[ ] Latch released (after failback)",
+                f"[✗] Redis STUCK after {PROMOTION_RETRY_MAX_ATTEMPTS} attempts",
+                "[—] Orchestrator silent until operator clears state",
             ],
             source="failover-orchestrator",
             region=CURRENT_REGION,
         )
         send_notification(subject, body)
+        return {"statusCode": 200, "body": "Redis promotion ESCALATED"}
+
+    if minutes_since_last_retry >= PROMOTION_RETRY_INTERVAL_MINUTES or retry_count == 0:
+        elapsed = int(minutes_since_failover)
+        new_count = retry_count + 1
+
+        if cfg["redis_auto"]:
+            logger.info(
+                f"Redis retry attempt {new_count}/{PROMOTION_RETRY_MAX_ATTEMPTS} "
+                f"(auto-promote): re-calling _auto_promote_elasticache"
+            )
+            _ = _auto_promote_elasticache(active_region, "app_failure")
+            why_action = (
+                f"Auto-failover attempt {new_count}/{PROMOTION_RETRY_MAX_ATTEMPTS}. "
+                f"The orchestrator just re-called elasticache:FailoverGlobal"
+                f"ReplicationGroup — watch for the promotion-confirmed email "
+                f"next cycle, or another retry email in "
+                f"{PROMOTION_RETRY_INTERVAL_MINUTES} min."
+            )
+        else:
+            why_action = (
+                f"Reminder {new_count}/{PROMOTION_RETRY_MAX_ATTEMPTS}. "
+                f"ElastiCache is configured for manual promotion — the "
+                f"orchestrator is NOT retrying the API itself; the operator "
+                f"must run the commands below."
+            )
+
+        update_failover_state({
+            "redis_promotion_retry_count": new_count,
+            "redis_promotion_last_retry_ts": now.isoformat(),
+        })
+
+        cmds = build_elasticache_promotion_commands(active_region)
+        next_step = (
+            f"Promote ElastiCache to {active_region} now using the commands below. "
+            f"Until you do, every cache operation against the current writer will "
+            f"go cross-region (or fail). After {PROMOTION_RETRY_MAX_ATTEMPTS} "
+            f"attempts the orchestrator will escalate to ON-CALL CRITICAL and "
+            f"stop sending reminders for this incident.\n\n{cmds}"
+        )
+        subject, body = compose_message(
+            severity=SEVERITY_WARNING,
+            what=(
+                f"ElastiCache promotion still pending — retry {new_count}/"
+                f"{PROMOTION_RETRY_MAX_ATTEMPTS} ({elapsed} min in)"
+            ),
+            why=(
+                f"DNS failover to {active_region} occurred {elapsed} min ago "
+                f"but ElastiCache has not been promoted yet. {why_action}"
+            ),
+            next_step=next_step,
+            context={
+                "Active region": active_region,
+                "ElastiCache RG": ELASTICACHE_REPLICATION_GROUP_ID or "(local RG)",
+                "Auto-promote": "enabled" if cfg["redis_auto"] else "disabled",
+                "Attempt": f"{new_count} of {PROMOTION_RETRY_MAX_ATTEMPTS}",
+                "Retry interval": f"{PROMOTION_RETRY_INTERVAL_MINUTES} min",
+                "Time since failover": f"{elapsed} min",
+            },
+            journey=[
+                "[✓] Failover (DNS moved)",
+                f"[→] Redis retry {new_count}/{PROMOTION_RETRY_MAX_ATTEMPTS}",
+                "[ ] Escalation (after retries exhausted)",
+            ],
+            source="failover-orchestrator",
+            region=CURRENT_REGION,
+        )
+        send_warning_notification(subject, body, state, bypass_throttle=True)
 
     return {"statusCode": 200, "body": "Waiting for ElastiCache promotion"}
 
