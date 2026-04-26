@@ -597,7 +597,8 @@ class TestFailoverTrigger:
         # Warning notification with recommendation
         mock_warn.assert_called_once()
         subject_arg = mock_warn.call_args[0][0] if mock_warn.call_args[0] else mock_warn.call_args[1].get("subject", "")
-        assert "FAILOVER RECOMMENDED" in subject_arg
+        # v1.6 wording: "Failover RECOMMENDED but blocked — FAILOVER_MODE is manual"
+        assert "RECOMMENDED" in subject_arg and "manual" in subject_arg.lower()
 
     @patch.object(orch, "_run_rca_analysis", return_value="")
     @patch.object(orch, "_emit_failover_event")
