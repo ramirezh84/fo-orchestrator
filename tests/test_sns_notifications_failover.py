@@ -1622,3 +1622,208 @@ class TestSNSFailback:
         assert subject.startswith("[Vigil] CRITICAL:")
         assert "Failback COMPLETE" in subject
         assert "us-east-1" in subject
+
+
+# ===========================================================================
+# 9. TestSNSFailbackRedisGate (PR5 / F5)
+#    Tests the new Redis-confirmed / auto-failover gates added in v1.6.
+# ===========================================================================
+
+class TestSNSFailbackRedisGate:
+    """v1.6 PR5: failback Lambda's config-aware Redis gate.
+
+    Mirror of the Aurora gate. Required when ElastiCache is configured;
+    skipped entirely when it isn't (C1/C2/C3 stacks).
+    """
+
+    # C5 (Aurora manual + Redis manual): require BOTH _confirmed flags
+    _C5_ENV = {
+        "AURORA_CLUSTER_ID": "my-aurora-w1",
+        "AURORA_AUTO_PROMOTE": "false",
+        "AURORA_GLOBAL_CLUSTER_ID": "my-aurora-global",
+        "TARGET_AURORA_CLUSTER_ID": "my-aurora-w2",
+        "ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID": "my-global-redis",
+        "ELASTICACHE_REPLICATION_GROUP_ID": "my-redis-rg",
+        "ELASTICACHE_AUTO_PROMOTE": "false",
+    }
+
+    # C9 (Aurora auto + Redis auto): no _confirmed flags needed
+    _C9_ENV = {
+        **_C5_ENV,
+        "AURORA_AUTO_PROMOTE": "true",
+        "ELASTICACHE_AUTO_PROMOTE": "true",
+    }
+
+    @patch.object(failback, "create_backend")
+    @patch.object(failback, "publish_region_health_metric")
+    @patch.object(failback, "update_failover_state")
+    @patch.object(failback, "get_failover_state")
+    @patch.object(failback, "sns")
+    def test_redis_gate_rejects_when_redis_not_confirmed(
+        self, mock_sns, mock_get_state, mock_upd, mock_pub, mock_cb
+    ):
+        """C5 (both manual): aurora_confirmed=true alone is NOT enough — failback
+        must reject with the Redis failover commands until redis_confirmed=true."""
+        mock_cb.return_value = MagicMock()
+        mock_get_state.return_value = _make_failback_state()
+
+        with patch.dict(os.environ, self._C5_ENV):
+            result = failback.handler({
+                "target_region": "us-east-1",
+                "operator": "test",
+                "aurora_confirmed": True,
+                "skip_health_check": True,
+                "skip_readiness_check": True,
+                # redis_confirmed missing → should reject
+            }, None)
+
+        assert result["statusCode"] == 400
+        body = result["body"]
+        assert "ElastiCache failover has NOT been confirmed" in body
+        assert "failover-global-replication-group" in body
+        assert "redis_confirmed=true" in body or "skip_redis_check=true" in body
+
+    @patch.object(failback, "create_backend")
+    @patch.object(failback, "publish_region_health_metric")
+    @patch.object(failback, "update_failover_state")
+    @patch.object(failback, "get_failover_state")
+    @patch.object(failback, "sns")
+    def test_redis_gate_passes_when_redis_confirmed(
+        self, mock_sns, mock_get_state, mock_upd, mock_pub, mock_cb
+    ):
+        """C5: aurora_confirmed=true + redis_confirmed=true → failback proceeds."""
+        mock_cb.return_value = MagicMock()
+        mock_get_state.return_value = _make_failback_state()
+
+        with patch.dict(os.environ, self._C5_ENV):
+            result = failback.handler({
+                "target_region": "us-east-1",
+                "operator": "test",
+                "aurora_confirmed": True,
+                "redis_confirmed": True,
+                "skip_health_check": True,
+                "skip_readiness_check": True,
+            }, None)
+
+        assert result["statusCode"] == 200
+        subject = _get_sns_subject(mock_sns)
+        assert "Failback COMPLETE" in subject
+
+    @patch.object(failback, "create_backend")
+    @patch.object(failback, "publish_region_health_metric")
+    @patch.object(failback, "update_failover_state")
+    @patch.object(failback, "get_failover_state")
+    @patch.object(failback, "sns")
+    def test_skip_redis_check_break_glass(
+        self, mock_sns, mock_get_state, mock_upd, mock_pub, mock_cb
+    ):
+        """skip_redis_check=true bypasses the Redis gate even without redis_confirmed.
+
+        Use case: operator has manually verified Redis is in target_region but
+        doesn't want to bother with the explicit confirmation flag (e.g., Redis
+        was already in target_region from the start of the incident)."""
+        mock_cb.return_value = MagicMock()
+        mock_get_state.return_value = _make_failback_state()
+
+        with patch.dict(os.environ, self._C5_ENV):
+            result = failback.handler({
+                "target_region": "us-east-1",
+                "operator": "test",
+                "aurora_confirmed": True,
+                "skip_redis_check": True,  # break-glass
+                "skip_health_check": True,
+                "skip_readiness_check": True,
+            }, None)
+
+        assert result["statusCode"] == 200
+
+    @patch.object(failback, "_auto_failover_redis")
+    @patch.object(failback, "_auto_switchover_aurora")
+    @patch.object(failback, "create_backend")
+    @patch.object(failback, "publish_region_health_metric")
+    @patch.object(failback, "update_failover_state")
+    @patch.object(failback, "get_failover_state")
+    @patch.object(failback, "sns")
+    def test_c9_lambda_does_both_data_tier_actions_itself(
+        self, mock_sns, mock_get_state, mock_upd, mock_pub, mock_cb,
+        mock_aurora, mock_redis,
+    ):
+        """C9 (both auto): no _confirmed flags needed. Lambda invokes the
+        switchover-global-cluster + failover-global-replication-group APIs
+        itself."""
+        mock_cb.return_value = MagicMock()
+        mock_get_state.return_value = _make_failback_state()
+        mock_aurora.return_value = {"success": True, "error": ""}
+        mock_redis.return_value = {"success": True, "error": ""}
+
+        with patch.dict(os.environ, self._C9_ENV):
+            result = failback.handler({
+                "target_region": "us-east-1",
+                "operator": "test",
+                "skip_health_check": True,
+                "skip_readiness_check": True,
+                # No aurora_confirmed or redis_confirmed — Lambda handles both.
+            }, None)
+
+        assert result["statusCode"] == 200
+        # Lambda made both API calls itself.
+        mock_aurora.assert_called_once_with("us-east-1")
+        mock_redis.assert_called_once_with("us-east-1")
+
+    @patch.object(failback, "_auto_failover_redis")
+    @patch.object(failback, "_auto_switchover_aurora")
+    @patch.object(failback, "create_backend")
+    @patch.object(failback, "publish_region_health_metric")
+    @patch.object(failback, "update_failover_state")
+    @patch.object(failback, "get_failover_state")
+    @patch.object(failback, "sns")
+    def test_c9_redis_auto_failure_rejects_with_500(
+        self, mock_sns, mock_get_state, mock_upd, mock_pub, mock_cb,
+        mock_aurora, mock_redis,
+    ):
+        """C9: when the Redis auto-failover API call fails, Lambda must reject
+        with a 500 status code rather than silently complete the failback —
+        otherwise the F5 problem (Redis split-brain after failback) returns."""
+        mock_cb.return_value = MagicMock()
+        mock_get_state.return_value = _make_failback_state()
+        mock_aurora.return_value = {"success": True, "error": ""}
+        mock_redis.return_value = {"success": False, "error": "API timeout"}
+
+        with patch.dict(os.environ, self._C9_ENV):
+            result = failback.handler({
+                "target_region": "us-east-1",
+                "operator": "test",
+                "skip_health_check": True,
+                "skip_readiness_check": True,
+            }, None)
+
+        assert result["statusCode"] == 500
+        assert "ElastiCache auto-failover FAILED" in result["body"]
+        # Operator gets the manual override path in the rejection body.
+        assert "redis_confirmed=true" in result["body"] or "skip_redis_check=true" in result["body"]
+
+    @patch.object(failback, "create_backend")
+    @patch.object(failback, "publish_region_health_metric")
+    @patch.object(failback, "update_failover_state")
+    @patch.object(failback, "get_failover_state")
+    @patch.object(failback, "sns")
+    def test_c1_no_data_tier_no_gates(
+        self, mock_sns, mock_get_state, mock_upd, mock_pub, mock_cb
+    ):
+        """C1 (no Aurora, no Redis): app-only stack. Failback should succeed
+        without ANY confirmation flags — there's nothing to confirm."""
+        mock_cb.return_value = MagicMock()
+        mock_get_state.return_value = _make_failback_state()
+
+        with patch.dict(os.environ, {
+            "AURORA_CLUSTER_ID": "",
+            "ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID": "",
+        }):
+            result = failback.handler({
+                "target_region": "us-east-1",
+                "operator": "test",
+                "skip_health_check": True,
+                "skip_readiness_check": True,
+            }, None)
+
+        assert result["statusCode"] == 200
