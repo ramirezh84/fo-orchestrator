@@ -38,8 +38,10 @@ DEFAULT_STATE_FIELDS = {
     "last_active_metric_ts": None,  # Must be set by caller
     "aurora_promotion_pending": False,
     "redis_promotion_pending": False,
-    "region_health": {},  # Map of region -> {"healthy": bool, "ts": iso_str}
     "last_warning_notification_ts": "1970-01-01T00:00:00Z",
+    # v1.7: region_health is no longer part of the shared state file.
+    # It lives in per-region keys at <prefix>region_health/<region>.json
+    # to avoid bilateral RMW races under bidirectional CRR (F7/F8).
 }
 
 
@@ -79,6 +81,23 @@ class StateBackend(ABC):
         (equivalent to DynamoDB ConditionalCheckFailedException).
         Raises on any other error.
         """
+        ...
+
+    # -- v1.7: per-key object operations (used for region_health/<region>.json) --
+
+    @abstractmethod
+    def put_object(self, key: str, data: dict) -> None:
+        """Write *data* (JSON-serializable) to *key*. Full overwrite."""
+        ...
+
+    @abstractmethod
+    def get_object(self, key: str) -> dict:
+        """Read *key* as JSON. Returns {} if not found."""
+        ...
+
+    @abstractmethod
+    def list_objects(self, prefix: str) -> list:
+        """List object keys under *prefix*. Returns [] if none."""
         ...
 
 
@@ -158,6 +177,44 @@ class DynamoDBStateBackend(StateBackend):
         except ClientError as e:
             if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
                 return False
+            raise
+
+    # -- v1.7: per-key object operations -----------------------------------
+    # DDB stores per-key blobs as items keyed by `pk=<key>`. F7/F8 don't exist
+    # on DDB Global Tables, so this is just a small KV API for parity.
+
+    def put_object(self, key: str, data: dict) -> None:
+        item = {"pk": key, "data": json.dumps(data, cls=_StateEncoder)}
+        try:
+            self._table.put_item(Item=item)
+        except ClientError as e:
+            logger.error(f"DynamoDB put_object failed for {key}: {e}")
+            raise
+
+    def get_object(self, key: str) -> dict:
+        try:
+            resp = self._table.get_item(Key={"pk": key})
+            item = resp.get("Item")
+            if not item or "data" not in item:
+                return {}
+            return json.loads(item["data"])
+        except ClientError as e:
+            logger.error(f"DynamoDB get_object failed for {key}: {e}")
+            raise
+
+    def list_objects(self, prefix: str) -> list:
+        # DDB doesn't natively support prefix scan on the partition key, but
+        # for the small set of region_health/<region>.json keys we can scan
+        # cheaply with a FilterExpression.
+        try:
+            resp = self._table.scan(
+                FilterExpression="begins_with(pk, :p)",
+                ExpressionAttributeValues={":p": prefix},
+                ProjectionExpression="pk",
+            )
+            return [item["pk"] for item in resp.get("Items", [])]
+        except ClientError as e:
+            logger.error(f"DynamoDB list_objects failed for prefix {prefix}: {e}")
             raise
 
 
@@ -331,6 +388,45 @@ class S3StateBackend(StateBackend):
         # Exhausted retries — treat as lost race
         logger.warning("conditional_update: exhausted retries due to ETag conflicts")
         return False
+
+    # -- v1.7: per-key object operations -----------------------------------
+    # Used for region_health/<region>.json and any other isolated per-region
+    # keys. Avoids RMW races on the shared REGION_STATE.json file (F7/F8).
+
+    def put_object(self, key: str, data: dict) -> None:
+        body = json.dumps(data, cls=_StateEncoder).encode("utf-8")
+        try:
+            self._s3.put_object(
+                Bucket=self._bucket,
+                Key=key,
+                Body=body,
+                ContentType="application/json",
+            )
+        except ClientError as e:
+            logger.error(f"S3 put_object failed for s3://{self._bucket}/{key}: {e}")
+            raise
+
+    def get_object(self, key: str) -> dict:
+        try:
+            resp = self._s3.get_object(Bucket=self._bucket, Key=key)
+            return json.loads(resp["Body"].read())
+        except ClientError as e:
+            if e.response["Error"]["Code"] in ("NoSuchKey", "404"):
+                return {}
+            logger.error(f"S3 get_object failed for s3://{self._bucket}/{key}: {e}")
+            raise
+
+    def list_objects(self, prefix: str) -> list:
+        try:
+            keys = []
+            paginator = self._s3.get_paginator("list_objects_v2")
+            for page in paginator.paginate(Bucket=self._bucket, Prefix=prefix):
+                for obj in page.get("Contents", []) or []:
+                    keys.append(obj["Key"])
+            return keys
+        except ClientError as e:
+            logger.error(f"S3 list_objects failed for prefix {prefix}: {e}")
+            raise
 
 
 # ===========================================================================

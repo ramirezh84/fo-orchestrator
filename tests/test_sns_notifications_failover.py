@@ -1439,20 +1439,23 @@ class TestSNSPassiveRegionNotifications:
     @patch.object(orch, "publish_region_health_metric")
     @patch.object(orch, "try_increment_failures", return_value=True)
     @patch.object(orch, "evaluate_region_health")
+    @patch.object(orch, "read_region_health_map")
     @patch.object(orch, "sns")
     def test_dual_region_outage_sends_critical(
-        self, mock_sns, mock_health, mock_inc, mock_pub, mock_upd
+        self, mock_sns, mock_rh, mock_health, mock_inc, mock_pub, mock_upd
     ):
         """v1.6: Both regions unhealthy → CRITICAL with 'app is DOWN' framing,
-        explicit 'NOT a failover candidate' next-step, and the on-call escalation."""
+        explicit 'NOT a failover candidate' next-step, and the on-call escalation.
+
+        v1.7: peer health is read via read_region_health_map() (per-region keys),
+        not from state['region_health'] which is no longer the source of truth.
+        """
         mock_health.return_value = _unhealthy_health()
         target_ts = datetime.now(timezone.utc).isoformat()
-        state = _make_state(
-            consecutive_failures=2,
-            region_health={
-                "us-east-2": {"healthy": False, "ts": target_ts},
-            },
-        )
+        mock_rh.return_value = {
+            "us-east-2": {"region": "us-east-2", "healthy": False, "ts": target_ts},
+        }
+        state = _make_state(consecutive_failures=2)
 
         orch._handle_active_region(state, "us-east-1", 2, "1970-01-01T00:00:00Z")
 
