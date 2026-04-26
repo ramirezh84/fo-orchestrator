@@ -1683,10 +1683,13 @@ def detect_data_tier_config() -> dict:
     }
 
 
-def _run_preflight_checks() -> dict:
+def _run_preflight_checks(include_r53: bool = False) -> dict:
     """Validate required resources are accessible before activation.
 
     Invoke from the AWS console Test tab with: {"preflight": true}
+    For the deeper R53 ↔ alarm wiring audit (PR9 / F2):
+        {"preflight": true, "include_r53": true}
+
     Returns a diagnostic report showing what's ready and what's missing.
     No activation side effects — purely diagnostic (publishes one test metric).
     """
@@ -1727,8 +1730,19 @@ def _run_preflight_checks() -> dict:
             else {"status": "SKIPPED", "note": f"{var} not set"}
         )
 
+    # 5. Optional R53 ↔ alarm wiring audit (PR9 / F2). Off by default
+    # because it makes 5 R53/CW API calls per health check and isn't needed
+    # for the routine pre-activation gate.
+    if include_r53:
+        try:
+            checks["r53_wiring"] = _preflight_r53_wiring()
+        except Exception as e:
+            checks["r53_wiring"] = {"status": "FAIL", "error": str(e)}
+
     required = ["state_backend", "cloudwatch_metric", "sns_topic"]
     all_pass = all(checks[k]["status"] == "PASS" for k in required)
+    if include_r53 and checks["r53_wiring"]["status"] not in ("PASS", "SKIPPED"):
+        all_pass = False
 
     return {
         "statusCode": 200 if all_pass else 400,
@@ -1736,6 +1750,94 @@ def _run_preflight_checks() -> dict:
         "checks": checks,
         "region": CURRENT_REGION,
     }
+
+
+def _preflight_r53_wiring() -> dict:
+    """Audit R53 health checks that point at this stack's alarms.
+
+    Identifies the alarms by namespace=CW_NAMESPACE and reports any R53
+    health check whose observed status is inconsistent with the alarm's
+    actual state. See tools/validate_r53_alarm_wiring.py for the
+    standalone version (this preflight uses the same staleness heuristics).
+    """
+    r53 = boto3.client("route53", config=_client_config)
+    cw = boto3.client("cloudwatch", region_name=CURRENT_REGION, config=_client_config)
+
+    # Pull all CLOUDWATCH_METRIC R53 health checks; filter to ones whose
+    # AlarmIdentifier.Region matches this Lambda's region (cross-region R53
+    # health checks for our alarms aren't typical for this stack).
+    hc_resp = r53.list_health_checks()
+    relevant = [
+        hc for hc in hc_resp.get("HealthChecks", [])
+        if hc.get("HealthCheckConfig", {}).get("Type") == "CLOUDWATCH_METRIC"
+        and hc.get("HealthCheckConfig", {}).get("AlarmIdentifier", {}).get("Region")
+            == CURRENT_REGION
+    ]
+    if not relevant:
+        return {"status": "SKIPPED", "note": "no R53 health checks point at this region's alarms"}
+
+    inconsistencies = []
+    now = datetime.now(timezone.utc)
+    for hc in relevant:
+        cfg = hc["HealthCheckConfig"]
+        alarm_name = cfg["AlarmIdentifier"]["Name"]
+        try:
+            alarms = cw.describe_alarms(AlarmNames=[alarm_name]).get("MetricAlarms", [])
+            if not alarms:
+                inconsistencies.append({
+                    "health_check_id": hc["Id"],
+                    "alarm": alarm_name,
+                    "problem": "alarm referenced by R53 health check does not exist",
+                })
+                continue
+            alarm = alarms[0]
+            obs = r53.get_health_check_status(HealthCheckId=hc["Id"]) \
+                .get("HealthCheckObservations", [])
+            if not obs:
+                continue
+            latest = max(obs, key=lambda o: o["StatusReport"]["CheckedTime"])
+            r53_status_text = latest["StatusReport"]["Status"]
+            r53_checked = latest["StatusReport"]["CheckedTime"].astimezone(timezone.utc)
+            alarm_state = alarm["StateValue"]
+            transition_age = (now - alarm["StateUpdatedTimestamp"].astimezone(timezone.utc)).total_seconds()
+            r53_age = (now - r53_checked).total_seconds()
+
+            # Same heuristics as tools/validate_r53_alarm_wiring.py:
+            problem = None
+            status_lower = r53_status_text.lower()
+            if alarm_state == "ALARM" and ("success" in status_lower or "breached: 0" in status_lower):
+                problem = "alarm=ALARM but R53 still reports Success"
+            elif alarm_state == "OK" and "fail" in status_lower:
+                problem = "alarm=OK but R53 still reports Failure"
+            elif transition_age > 60 and r53_age > transition_age:
+                problem = (
+                    f"R53 last checked {r53_age:.0f}s ago vs alarm transitioned "
+                    f"{transition_age:.0f}s ago — observation cache is stale"
+                )
+
+            if problem:
+                inconsistencies.append({
+                    "health_check_id": hc["Id"],
+                    "alarm": alarm_name,
+                    "alarm_state": alarm_state,
+                    "r53_status": r53_status_text[:80],
+                    "problem": problem,
+                })
+        except ClientError as e:
+            inconsistencies.append({
+                "health_check_id": hc["Id"],
+                "alarm": alarm_name,
+                "problem": f"could not audit: {e}",
+            })
+
+    if inconsistencies:
+        return {
+            "status": "FAIL",
+            "checked_count": len(relevant),
+            "inconsistencies": inconsistencies,
+            "fix": "recreate the affected R53 health checks (see CLAUDE.md → Operational Hazards)",
+        }
+    return {"status": "PASS", "checked_count": len(relevant)}
 
 
 def handler(event, context):
@@ -1767,8 +1869,11 @@ def handler(event, context):
     # ── Pre-flight check ──────────────────────────────────────────────
     # Invoke with {"preflight": true} from the AWS console to validate
     # resources before changing FAILOVER_MODE to "auto".
+    # Pass {"preflight": true, "include_r53": true} to also audit R53 ↔
+    # alarm wiring (PR9 / F2) — slower (~5 API calls per health check)
+    # but worth running after any CW alarm modification.
     if event.get("preflight", False):
-        return _run_preflight_checks()
+        return _run_preflight_checks(include_r53=event.get("include_r53", False))
 
     # Re-read dynamic config (portal may have changed env vars)
     _reload_dynamic_config()
