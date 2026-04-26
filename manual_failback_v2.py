@@ -37,6 +37,7 @@ import json
 import logging
 import ssl
 from datetime import datetime, timezone
+from typing import Optional
 from urllib.request import urlopen, Request
 from urllib.error import URLError, HTTPError
 
@@ -573,6 +574,54 @@ STEP 3: Then re-invoke this Lambda with redis_confirmed=true (alongside
 """
 
 
+def _resolve_target_aurora_arn(target_region: str) -> Optional[str]:
+    """Resolve the Aurora cluster ARN for the cluster in *target_region*.
+
+    Priority (mirrors the orchestrator's helper):
+      1. describe_global_clusters → find member whose ARN contains :target_region:
+      2. AURORA_CLUSTER_ID (LOCAL cluster, since failback Lambda runs in the
+         target region by invariant — the local cluster IS the failback target)
+      3. Hard-coded -w1/-w2 suffix swap as last resort
+
+    v1.7 fix (F9): the previous logic used TARGET_AURORA_CLUSTER_ID first,
+    which is the PEER cluster (the one currently writing in the OTHER region)
+    — exactly the wrong target. Switchover wants to PROMOTE a cluster, so the
+    target is the LOCAL one in the failback region, not the peer.
+    """
+    if not AURORA_GLOBAL_CLUSTER_ID:
+        return None
+
+    # Best path: ask AWS which cluster lives in target_region.
+    try:
+        rds = boto3.client("rds", region_name=CURRENT_REGION, config=_client_config)
+        resp = rds.describe_global_clusters(GlobalClusterIdentifier=AURORA_GLOBAL_CLUSTER_ID)
+        for gc in resp.get("GlobalClusters", []):
+            for member in gc.get("GlobalClusterMembers", []):
+                arn = member.get("DBClusterArn", "")
+                if f":{target_region}:" in arn:
+                    return arn
+    except ClientError as e:
+        logger.warning(f"describe_global_clusters failed during ARN lookup: {e}")
+
+    if not _AWS_ACCOUNT_ID:
+        return None
+
+    # The failback Lambda runs IN target_region (by invariant), so AURORA_CLUSTER_ID
+    # in this Lambda's env IS the cluster we want to promote.
+    if AURORA_CLUSTER_ID and CURRENT_REGION == target_region:
+        return f"arn:aws:rds:{target_region}:{_AWS_ACCOUNT_ID}:cluster:{AURORA_CLUSTER_ID}"
+
+    # Last-resort suffix swap (kept for backwards compat with -w1/-w2 stacks).
+    cid = AURORA_CLUSTER_ID
+    if cid:
+        if target_region == "us-west-2" and cid.endswith("-w1"):
+            cid = cid[:-3] + "-w2"
+        elif target_region == "us-west-1" and cid.endswith("-w2"):
+            cid = cid[:-3] + "-w1"
+        return f"arn:aws:rds:{target_region}:{_AWS_ACCOUNT_ID}:cluster:{cid}"
+    return None
+
+
 def _auto_switchover_aurora(target_region: str) -> dict:
     """Trigger Aurora switchover-global-cluster from the failback Lambda itself.
 
@@ -582,22 +631,10 @@ def _auto_switchover_aurora(target_region: str) -> dict:
 
     Returns: ``{"success": bool, "error": str}``.
     """
-    if not AURORA_GLOBAL_CLUSTER_ID:
-        return {"success": False, "error": "AURORA_GLOBAL_CLUSTER_ID not configured"}
+    target_arn = _resolve_target_aurora_arn(target_region)
+    if not target_arn:
+        return {"success": False, "error": "Cannot determine target cluster ARN — set AURORA_GLOBAL_CLUSTER_ID + AURORA_CLUSTER_ID"}
 
-    target_cluster_id = TARGET_AURORA_CLUSTER_ID or AURORA_CLUSTER_ID
-    if not TARGET_AURORA_CLUSTER_ID and target_cluster_id:
-        if target_region == "us-west-2" and target_cluster_id.endswith("-w1"):
-            target_cluster_id = target_cluster_id[:-3] + "-w2"
-        elif target_region == "us-west-1" and target_cluster_id.endswith("-w2"):
-            target_cluster_id = target_cluster_id[:-3] + "-w1"
-
-    if not target_cluster_id or not _AWS_ACCOUNT_ID:
-        return {"success": False, "error": "Cannot determine target cluster ARN"}
-
-    target_arn = (
-        f"arn:aws:rds:{target_region}:{_AWS_ACCOUNT_ID}:cluster:{target_cluster_id}"
-    )
     try:
         rds = boto3.client("rds", region_name=CURRENT_REGION, config=_client_config)
         rds.switchover_global_cluster(

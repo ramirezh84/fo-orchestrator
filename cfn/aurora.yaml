@@ -29,9 +29,14 @@ Parameters:
     Default: 'false'
     AllowedValues: ['true', 'false']
     Description: Set true only for primary (us-west-1) stack
+  KmsKeyId:
+    Type: String
+    Default: ''
+    Description: KMS key ID/ARN/alias for storage encryption. Required for cross-region replicas (secondary stacks).
 
 Conditions:
   IsPrimary: !Equals [!Ref CreateGlobalCluster, 'true']
+  HasKmsKey: !Not [!Equals [!Ref KmsKeyId, '']]
 
 Resources:
 
@@ -78,6 +83,7 @@ Resources:
       BackupRetentionPeriod: 1
       DeletionProtection: false
       StorageEncrypted: true
+      KmsKeyId: !If [HasKmsKey, !Ref KmsKeyId, !Ref 'AWS::NoValue']
       Port: 5432
       Tags:
         - Key: Name

@@ -273,22 +273,28 @@ elasticache_client = boto3.client("elasticache", region_name=CURRENT_REGION, con
 # State backend — DynamoDB (default) or S3 (via STATE_BACKEND env var)
 _state_backend = create_backend(region=CURRENT_REGION, client_config=_client_config)
 
-# For S3 backend: remote backend for cross-region writes during failover.
-# Ensures the other region sees state changes immediately without waiting for CRR.
-_REMOTE_STATE_BUCKET = os.environ.get("REMOTE_STATE_BUCKET", "")
-_remote_state_backend = None
-if _REMOTE_STATE_BUCKET and os.environ.get("STATE_BACKEND", "dynamodb").lower() == "s3":
-    from state_backend import S3StateBackend
-    _remote_region = SECONDARY_REGION if CURRENT_REGION == PRIMARY_REGION else PRIMARY_REGION
-    _remote_state_backend = S3StateBackend(
-        bucket=_REMOTE_STATE_BUCKET, region=_remote_region,
-        prefix=os.environ.get("STATE_PREFIX", "failover-state/"),
-        client_config=_client_config,
+# v1.7: REMOTE_STATE_BUCKET is deprecated. Bidirectional CRR + bilateral RMW
+# from both regions caused F7/F8 in the v1.6 drill (see
+# docs/v1.7-s3-state-isolation-spec.md). The new design has only the active
+# region write to REGION_STATE.json; passive writes its own region_health
+# under a per-region key. CRR handles cross-region propagation on its own.
+if os.environ.get("REMOTE_STATE_BUCKET"):
+    logger.warning(
+        "REMOTE_STATE_BUCKET is ignored as of v1.7. Cross-region propagation is "
+        "handled by S3 CRR. See docs/v1.7-s3-state-isolation-spec.md."
     )
+
+# State path prefix used for both REGION_STATE.json and region_health/<r>.json
+_STATE_PREFIX = os.environ.get("STATE_PREFIX", "failover-state/")
+
+# v1.7: state schema version. Pre-v1.7 state has no schema_version key →
+# treated as 0. v1.7 writes 1. Bump on backwards-incompatible changes.
+SCHEMA_VERSION = 1
 
 logger.info(
     f"Module initialized: region={CURRENT_REGION}, failover_mode={FAILOVER_MODE}, "
-    f"routing_mode={ROUTING_MODE}, app={APP_NAME or '(not set)'}, namespace={CW_NAMESPACE}"
+    f"routing_mode={ROUTING_MODE}, app={APP_NAME or '(not set)'}, namespace={CW_NAMESPACE}, "
+    f"schema_version={SCHEMA_VERSION}"
 )
 
 
@@ -823,6 +829,7 @@ def get_failover_state() -> dict:
         if not item:
             logger.info("No state found, writing default state")
             default_state = {
+                "schema_version": SCHEMA_VERSION,
                 "active_region": PRIMARY_REGION,
                 "state": "PRIMARY_ACTIVE",
                 "last_failover_ts": "1970-01-01T00:00:00Z",
@@ -844,16 +851,117 @@ def get_failover_state() -> dict:
         raise
 
 
-def update_failover_state(updates: dict) -> None:
-    """Update failover state in the configured backend."""
-    logger.info(f"Updating state: {json.dumps(updates, default=str)}")
+def is_active_region(state: dict) -> bool:
+    """True iff CURRENT_REGION is the active region per the supplied state."""
+    return CURRENT_REGION == state.get("active_region", PRIMARY_REGION)
+
+
+# v1.7 per-invocation cache for region_health reads. Cleared at the top of
+# every handler() invocation via _reload_dynamic_config → _reset_region_health_cache.
+_region_health_cache: dict = {}
+
+
+def _reset_region_health_cache() -> None:
+    """Clear the per-invocation region_health cache. Called once per Lambda invoke."""
+    global _region_health_cache
+    _region_health_cache = {}
+
+
+def write_own_region_health(healthy: bool, signals=None) -> None:
+    """
+    Write CURRENT_REGION's health to a per-region key (v1.7).
+
+    Replaces the old pattern of merging into state['region_health'] and writing
+    the whole REGION_STATE.json — which raced with the active region's
+    locally-conditional updates under bidirectional CRR (F7/F8).
+
+    The active region reads these per-region keys via read_region_health_map().
+    """
+    payload = {
+        "region": CURRENT_REGION,
+        "healthy": healthy,
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "signals": signals or [],
+    }
+    key = f"{_STATE_PREFIX}region_health/{CURRENT_REGION}.json"
     try:
-        _state_backend.update_state(updates)
-        if _remote_state_backend:
-            try:
-                _remote_state_backend.update_state(updates)
-            except Exception as e:
-                logger.warning(f"Remote state update failed (non-fatal): {type(e).__name__}: {e}")
+        _state_backend.put_object(key, payload)
+    except Exception as e:
+        logger.warning(f"Failed to write own region_health to {key}: {type(e).__name__}: {e}")
+
+
+def read_region_health_map() -> dict:
+    """
+    Aggregate per-region health by listing region_health/*.json (v1.7).
+
+    Cached per-invocation; cleared by _reset_region_health_cache() at the top
+    of every handler() call via _reload_dynamic_config.
+
+    Returns: {region: {region, healthy, ts, signals}} for every region key
+    found under the configured STATE_PREFIX.
+    """
+    global _region_health_cache
+    if _region_health_cache:
+        return _region_health_cache
+
+    prefix = f"{_STATE_PREFIX}region_health/"
+    out = {}
+    try:
+        keys = _state_backend.list_objects(prefix)
+    except Exception as e:
+        logger.warning(f"region_health list failed for {prefix}: {type(e).__name__}: {e}")
+        return out
+
+    for key in keys:
+        try:
+            data = _state_backend.get_object(key)
+            region = data.get("region")
+            if region:
+                out[region] = data
+        except Exception as e:
+            logger.warning(f"region_health read failed for {key}: {type(e).__name__}: {e}")
+
+    _region_health_cache = out
+    return out
+
+
+def update_failover_state(updates: dict) -> None:
+    """
+    Update the shared REGION_STATE.json. Active-region only (v1.7 tripwire).
+
+    Passive-region writes are refused with an ERROR log. This catches future
+    regressions of the F7/F8 race where bilateral RMW from both regions plus
+    bidirectional CRR caused locally-conditional updates to be silently lost.
+
+    Per-region health belongs in write_own_region_health() — not here.
+    """
+    # Read current state to learn who is active. Cached read is acceptable —
+    # if we're racing with a brand-new failover claim, the worst outcome is
+    # one stale write that gets clobbered by CAS or read again next cycle.
+    try:
+        current = _state_backend.get_state()
+    except Exception as e:
+        logger.error(f"update_failover_state: get_state failed: {type(e).__name__}: {e}")
+        raise
+
+    if current and not is_active_region(current):
+        # v1.7 tripwire: passive region must not write the shared state file.
+        # Logged at ERROR so this is loud — see spec §8 Q3.
+        logger.error(
+            f"REFUSING update_failover_state from passive region {CURRENT_REGION} "
+            f"(active is {current.get('active_region')}). Updates dropped: "
+            f"{json.dumps(updates, default=str)}"
+        )
+        return
+
+    # v1.7: stamp schema_version on every write so older readers can detect
+    # forward-incompatible changes.
+    payload = dict(updates)
+    payload.setdefault("schema_version", SCHEMA_VERSION)
+
+    logger.info(f"Updating state: {json.dumps(payload, default=str)}")
+    try:
+        _state_backend.update_state(payload)
     except Exception as e:
         logger.error(f"Error updating state: {e}")
         raise
@@ -1606,7 +1714,7 @@ def _reload_dynamic_config():
     Valid FAILOVER_MODE values: "auto", "manual", "parked".
     """
     global ROUTING_MODE, PASSIVE_PUBLISH_ZERO, FAILOVER_MODE
-    global _state_backend, _remote_state_backend, _REMOTE_STATE_BUCKET
+    global _state_backend, _STATE_PREFIX
     global AURORA_AUTO_PROMOTE, ELASTICACHE_AUTO_PROMOTE
     global ELASTICACHE_REPLICATION_GROUP_ID, ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID
     global HEALTH_ENDPOINT, HEALTH_CHECK_URL, HEALTH_CHECK_TIMEOUT_SECONDS
@@ -1637,19 +1745,17 @@ def _reload_dynamic_config():
 
     # Reinitialize state backend (DynamoDB or S3)
     _state_backend = create_backend(region=CURRENT_REGION, client_config=_client_config)
+    _STATE_PREFIX = os.environ.get("STATE_PREFIX", "failover-state/")
     logger.info(f"Config reloaded: STATE_BACKEND={os.environ.get('STATE_BACKEND','?')}, backend={type(_state_backend).__name__}")
 
-    # Reinitialize remote state backend for S3 CRR
-    _REMOTE_STATE_BUCKET = os.environ.get("REMOTE_STATE_BUCKET", "")
-    _remote_state_backend = None
-    if _REMOTE_STATE_BUCKET and os.environ.get("STATE_BACKEND", "dynamodb").lower() == "s3":
-        from state_backend import S3StateBackend
-        _remote_region = SECONDARY_REGION if CURRENT_REGION == PRIMARY_REGION else PRIMARY_REGION
-        _remote_state_backend = S3StateBackend(
-            bucket=_REMOTE_STATE_BUCKET, region=_remote_region,
-            prefix=os.environ.get("STATE_PREFIX", "failover-state/"),
-            client_config=_client_config,
+    # v1.7: REMOTE_STATE_BUCKET deprecated; warn if still set.
+    if os.environ.get("REMOTE_STATE_BUCKET"):
+        logger.warning(
+            "REMOTE_STATE_BUCKET is ignored as of v1.7. CRR handles cross-region state."
         )
+
+    # Reset per-invocation cache for region_health reads (v1.7)
+    _reset_region_health_cache()
 
 
 def detect_data_tier_config() -> dict:
@@ -2929,13 +3035,10 @@ def _handle_passive_region(state: dict, active_region: str) -> dict:
     # -----------------------------------------------------------------
     # LATCH CHECK: Am I the region that was failed away from?
     # -----------------------------------------------------------------
+    # v1.7: write to per-region key instead of merging into shared state.
+    # Avoids the F7/F8 RMW race that blocked v1.6 in the bilateral-CRR drill.
     our_health = evaluate_region_health()
-    current_health_map = state.get("region_health", {})
-    current_health_map[CURRENT_REGION] = {
-        "healthy": our_health["healthy"],
-        "ts": datetime.now(timezone.utc).isoformat()
-    }
-    update_failover_state({"region_health": current_health_map})
+    write_own_region_health(our_health["healthy"], signals=our_health.get("signals"))
 
     if latch_engaged:
         logger.info(
@@ -3487,7 +3590,8 @@ def _handle_active_region(state: dict, active_region: str,
     # If the target is ALSO unhealthy, we stay in the current region
     # and alert operators of a global outage to prevent flip-flopping.
     # ---------------------------------------------------------------------
-    peer_health_info = state.get("region_health", {}).get(target_region, {})
+    # v1.7: peer health is read from per-region keys, not the shared state file.
+    peer_health_info = read_region_health_map().get(target_region, {})
     peer_healthy = peer_health_info.get("healthy", True)  # Assume healthy if unknown
     peer_ts_str = peer_health_info.get("ts")
     
