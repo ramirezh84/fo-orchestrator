@@ -260,7 +260,12 @@ Resources:
       Runtime: python3.12
       Handler: manual_failback_v2.handler
       Role: !GetAtt LambdaRole.Arn
-      Timeout: 120
+      # v1.7.1 (F10): bumped from 120s to 600s. The Lambda now polls inline
+      # for Aurora switchover + ElastiCache failover completion (via
+      # FAILBACK_PROMOTION_WAIT_TIMEOUT_SECONDS, default 480s) so the
+      # validate_target_region_health step doesn't run before the data tier
+      # has actually flipped.
+      Timeout: 600
       MemorySize: 256
       Code:
         ZipFile: |
