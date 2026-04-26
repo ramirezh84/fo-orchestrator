@@ -88,7 +88,7 @@ python3 tools/publish_version.py --alias active --copy-from v1-2
 # Returns: {"ready": true/false, "checks": {"state_backend": ..., "cloudwatch_metric": ..., "sns_topic": ...}}
 
 # Package and deploy orchestrator Lambda (production)
-zip failover_orchestrator_v3.zip failover_orchestrator_v3.py state_backend.py ai/__init__.py ai/config.py ai/llm_client.py ai/collector.py ai/rca_analyzer.py ai/stability_collector.py ai/aurora_advisor.py
+zip failover_orchestrator_v3.zip failover_orchestrator_v3.py state_backend.py notifications.py ai/__init__.py ai/config.py ai/llm_client.py ai/collector.py ai/rca_analyzer.py ai/stability_collector.py ai/aurora_advisor.py
 aws lambda update-function-code \
   --function-name failover-orchestrator-prod \
   --zip-file fileb://failover_orchestrator_v3.zip \
@@ -96,7 +96,7 @@ aws lambda update-function-code \
 # Repeat for us-west-2
 
 # Package and deploy failback Lambda (production)
-zip manual_failback_v2.zip manual_failback_v2.py state_backend.py ai/__init__.py ai/config.py ai/llm_client.py ai/stability_collector.py ai/failback_readiness.py
+zip manual_failback_v2.zip manual_failback_v2.py state_backend.py notifications.py ai/__init__.py ai/config.py ai/llm_client.py ai/stability_collector.py ai/failback_readiness.py
 aws lambda update-function-code \
   --function-name failover-manual-failback-prod \
   --zip-file fileb://manual_failback_v2.zip \
@@ -252,6 +252,9 @@ All configuration is via Lambda environment variables. Key variables:
 | `PASSIVE_PUBLISH_ZERO` | false | Passive region always publishes metric=0 (for zero-container secondary use case) |
 | `ROUTING_MODE` | failover | `failover` (active/passive with latch) or `active-active` (both regions serve, auto-recovery) |
 | `SNS_TOPIC_ARN` | (required) | Operator notifications |
+| `APP_NAME` | (empty) | Application name shown in notification subject prefix |
+| `ENVIRONMENT` | (empty) | Deployment environment (e.g., `prod`, `staging`, `demo`). Composed with `APP_NAME` into the `[ENVIRONMENT-APP_NAME]` notification subject prefix. Empty falls back to `[APP_NAME]` only. |
+| `WARNING_NOTIFICATION_COOLDOWN_MINUTES` | 5 | Throttle between repeated WARNING-level notifications. First failure of an incident bypasses throttling. |
 | `HEALTH_CHECK_URL` | (empty) | Private ALB URL for HTTP health check |
 | `FAILOVER_MODE` | auto | `auto`, `manual` (notify-only), or `parked` (inactive during staged deployment) |
 | `COOLDOWN_MINUTES` | 30 | Minimum time between failovers |
@@ -398,9 +401,9 @@ python3 tools/setup_s3_state_backend.py
 #    STATE_BUCKET=failover-state-<region>-<account-id>
 #    STATE_PREFIX=failover-state/
 
-# 3. Include state_backend.py in the Lambda deployment zip:
-zip failover_orchestrator_v3.zip failover_orchestrator_v3.py state_backend.py
-zip manual_failback_v2.zip manual_failback_v2.py state_backend.py ai/__init__.py ai/config.py ai/llm_client.py ai/stability_collector.py ai/failback_readiness.py
+# 3. Include state_backend.py and notifications.py in the Lambda deployment zip:
+zip failover_orchestrator_v3.zip failover_orchestrator_v3.py state_backend.py notifications.py
+zip manual_failback_v2.zip manual_failback_v2.py state_backend.py notifications.py ai/__init__.py ai/config.py ai/llm_client.py ai/stability_collector.py ai/failback_readiness.py
 ```
 
 ### Trade-offs vs DynamoDB

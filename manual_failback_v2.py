@@ -45,6 +45,12 @@ from botocore.config import Config as BotoConfig
 from botocore.exceptions import ClientError
 
 from state_backend import create_backend, S3StateBackend
+from notifications import (
+    compose_message,
+    SEVERITY_INFO,
+    SEVERITY_WARNING,
+    SEVERITY_CRITICAL,
+)
 
 # AI modules imported lazily inside functions to support v1.0 mode
 
@@ -210,13 +216,20 @@ def detect_data_tier_config() -> dict:
     (aurora_confirmed, redis_confirmed, etc.) and to suppress notifications
     for absent tiers.
 
+    Reads os.environ directly so per-invocation env changes (and per-test
+    patch.dict overrides) take effect without re-importing the module.
+
     See failover_orchestrator_v3.py:detect_data_tier_config for full docs.
     """
+    aurora_id = os.environ.get("AURORA_CLUSTER_ID", "")
+    redis_id = os.environ.get("ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID", "")
+    aurora_auto = os.environ.get("AURORA_AUTO_PROMOTE", "false").lower() == "true"
+    redis_auto = os.environ.get("ELASTICACHE_AUTO_PROMOTE", "false").lower() == "true"
     return {
-        "aurora_present": bool(AURORA_CLUSTER_ID),
-        "aurora_auto":    bool(AURORA_CLUSTER_ID) and AURORA_AUTO_PROMOTE,
-        "redis_present":  bool(ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID),
-        "redis_auto":     bool(ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID) and ELASTICACHE_AUTO_PROMOTE,
+        "aurora_present": bool(aurora_id),
+        "aurora_auto":    bool(aurora_id) and aurora_auto,
+        "redis_present":  bool(redis_id),
+        "redis_auto":     bool(redis_id) and redis_auto,
     }
 
 
@@ -621,19 +634,42 @@ def handler(event, context):
             )
 
             if verdict == "NO_GO":
-                msg = (
-                    f"AI readiness assessment: NO GO (confidence: {assessment.get('confidence')}%)\n\n"
-                    f"Reasoning: {assessment.get('reasoning', 'N/A')}\n\n"
-                    f"Risks:\n"
-                    + "\n".join(f"  - {r}" for r in assessment.get("risks", []))
-                    + "\n\nTo override, set skip_readiness_check=true in the payload."
+                risks_lines = "\n".join(f"  • {r}" for r in assessment.get("risks", []))
+                next_step = (
+                    "Address the risks above, OR re-invoke the failback Lambda with "
+                    "`skip_readiness_check=true` in the payload to override the AI "
+                    "veto if you have human-verified that failback is safe.\n"
+                    + (readiness_appendix or "")
                 )
                 logger.warning(f"Failback blocked by AI readiness: {verdict}")
-                send_notification(
-                    f"FAILBACK BLOCKED: AI readiness assessment says NO GO",
-                    msg + readiness_appendix,
+                subject, body = compose_message(
+                    severity=SEVERITY_CRITICAL,
+                    what="Failback BLOCKED — AI readiness assessment says NO GO",
+                    why=(
+                        f"The AI failback-readiness check returned NO GO with "
+                        f"{assessment.get('confidence')}% confidence. "
+                        f"Reasoning: {assessment.get('reasoning', 'N/A')}"
+                    ),
+                    next_step=next_step,
+                    context={
+                        "Operator": operator,
+                        "Target region": target_region,
+                        "AI verdict": verdict,
+                        "AI confidence": f"{assessment.get('confidence')}%",
+                        "Risks":
+                            f"\n{risks_lines}" if risks_lines else "(none reported)",
+                    },
+                    journey=[
+                        "[✓] Failback requested",
+                        "[✗] AI readiness gate — NO GO",
+                        "[ ] Aurora switchover",
+                        "[ ] Latch released",
+                    ],
+                    source="failover-failback",
+                    region=CURRENT_REGION,
                 )
-                return {"statusCode": 400, "body": msg}
+                send_notification(subject, body)
+                return {"statusCode": 400, "body": body}
         except Exception as e:
             logger.error(f"AI readiness assessment failed (non-blocking): {e}")
             # Continue with failback — AI failure should not block
@@ -645,18 +681,45 @@ def handler(event, context):
         logger.info("Step 3: Validating target region health...")
         health = validate_target_region_health(target_region)
         if not health["healthy"]:
-            msg = (
-                f"Target region {target_region} is NOT healthy. Issues:\n"
-                + "\n".join(f"  - {i}" for i in health["issues"])
-                + "\n\nTo override, set skip_health_check=true in the payload."
-                + "\nIf Aurora is not the writer, you must switchover Aurora "
-                + "first."
+            issue_lines = "\n".join(f"  • {i}" for i in health["issues"])
+            msg_for_log = (
+                f"Target region {target_region} is NOT healthy. Issues:\n{issue_lines}"
             )
-            logger.error(msg)
-            send_notification(
-                f"FAILBACK BLOCKED: {target_region} not ready", msg
+            logger.error(msg_for_log)
+            next_step = (
+                f"Resolve each issue above in {target_region} before re-invoking "
+                f"failback. Common causes: ECS tasks not yet healthy, Aurora not "
+                f"yet the writer in {target_region} (run `switchover-global-cluster` "
+                f"first), or app /healthcheck endpoint returning non-200. "
+                f"To override the gate (only after you've human-verified target "
+                f"readiness), re-invoke with `skip_health_check=true` in the payload."
             )
-            return {"statusCode": 400, "body": msg}
+            subject, body = compose_message(
+                severity=SEVERITY_CRITICAL,
+                what=f"Failback BLOCKED — target region {target_region} is not ready",
+                why=(
+                    f"The pre-flight health check for {target_region} found "
+                    f"{len(health['issues'])} issue(s). Failback would route traffic "
+                    f"to a region that cannot serve it, so the orchestrator refused "
+                    f"to release the latch."
+                ),
+                next_step=next_step,
+                context={
+                    "Operator": operator,
+                    "Target region": target_region,
+                    "Issues found": f"\n{issue_lines}",
+                },
+                journey=[
+                    "[✓] Failback requested",
+                    "[✗] Target region health gate — FAILED",
+                    "[ ] Aurora switchover",
+                    "[ ] Latch released",
+                ],
+                source="failover-failback",
+                region=CURRENT_REGION,
+            )
+            send_notification(subject, body)
+            return {"statusCode": 400, "body": body}
         logger.info(f"All health checks passed for {target_region}")
     else:
         logger.warning(
@@ -705,27 +768,81 @@ def handler(event, context):
         })
 
         logger.info("  4d: Sending confirmation notification...")
-        msg = (
-            f"Manual failback completed successfully.\n\n"
-            f"Operator: {operator}\n"
-            f"From: {active_region}\n"
-            f"To: {target_region}\n"
-            f"Time: {now.isoformat()}\n\n"
-            f"Latch has been RELEASED. Automated health monitoring is active.\n"
-            f"The orchestrator Lambda will resume normal health evaluation."
+        cfg = detect_data_tier_config()
+        # Journey: failback is the inverse of failover. All earlier journey
+        # steps map to "✓" and the lifecycle is back at PRIMARY_ACTIVE.
+        journey = ["[✓] Failback requested", "[✓] Aurora switchover (operator)"]
+        if cfg["redis_present"]:
+            journey.append("[✓] Redis switchover (operator)")
+        journey.append("[✓] Latch released — system back to PRIMARY_ACTIVE")
+        next_step = (
+            f"No action required. The orchestrator's automated health monitoring "
+            f"is active again in both regions. Confirm Route 53 traffic is flowing "
+            f"to {target_region} and watch for any sustained-failure WARNINGs in "
+            f"the next 5–10 minutes to verify the underlying issue is resolved."
+            + (readiness_appendix or "")
         )
-        send_notification(f"FAILBACK COMPLETE: -> {target_region}", msg + readiness_appendix)
+        subject, body = compose_message(
+            severity=SEVERITY_CRITICAL,
+            what=f"Failback COMPLETE — traffic returned to {target_region}",
+            why=(
+                f"Operator {operator} initiated and completed manual failback "
+                f"from {active_region} back to {target_region}. The orchestrator "
+                f"validated target health, released the latch, and updated state "
+                f"to PRIMARY_ACTIVE."
+            ),
+            next_step=next_step,
+            context={
+                "Operator": operator,
+                "From region": active_region,
+                "To region": target_region,
+                "New state": new_state,
+                "Latch": "RELEASED",
+            },
+            journey=journey,
+            source="failover-failback",
+            region=CURRENT_REGION,
+        )
+        send_notification(subject, body)
+        msg_for_return = body  # full body for any caller that logs it
 
         logger.info(f"FAILBACK COMPLETE: {active_region} -> {target_region}")
-        return {"statusCode": 200, "body": msg}
+        return {"statusCode": 200, "body": msg_for_return}
 
     except Exception as e:
         logger.error(
             f"FAILBACK FAILED at step 4: {type(e).__name__}: {e}"
         )
-        send_notification(
-            f"FAILBACK FAILED: -> {target_region}",
-            f"Manual failback failed.\nError: {str(e)}\n\n"
-            f"Manual intervention required.",
+        next_step = (
+            "Manual intervention required. Inspect the Lambda's CloudWatch logs "
+            "for the full traceback. Common causes: state backend write failure "
+            "(check IAM + DynamoDB/S3 health), CloudWatch PutMetricData failure "
+            "(check IAM), or Aurora describe-db-clusters returning unexpected "
+            "shape. Once the root cause is fixed, re-invoke the failback Lambda "
+            "with the same payload."
         )
+        subject, body = compose_message(
+            severity=SEVERITY_CRITICAL,
+            what=f"Failback FAILED — {target_region} did not regain control",
+            why=(
+                f"The failback Lambda threw {type(e).__name__} during the "
+                f"DNS/state update step (after health checks passed). Error: {e}"
+            ),
+            next_step=next_step,
+            context={
+                "Operator": operator,
+                "Target region": target_region,
+                "Error type": type(e).__name__,
+                "Error detail": str(e)[:200],
+            },
+            journey=[
+                "[✓] Failback requested",
+                "[✓] Health gate passed",
+                "[✗] DNS/state update — FAILED",
+                "[ ] Latch released",
+            ],
+            source="failover-failback",
+            region=CURRENT_REGION,
+        )
+        send_notification(subject, body)
         raise

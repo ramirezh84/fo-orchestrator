@@ -58,6 +58,12 @@ from botocore.exceptions import (
 )
 
 from state_backend import create_backend, ConditionalCheckFailedError
+from notifications import (
+    compose_message,
+    SEVERITY_INFO,
+    SEVERITY_WARNING,
+    SEVERITY_CRITICAL,
+)
 
 # AI modules are imported lazily inside functions to support v1.0 mode
 # (where AI_RCA_ENABLED=false and AI modules may not be needed)
@@ -224,7 +230,7 @@ AURORA_PROMOTION_REMINDER_INTERVAL_MINUTES = int(
 # are NEVER throttled.
 # ---------------------------------------------------------------------------
 WARNING_NOTIFICATION_COOLDOWN_MINUTES = int(
-    os.environ.get("WARNING_NOTIFICATION_COOLDOWN_MINUTES", "10")
+    os.environ.get("WARNING_NOTIFICATION_COOLDOWN_MINUTES", "5")
 )
 
 logger = logging.getLogger()
@@ -1165,7 +1171,12 @@ def send_notification(subject: str, message: str) -> None:
         logger.error(f"Notification failed: {type(e).__name__}: {e}")
 
 
-def send_warning_notification(subject: str, message: str, state: dict) -> None:
+def send_warning_notification(
+    subject: str,
+    message: str,
+    state: dict,
+    bypass_throttle: bool = False,
+) -> None:
     """
     Send a WARNING-level SNS notification with throttling.
 
@@ -1174,7 +1185,14 @@ def send_warning_notification(subject: str, message: str, state: dict) -> None:
     out immediately, then subsequent alerts are suppressed for N minutes.
 
     The first alert always sends (so the team knows something is wrong).
-    Subsequent alerts send only every WARNING_NOTIFICATION_COOLDOWN_MINUTES.
+    Subsequent alerts send only every WARNING_NOTIFICATION_COOLDOWN_MINUTES
+    (default 5min in v1.6, was 10min in v1.5).
+
+    Set ``bypass_throttle=True`` for notifications that must always reach the
+    operator regardless of recent traffic — e.g., the very first failure of an
+    incident, retry-attempt-N alerts during stuck data-tier promotion, or the
+    final escalation when retries exhaust. These signal-class events lose
+    information if collapsed under a cooldown window.
 
     CRITICAL one-time events (failover, region failure, failover failed) should
     use send_notification() directly - they are NEVER throttled.
@@ -1182,22 +1200,23 @@ def send_warning_notification(subject: str, message: str, state: dict) -> None:
     now = datetime.now(timezone.utc)
     last_warning_ts_str = state.get("last_warning_notification_ts", "1970-01-01T00:00:00Z")
 
-    try:
-        last_warning_ts = datetime.fromisoformat(last_warning_ts_str.replace("Z", "+00:00"))
-        seconds_since_last = (now - last_warning_ts).total_seconds()
-        cooldown_seconds = WARNING_NOTIFICATION_COOLDOWN_MINUTES * 60
+    if not bypass_throttle:
+        try:
+            last_warning_ts = datetime.fromisoformat(last_warning_ts_str.replace("Z", "+00:00"))
+            seconds_since_last = (now - last_warning_ts).total_seconds()
+            cooldown_seconds = WARNING_NOTIFICATION_COOLDOWN_MINUTES * 60
 
-        if seconds_since_last < cooldown_seconds:
-            remaining = (cooldown_seconds - seconds_since_last) / 60
-            logger.info(
-                f"Warning notification throttled. Last sent {seconds_since_last:.0f}s ago, "
-                f"cooldown {cooldown_seconds}s. Next in ~{remaining:.0f}m. "
-                f"Subject: {subject}"
-            )
-            return
-    except (ValueError, TypeError):
-        # Can't parse timestamp - send the notification to be safe
-        pass
+            if seconds_since_last < cooldown_seconds:
+                remaining = (cooldown_seconds - seconds_since_last) / 60
+                logger.info(
+                    f"Warning notification throttled. Last sent {seconds_since_last:.0f}s ago, "
+                    f"cooldown {cooldown_seconds}s. Next in ~{remaining:.0f}m. "
+                    f"Subject: {subject}"
+                )
+                return
+        except (ValueError, TypeError):
+            # Can't parse timestamp - send the notification to be safe
+            pass
 
     # Send the notification and update the timestamp
     try:
@@ -1335,15 +1354,33 @@ def _handle_active_active(state: dict) -> dict:
                     reason="Health restored, region rejoining traffic pool",
                     severity="INFO",
                 )
-                send_notification(
-                    subject=f"RECOVERED: {CURRENT_REGION} healthy, rejoining traffic pool",
-                    message=(
-                        f"Region {CURRENT_REGION} has recovered and is publishing healthy.\n"
-                        f"Route 53 will resume routing traffic here based on latency.\n\n"
-                        f"Time: {now.isoformat()}\n"
-                        f"Previous failures: {consecutive_failures}\n"
+                subject, body = compose_message(
+                    severity=SEVERITY_INFO,
+                    what=f"Region {CURRENT_REGION} recovered — rejoining traffic pool",
+                    why=(
+                        f"After {consecutive_failures} failed health-check cycle(s), "
+                        f"region {CURRENT_REGION} is reporting healthy again. In "
+                        f"active-active mode this means Route 53 will resume "
+                        f"routing latency-based traffic here automatically."
                     ),
+                    next_step=(
+                        "No action required. Watch for sustained-failure WARNINGs "
+                        "in the next 5–10 minutes to verify the underlying issue "
+                        "is fully resolved."
+                    ),
+                    context={
+                        "Region": CURRENT_REGION,
+                        "Previous failure count": str(consecutive_failures),
+                        "Mode": "active-active",
+                    },
+                    journey=[
+                        f"[✓] Region {CURRENT_REGION} healthy",
+                        "[✓] Rejoined Route 53 traffic pool",
+                    ],
+                    source="failover-orchestrator",
+                    region=CURRENT_REGION,
                 )
+                send_notification(subject, body)
 
         publish_region_health_metric(CURRENT_REGION, True)
         return {"statusCode": 200, "body": "Region healthy"}
@@ -1357,17 +1394,57 @@ def _handle_active_active(state: dict) -> dict:
     if new_count < CONSECUTIVE_FAILURES_THRESHOLD:
         # Below threshold — still publishing healthy, send warning
         publish_region_health_metric(CURRENT_REGION, True)
-        send_warning_notification(
-            subject=f"WARNING: {CURRENT_REGION} degraded ({new_count}/{CONSECUTIVE_FAILURES_THRESHOLD})",
-            message=(
-                f"Region {CURRENT_REGION} health check failing.\n"
-                f"Consecutive failures: {new_count}/{CONSECUTIVE_FAILURES_THRESHOLD}\n"
-                f"Reason: {health.get('decision_reason', 'N/A')}\n\n"
-                f"If failures reach threshold, this region will be removed from the "
-                f"Route 53 traffic pool.\n"
-            ),
-            state=state,
+        is_first = new_count == 1
+        if is_first:
+            what = (
+                f"Region {CURRENT_REGION} (active-active) reported its FIRST "
+                f"health failure (1 of {CONSECUTIVE_FAILURES_THRESHOLD})"
+            )
+            why = (
+                f"{health.get('decision_reason', 'health check failed')}. "
+                f"Active-active mode: traffic is still flowing here based on "
+                f"Route 53 latency routing — this is the first failure of an incident."
+            )
+            next_step = (
+                f"No action required. The orchestrator will keep evaluating "
+                f"every 60s. If {CONSECUTIVE_FAILURES_THRESHOLD} consecutive "
+                f"failures occur and the cooldown has expired, this region will "
+                f"be removed from the traffic pool automatically."
+            )
+        else:
+            what = (
+                f"Region {CURRENT_REGION} (active-active) health failure "
+                f"{new_count} of {CONSECUTIVE_FAILURES_THRESHOLD} — sustained"
+            )
+            why = (
+                f"{health.get('decision_reason', 'health check failed')}. "
+                f"This is failure {new_count} in a row — one more and the "
+                f"region will be removed from the Route 53 traffic pool."
+            )
+            next_step = (
+                f"Investigate {CURRENT_REGION} now. If the next cycle (~60s) "
+                f"also fails, this region will be removed from the traffic pool."
+            )
+        subject, body = compose_message(
+            severity=SEVERITY_WARNING,
+            what=what,
+            why=why,
+            next_step=next_step,
+            context={
+                "Region": CURRENT_REGION,
+                "Mode": "active-active",
+                "Consecutive failures": f"{new_count} of {CONSECUTIVE_FAILURES_THRESHOLD}",
+                "Decision": health.get("decision_reason", "N/A"),
+            },
+            journey=[
+                f"[{'1' if is_first else '✓'}] First failure",
+                f"[{'→' if not is_first else ' '}] Sustained ({new_count}/{CONSECUTIVE_FAILURES_THRESHOLD})",
+                "[ ] Removed from traffic pool",
+            ],
+            source="failover-orchestrator",
+            region=CURRENT_REGION,
         )
+        send_warning_notification(subject, body, state, bypass_throttle=is_first)
         return {"statusCode": 200, "body": "Below threshold, monitoring"}
 
     # Threshold reached — check cooldown
@@ -1376,17 +1453,43 @@ def _handle_active_active(state: dict) -> dict:
         cooldown_window = timedelta(minutes=COOLDOWN_MINUTES)
         if now < last_ts + cooldown_window:
             remaining = (last_ts + cooldown_window - now).total_seconds()
+            remaining_min = remaining / 60
             logger.info(f"Cooldown active: {remaining:.0f}s remaining")
             publish_region_health_metric(CURRENT_REGION, True)
-            send_warning_notification(
-                subject=f"WARNING: {CURRENT_REGION} unhealthy but cooldown active",
-                message=(
-                    f"Health threshold reached but cooldown prevents marking unhealthy.\n"
-                    f"Cooldown remaining: {remaining:.0f}s\n"
-                    f"Reason: {health.get('decision_reason', 'N/A')}\n"
+            subject, body = compose_message(
+                severity=SEVERITY_WARNING,
+                what=(
+                    f"Region {CURRENT_REGION} (active-active) unhealthy but "
+                    f"removal blocked by cooldown ({remaining_min:.0f} min remaining)"
                 ),
-                state=state,
+                why=(
+                    f"{health.get('decision_reason', 'health check failed')}. "
+                    f"The {CONSECUTIVE_FAILURES_THRESHOLD}-failure threshold has "
+                    f"been reached, but a previous removal happened within the "
+                    f"{COOLDOWN_MINUTES}-minute cooldown so the orchestrator will "
+                    f"NOT remove {CURRENT_REGION} from the traffic pool right now."
+                ),
+                next_step=(
+                    f"Investigate {CURRENT_REGION} immediately — Route 53 is still "
+                    f"routing traffic here despite the unhealthy signal. If the "
+                    f"region cannot be restored before the cooldown expires (in "
+                    f"{remaining_min:.0f} min), it will be removed on the next cycle."
+                ),
+                context={
+                    "Region": CURRENT_REGION,
+                    "Mode": "active-active",
+                    "Cooldown remaining": f"{remaining_min:.0f} min",
+                    "Decision": health.get("decision_reason", "N/A"),
+                },
+                journey=[
+                    "[✓] First failure",
+                    f"[✓] Sustained ({CONSECUTIVE_FAILURES_THRESHOLD}/{CONSECUTIVE_FAILURES_THRESHOLD})",
+                    "[⏸] Cooldown — removal deferred",
+                ],
+                source="failover-orchestrator",
+                region=CURRENT_REGION,
             )
+            send_warning_notification(subject, body, state)
             return {"statusCode": 200, "body": "Cooldown active"}
     except (ValueError, TypeError):
         pass  # No valid last timestamp, proceed
@@ -1417,18 +1520,47 @@ def _handle_active_active(state: dict) -> dict:
         },
     )
 
-    send_notification(
-        subject=f"CRITICAL: {CURRENT_REGION} removed from traffic pool",
-        message=(
-            f"Region {CURRENT_REGION} has been marked unhealthy.\n"
-            f"Route 53 will stop routing traffic to this region.\n\n"
-            f"Reason: {health.get('decision_reason', 'N/A')}\n"
-            f"Consecutive failures: {new_count}\n"
-            f"Time: {now.isoformat()}\n\n"
-            f"The region will automatically rejoin the traffic pool when health is restored.\n"
-            f"No manual intervention required.\n"
-        ),
+    signals_brief = ", ".join(
+        f"{s['signal']}={'OK' if s.get('healthy') else 'FAIL'}"
+        for s in health.get("signals", [])
+        if not s.get("skipped")
     )
+    ctx = {
+        "Region": CURRENT_REGION,
+        "Mode": "active-active",
+        "Consecutive failures": str(new_count),
+        "Decision": health.get("decision_reason", "N/A"),
+    }
+    if signals_brief:
+        ctx["Health signals"] = signals_brief
+    subject, body = compose_message(
+        severity=SEVERITY_CRITICAL,
+        what=f"Region {CURRENT_REGION} removed from traffic pool (active-active)",
+        why=(
+            f"{health.get('decision_reason', 'health check failed')}. "
+            f"After {new_count} consecutive failures, the orchestrator marked "
+            f"{CURRENT_REGION} unhealthy. Route 53 will stop routing traffic here. "
+            f"Unlike active/passive failover, no latch is engaged: as soon as "
+            f"{CURRENT_REGION} reports healthy again, it will rejoin the pool "
+            f"automatically (no failback step needed)."
+        ),
+        next_step=(
+            f"Investigate the root cause in {CURRENT_REGION}. The region will "
+            f"auto-recover and rejoin the traffic pool on the next healthy cycle "
+            f"— no manual failback required. If you don't expect quick recovery, "
+            f"verify the *other* region is healthy (otherwise you have no traffic-"
+            f"serving region)."
+        ),
+        context=ctx,
+        journey=[
+            "[✓] Threshold reached",
+            "[✓] Region removed from traffic pool",
+            "[ ] Auto-rejoin when health restored",
+        ],
+        source="failover-orchestrator",
+        region=CURRENT_REGION,
+    )
+    send_notification(subject, body)
 
     return {"statusCode": 200, "body": "Region marked unhealthy, removed from pool"}
 
@@ -1514,14 +1646,19 @@ def detect_data_tier_config() -> dict:
     (redis ∈ {absent, manual, auto}) cover all supported deployments
     from app-only stacks (C1) to fully automated dual-tier (C9).
 
-    Read at invocation time — do not cache; the portal can flip these
-    env vars between cycles. Call after _reload_dynamic_config().
+    Reads os.environ directly (not module globals) so portal env-var
+    flips and per-test patch.dict overrides take effect immediately
+    without depending on _reload_dynamic_config() ordering.
     """
+    aurora_id = os.environ.get("AURORA_CLUSTER_ID", "")
+    redis_id = os.environ.get("ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID", "")
+    aurora_auto = os.environ.get("AURORA_AUTO_PROMOTE", "false").lower() == "true"
+    redis_auto = os.environ.get("ELASTICACHE_AUTO_PROMOTE", "false").lower() == "true"
     return {
-        "aurora_present": bool(AURORA_CLUSTER_ID),
-        "aurora_auto":    bool(AURORA_CLUSTER_ID) and AURORA_AUTO_PROMOTE,
-        "redis_present":  bool(ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID),
-        "redis_auto":     bool(ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID) and ELASTICACHE_AUTO_PROMOTE,
+        "aurora_present": bool(aurora_id),
+        "aurora_auto":    bool(aurora_id) and aurora_auto,
+        "redis_present":  bool(redis_id),
+        "redis_auto":     bool(redis_id) and redis_auto,
     }
 
 
@@ -1799,41 +1936,91 @@ def _execute_manual_failover() -> dict:
             else:
                 manual_parts.append(build_elasticache_promotion_commands(target_region))
 
+        cfg = detect_data_tier_config()
+        ctx = {
+            "From region": active_region,
+            "To region": target_region,
+            "Trigger": "operator (manual execute_failover invoke)",
+        }
+        journey_lines = ["[✓] Operator invoked manual failover", "[✓] DNS moved"]
+        if cfg["aurora_present"]:
+            ctx["Aurora cluster"] = AURORA_CLUSTER_ID or "(local cluster)"
+            ctx["Aurora action"] = (
+                f"{aurora_result['method']} (auto, in progress)" if aurora_auto_done
+                else "MANUAL — see commands below"
+            )
+            journey_lines.append("[→] Aurora promoting" if aurora_auto_done
+                                  else "[→] Aurora — operator action required")
+        if cfg["redis_present"]:
+            ctx["ElastiCache action"] = (
+                "failover (auto, in progress)" if elasticache_auto_done
+                else "MANUAL — see commands below"
+            )
+            journey_lines.append("[→] Redis promoting" if elasticache_auto_done
+                                  else "[→] Redis — operator action required")
+
         if auto_parts and not manual_parts:
             # Everything auto-promoted
-            send_notification(
-                subject=f"FAILOVER EXECUTED: DNS moved to {target_region} - data tier promotion initiated",
-                message=(
-                    f"Manual failover executed by operator.\n\n"
-                    f"From: {active_region}\n"
-                    f"To: {target_region}\n"
-                    f"Time: {now.isoformat()}\n\n"
-                    f"DNS has been moved. Route 53 is now routing traffic to {target_region}.\n\n"
-                    + "\n".join(auto_parts) + "\n\n"
-                    f"Latch is ENGAGED. {active_region} will remain marked unhealthy."
-                ),
+            next_step = (
+                f"No immediate action — {' and '.join(auto_parts).lower()} The "
+                f"orchestrator will detect each tier's promotion and notify you "
+                f"when complete. The latch is ENGAGED — {active_region} stays "
+                f"marked unhealthy until you run failback manually."
             )
+            subject, body = compose_message(
+                severity=SEVERITY_CRITICAL,
+                what=f"Manual failover executed — DNS moved to {target_region}",
+                why=(
+                    f"Operator invoked the orchestrator with execute_failover=true "
+                    f"to move traffic from {active_region} to {target_region}. "
+                    f"All configured data tiers are auto-promoting in the "
+                    f"background."
+                ),
+                next_step=next_step,
+                context=ctx,
+                journey=journey_lines,
+                source="failover-orchestrator",
+                region=CURRENT_REGION,
+            )
+            send_notification(subject, body)
         else:
             # Some or all require manual action
-            subject_action = "PROMOTE DATA TIER NOW" if manual_parts else "promotion initiated"
-            send_notification(
-                subject=f"FAILOVER EXECUTED: DNS moved to {target_region} - {subject_action}",
-                message=(
-                    f"Manual failover executed by operator.\n\n"
-                    f"From: {active_region}\n"
-                    f"To: {target_region}\n"
-                    f"Time: {now.isoformat()}\n\n"
-                    f"DNS has been moved. Route 53 is now routing traffic to {target_region}.\n\n"
-                    + (("\n".join(auto_parts) + "\n\n") if auto_parts else "")
-                    + "ACTION REQUIRED: Manual promotion needed.\n"
-                    f"Your app in {target_region} CANNOT WRITE until promotion completes.\n\n"
-                    + "\n".join(manual_parts) + "\n\n"
-                    f"Latch is ENGAGED. {active_region} will remain marked unhealthy.\n"
-                    f"You will receive reminders every "
-                    f"{AURORA_PROMOTION_REMINDER_INTERVAL_MINUTES} minutes until "
-                    f"promotion is detected automatically."
-                ),
+            next_step_parts = []
+            if auto_parts:
+                next_step_parts.append(
+                    f"In flight automatically: {', '.join(auto_parts).lower()}."
+                )
+            next_step_parts.append(
+                f"**Operator action required.** App in {target_region} CANNOT "
+                f"WRITE to the data tier until promotion completes. Run the "
+                f"command(s) below."
             )
+            for i, m in enumerate(manual_parts, 1):
+                label = "Promote Aurora" if i == 1 and cfg["aurora_present"] and not aurora_auto_done \
+                        else "Promote ElastiCache"
+                next_step_parts.append(f"\n--- {label} ---\n{m}")
+            next_step_parts.append(
+                f"\nReminders fire every {AURORA_PROMOTION_REMINDER_INTERVAL_MINUTES} "
+                f"min until promotion is detected. Latch is ENGAGED — "
+                f"{active_region} stays unhealthy until you run failback."
+            )
+            subject, body = compose_message(
+                severity=SEVERITY_CRITICAL,
+                what=f"Manual failover executed — promote data tier in {target_region} now",
+                why=(
+                    f"Operator invoked the orchestrator with execute_failover=true. "
+                    f"DNS has moved to {target_region}, but at least one data tier "
+                    f"is configured for manual promotion (or its auto-promote "
+                    f"failed), so the operator must run promotion commands "
+                    f"before {target_region} can serve writes."
+                ),
+                next_step="\n".join(next_step_parts),
+                context=ctx,
+                journey=journey_lines,
+                source="failover-orchestrator",
+                region=CURRENT_REGION,
+            )
+            send_notification(subject, body)
 
         return {
             "statusCode": 200,
@@ -1848,14 +2035,35 @@ def _execute_manual_failover() -> dict:
             "aurora_promotion_pending": False,
             "redis_promotion_pending": False,
         })
-        send_notification(
-            subject=f"MANUAL FAILOVER FAILED: {active_region} -> {target_region}",
-            message=(
-                f"Manual failover FAILED.\n"
-                f"Error: {str(e)}\n"
-                f"Manual intervention required."
+        subject, body = compose_message(
+            severity=SEVERITY_CRITICAL,
+            what=f"Manual failover FAILED — {active_region} → {target_region} did not complete",
+            why=(
+                f"Operator invoked the orchestrator with execute_failover=true but "
+                f"the failover threw {type(e).__name__} during execution. State "
+                f"has been reverted to {expected_state}. Error: {e}"
             ),
+            next_step=(
+                "Inspect the Lambda's CloudWatch logs for the full traceback. "
+                "Common causes: state backend write failure, Aurora switchover-"
+                "global-cluster API error, or CW PutMetricData failure. Once the "
+                "root cause is fixed, re-invoke with execute_failover=true."
+            ),
+            context={
+                "From region": active_region,
+                "To region": target_region,
+                "Error type": type(e).__name__,
+                "Error detail": str(e)[:200],
+                "State after revert": expected_state,
+            },
+            journey=[
+                "[✓] Operator invoked manual failover",
+                "[✗] Execution FAILED — state reverted",
+            ],
+            source="failover-orchestrator",
+            region=CURRENT_REGION,
         )
+        send_notification(subject, body)
         raise
 
 
@@ -1943,17 +2151,49 @@ def _handle_aurora_promotion_reminder(state: dict) -> dict:
         )
         update_failover_state({"aurora_promotion_pending": False})
 
-        send_notification(
-            subject=f"Aurora promotion confirmed - {active_region} is writer",
-            message=(
-                f"The Aurora Global Database has been promoted.\n\n"
-                f"Region {active_region} is now the writer.\n"
-                f"aurora_promotion_pending has been automatically cleared.\n"
-                f"The orchestrator will transition to steady state on the next cycle.\n\n"
-                f"Time: {now.isoformat()}\n"
-                f"Minutes since failover: {int(minutes_since_failover)}"
+        cfg = detect_data_tier_config()
+        redis_pending = bool(state.get("redis_promotion_pending"))
+        # Journey: Aurora is done; Redis step shown only when Redis is configured.
+        if cfg["redis_present"]:
+            journey = [
+                "[✓] Aurora promoted",
+                f"[{'→' if redis_pending else '✓'}] Redis promoting",
+                "[ ] Latch released",
+            ]
+            next_step = (
+                "No action — Aurora is ready. The orchestrator is now waiting for "
+                "ElastiCache promotion. You'll receive another email when Redis "
+                "completes (and a CRITICAL alert if it gets stuck)."
+                if redis_pending else
+                "No action — both data tiers are promoted. The orchestrator will "
+                "transition to SECONDARY_ACTIVE on the next cycle."
+            )
+        else:
+            journey = ["[✓] Aurora promoted", "[ ] Latch released"]
+            next_step = (
+                "No action — Aurora is ready. The orchestrator will transition to "
+                "SECONDARY_ACTIVE on the next cycle and the failover will be complete."
+            )
+
+        subject, body = compose_message(
+            severity=SEVERITY_INFO,
+            what=f"Aurora is now writer in {active_region}",
+            why=(
+                f"The Aurora Global Database promotion to {active_region} completed "
+                f"after {int(minutes_since_failover)} minute(s). Your app can now "
+                f"write to the database from this region."
             ),
+            next_step=next_step,
+            context={
+                "Active region": active_region,
+                "Aurora cluster": AURORA_CLUSTER_ID or "(not configured)",
+                "Promotion took": f"~{int(minutes_since_failover)} min from failover",
+            },
+            journey=journey,
+            source="failover-orchestrator",
+            region=CURRENT_REGION,
         )
+        send_notification(subject, body)
 
         publish_region_health_metric(CURRENT_REGION, True)
         return {"statusCode": 200, "body": "Aurora promotion detected and confirmed"}
@@ -1962,17 +2202,42 @@ def _handle_aurora_promotion_reminder(state: dict) -> dict:
     # Aurora not yet promoted - send periodic reminders
     # -----------------------------------------------------------------
     if int(minutes_since_failover) % AURORA_PROMOTION_REMINDER_INTERVAL_MINUTES == 0:
-        failed_region = PRIMARY_REGION if active_region == SECONDARY_REGION else SECONDARY_REGION
-
-        send_notification(
-            subject=f"REMINDER: Aurora promotion still pending ({int(minutes_since_failover)}m)",
-            message=(
-                f"DNS failover to {active_region} occurred {int(minutes_since_failover)} "
-                f"minutes ago but Aurora has NOT been promoted yet.\n\n"
-                f"Your app in {active_region} CANNOT WRITE to the database.\n\n"
-                f"{build_aurora_promotion_commands(active_region, 'app_failure')}"
-            ),
+        elapsed = int(minutes_since_failover)
+        cmds = build_aurora_promotion_commands(active_region, "app_failure")
+        next_step = (
+            f"Promote Aurora to {active_region} now using the commands below. "
+            f"Until you do, every write attempt against the database will fail. "
+            f"The orchestrator polls every minute and will detect promotion "
+            f"automatically — you'll receive a confirmation email and this "
+            f"reminder will stop firing.\n\n{cmds}"
         )
+        subject, body = compose_message(
+            severity=SEVERITY_CRITICAL,
+            what=f"Aurora promotion still pending after {elapsed} min — operator action required",
+            why=(
+                f"DNS failover to {active_region} occurred {elapsed} minutes ago "
+                f"but the Aurora Global Database has not been promoted to "
+                f"{active_region} yet. Until promotion completes, the app in "
+                f"{active_region} CANNOT WRITE to the database. This reminder "
+                f"will fire every {AURORA_PROMOTION_REMINDER_INTERVAL_MINUTES} "
+                f"minutes until promotion is detected."
+            ),
+            next_step=next_step,
+            context={
+                "Active region": active_region,
+                "Aurora cluster": AURORA_CLUSTER_ID or "(local cluster)",
+                "Time since failover": f"{elapsed} min",
+                "Reminder interval": f"every {AURORA_PROMOTION_REMINDER_INTERVAL_MINUTES} min",
+            },
+            journey=[
+                "[✓] Failover (DNS moved)",
+                "[→] Aurora — operator action required",
+                "[ ] Latch released (after failback)",
+            ],
+            source="failover-orchestrator",
+            region=CURRENT_REGION,
+        )
+        send_notification(subject, body)
 
     # Keep publishing ourselves as healthy for Route 53.
     # The failed region's metric is handled by the CW alarm's TreatMissingData=breaching
@@ -2009,29 +2274,89 @@ def _handle_elasticache_promotion_reminder(state: dict) -> dict:
         )
         update_failover_state({"redis_promotion_pending": False})
 
-        send_notification(
-            subject=f"ElastiCache promotion confirmed - {active_region} is primary",
-            message=(
-                f"The ElastiCache Global Datastore has been promoted.\n\n"
-                f"Region {active_region} is now the primary.\n"
-                f"redis_promotion_pending has been automatically cleared.\n\n"
-                f"Time: {now.isoformat()}\n"
-                f"Minutes since failover: {int(minutes_since_failover)}"
+        cfg = detect_data_tier_config()
+        aurora_pending = bool(state.get("aurora_promotion_pending"))
+        # Journey: Redis is done; show Aurora step only if Aurora is configured.
+        if cfg["aurora_present"]:
+            journey = [
+                f"[{'→' if aurora_pending else '✓'}] Aurora promoting",
+                "[✓] Redis promoted",
+                "[ ] Latch released",
+            ]
+            next_step = (
+                "No action — Redis is ready. The orchestrator is now waiting for "
+                "Aurora promotion. You'll receive another email when Aurora "
+                "completes (and a CRITICAL alert if it gets stuck)."
+                if aurora_pending else
+                "No action — both data tiers are promoted. The orchestrator will "
+                "transition to SECONDARY_ACTIVE on the next cycle."
+            )
+        else:
+            journey = ["[✓] Redis promoted", "[ ] Latch released"]
+            next_step = (
+                "No action — Redis is ready. The orchestrator will transition to "
+                "SECONDARY_ACTIVE on the next cycle and the failover will be complete."
+            )
+
+        subject, body = compose_message(
+            severity=SEVERITY_INFO,
+            what=f"ElastiCache is now primary in {active_region}",
+            why=(
+                f"The ElastiCache Global Datastore promotion to {active_region} "
+                f"completed after {int(minutes_since_failover)} minute(s). Cache "
+                f"writes from this region are now served locally."
             ),
+            next_step=next_step,
+            context={
+                "Active region": active_region,
+                "ElastiCache RG": ELASTICACHE_REPLICATION_GROUP_ID or "(not configured)",
+                "Promotion took": f"~{int(minutes_since_failover)} min from failover",
+            },
+            journey=journey,
+            source="failover-orchestrator",
+            region=CURRENT_REGION,
         )
+        send_notification(subject, body)
         return {"statusCode": 200, "body": "ElastiCache promotion detected and confirmed"}
 
     # ElastiCache not yet promoted - send periodic reminders
     if int(minutes_since_failover) % AURORA_PROMOTION_REMINDER_INTERVAL_MINUTES == 0:
-        send_notification(
-            subject=f"REMINDER: ElastiCache promotion still pending ({int(minutes_since_failover)}m)",
-            message=(
-                f"DNS failover to {active_region} occurred {int(minutes_since_failover)} "
-                f"minutes ago but ElastiCache has NOT been promoted yet.\n\n"
-                f"Your app in {active_region} CANNOT WRITE to Redis.\n\n"
-                f"{build_elasticache_promotion_commands(active_region)}"
-            ),
+        elapsed = int(minutes_since_failover)
+        cmds = build_elasticache_promotion_commands(active_region)
+        next_step = (
+            f"Promote ElastiCache to {active_region} now using the commands below. "
+            f"Until you do, every cache operation against the current writer will "
+            f"go cross-region (or fail). The orchestrator polls every minute and "
+            f"will detect promotion automatically — you'll receive a confirmation "
+            f"email and this reminder will stop firing.\n\n{cmds}"
         )
+        subject, body = compose_message(
+            severity=SEVERITY_CRITICAL,
+            what=f"ElastiCache promotion still pending after {elapsed} min — operator action required",
+            why=(
+                f"DNS failover to {active_region} occurred {elapsed} minutes ago "
+                f"but the ElastiCache Global Datastore has not been promoted to "
+                f"{active_region} yet. Until promotion completes, the app in "
+                f"{active_region} CANNOT WRITE to Redis locally. This reminder "
+                f"will fire every {AURORA_PROMOTION_REMINDER_INTERVAL_MINUTES} "
+                f"minutes until promotion is detected."
+            ),
+            next_step=next_step,
+            context={
+                "Active region": active_region,
+                "ElastiCache RG": ELASTICACHE_REPLICATION_GROUP_ID or "(local RG)",
+                "Time since failover": f"{elapsed} min",
+                "Reminder interval": f"every {AURORA_PROMOTION_REMINDER_INTERVAL_MINUTES} min",
+            },
+            journey=[
+                "[✓] Failover (DNS moved)",
+                "[→] Redis — operator action required",
+                "[ ] Latch released (after failback)",
+            ],
+            source="failover-orchestrator",
+            region=CURRENT_REGION,
+        )
+        send_notification(subject, body)
 
     return {"statusCode": 200, "body": "Waiting for ElastiCache promotion"}
 
@@ -2356,24 +2681,44 @@ def _handle_passive_region(state: dict, active_region: str) -> dict:
                 aurora_result = _auto_promote_aurora(target_region, "region_failure")
                 if aurora_result["success"]:
                     aurora_handled = True
-                    send_notification(
-                        subject=f"REGION FAILURE: DNS moved to {target_region} - Aurora {aurora_result['method']} initiated (AI-advised)",
-                        message=(
-                            f"REGION-LEVEL FAILURE DETECTED.\n\n"
-                            f"The active region {active_region} has stopped responding.\n"
-                            f"DNS has been moved to {target_region}.\n\n"
-                            f"Aurora {aurora_result['method']} has been initiated AUTOMATICALLY "
-                            f"(AI advisor confidence: {advisor_rec.get('confidence')}%).\n"
-                            f"Monitor progress with:\n\n"
-                            f"  aws rds describe-db-clusters \\\n"
-                            f"    --db-cluster-identifier {AURORA_CLUSTER_ID} \\\n"
-                            f"    --query 'DBClusters[0].{{Status:Status,ReplicationSource:ReplicationSourceIdentifier}}' \\\n"
-                            f"    --region {target_region}\n\n"
-                            f"Time: {now.isoformat()}\n"
-                            f"Detection: {staleness['reason']}"
-                            f"{advisor_appendix}"
+                    confidence = advisor_rec.get("confidence")
+                    subject, body = compose_message(
+                        severity=SEVERITY_CRITICAL,
+                        what=f"Region failure — {active_region} unreachable, DNS moved to {target_region}",
+                        why=(
+                            f"The active region {active_region} stopped responding "
+                            f"({staleness['reason']}). The orchestrator's AI advisor "
+                            f"recommended an automatic Aurora {aurora_result['method']} "
+                            f"with {confidence}% confidence and executed it without "
+                            f"operator intervention."
                         ),
+                        next_step=(
+                            f"No immediate action. Aurora {aurora_result['method']} is "
+                            f"in flight. Monitor progress with:\n"
+                            f"  aws rds describe-db-clusters --db-cluster-identifier "
+                            f"{AURORA_CLUSTER_ID or '<cluster-id>'} "
+                            f"--query 'DBClusters[0].{{Status:Status,ReplicationSource:ReplicationSourceIdentifier}}' "
+                            f"--region {target_region}\n\n"
+                            f"Latch is ENGAGED. {active_region} stays unhealthy until "
+                            f"failback. Investigate why {active_region} went unresponsive "
+                            f"once recovery is complete."
+                        ),
+                        context={
+                            "Failed region": active_region,
+                            "Target region": target_region,
+                            "Detection": staleness["reason"],
+                            "Aurora action": f"{aurora_result['method']} (auto, AI-advised)",
+                            "AI confidence": f"{confidence}%",
+                        },
+                        journey=[
+                            "[✗] Active region unresponsive",
+                            "[✓] Passive detected via staleness check",
+                            "[→] Failover IN PROGRESS (AI-advised)",
+                        ],
+                        source="failover-orchestrator",
+                        region=CURRENT_REGION,
                     )
+                    send_notification(subject, body + (advisor_appendix or ""))
                 else:
                     logger.warning(
                         f"AI-advised Aurora promotion failed: {aurora_result['error']}. "
@@ -2383,23 +2728,42 @@ def _handle_passive_region(state: dict, active_region: str) -> dict:
                 aurora_result = _auto_promote_aurora(target_region, "region_failure")
                 if aurora_result["success"]:
                     aurora_handled = True
-                    send_notification(
-                        subject=f"REGION FAILURE: DNS moved to {target_region} - Aurora {aurora_result['method']} initiated",
-                        message=(
-                            f"REGION-LEVEL FAILURE DETECTED.\n\n"
-                            f"The active region {active_region} has stopped responding.\n"
-                            f"DNS has been moved to {target_region}.\n\n"
-                            f"Aurora {aurora_result['method']} has been initiated AUTOMATICALLY.\n"
-                            f"Monitor progress with:\n\n"
-                            f"  aws rds describe-db-clusters \\\n"
-                            f"    --db-cluster-identifier {AURORA_CLUSTER_ID} \\\n"
-                            f"    --query 'DBClusters[0].{{Status:Status,ReplicationSource:ReplicationSourceIdentifier}}' \\\n"
-                            f"    --region {target_region}\n\n"
-                            f"Time: {now.isoformat()}\n"
-                            f"Detection: {staleness['reason']}"
-                            f"{advisor_appendix}"
+                    subject, body = compose_message(
+                        severity=SEVERITY_CRITICAL,
+                        what=f"Region failure — {active_region} unreachable, DNS moved to {target_region}",
+                        why=(
+                            f"The active region {active_region} stopped responding "
+                            f"({staleness['reason']}). DNS has been moved to "
+                            f"{target_region} and Aurora {aurora_result['method']} "
+                            f"was triggered automatically per AURORA_AUTO_PROMOTE=true."
                         ),
+                        next_step=(
+                            f"No immediate action. Aurora {aurora_result['method']} is "
+                            f"in flight. Monitor with:\n"
+                            f"  aws rds describe-db-clusters --db-cluster-identifier "
+                            f"{AURORA_CLUSTER_ID or '<cluster-id>'} "
+                            f"--query 'DBClusters[0].{{Status:Status,ReplicationSource:ReplicationSourceIdentifier}}' "
+                            f"--region {target_region}\n\n"
+                            f"Latch is ENGAGED. Investigate why {active_region} went "
+                            f"unresponsive — region-level outages are unusual and "
+                            f"warrant deeper investigation than app-level failures."
+                        ),
+                        context={
+                            "Failed region": active_region,
+                            "Target region": target_region,
+                            "Detection": staleness["reason"],
+                            "Aurora action": f"{aurora_result['method']} (auto, in progress)",
+                        },
+                        journey=[
+                            "[✗] Active region unresponsive",
+                            "[✓] Passive detected via staleness check",
+                            "[→] Failover IN PROGRESS",
+                            "[→] Aurora promoting",
+                        ],
+                        source="failover-orchestrator",
+                        region=CURRENT_REGION,
                     )
+                    send_notification(subject, body + (advisor_appendix or ""))
                 else:
                     logger.warning(
                         f"Auto Aurora promotion failed: {aurora_result['error']}. "
@@ -2414,41 +2778,102 @@ def _handle_passive_region(state: dict, active_region: str) -> dict:
 
             if not aurora_handled:
                 # Manual Aurora promotion (default, or auto-promote failed)
-                aurora_commands = build_aurora_promotion_commands(
-                    target_region, "region_failure"
+                cfg = detect_data_tier_config()
+                aurora_commands = (
+                    build_aurora_promotion_commands(target_region, "region_failure")
+                    if cfg["aurora_present"] else ""
                 )
-                elasticache_commands = build_elasticache_promotion_commands(target_region)
+                elasticache_commands = (
+                    build_elasticache_promotion_commands(target_region)
+                    if cfg["redis_present"] else ""
+                )
+                next_step_parts = [
+                    f"DNS has moved to {target_region} but the data tier needs "
+                    f"manual promotion. App in {target_region} CANNOT WRITE until "
+                    f"you complete the steps below."
+                ]
+                if aurora_commands:
+                    next_step_parts.append("\n--- Step 1: Promote Aurora ---\n" + aurora_commands)
+                if elasticache_commands:
+                    n = 2 if aurora_commands else 1
+                    next_step_parts.append(f"\n--- Step {n}: Promote ElastiCache ---\n" + elasticache_commands)
+                next_step_parts.append(
+                    f"\nReminders fire every {AURORA_PROMOTION_REMINDER_INTERVAL_MINUTES} "
+                    f"min. Latch is ENGAGED. **Investigate why {active_region} went "
+                    f"unresponsive** — region-level outages are unusual."
+                )
 
-                send_notification(
-                    subject=f"REGION FAILURE: DNS moved to {target_region} - PROMOTE DATA TIER NOW",
-                    message=(
-                        f"REGION-LEVEL FAILURE DETECTED.\n\n"
-                        f"The active region {active_region} has stopped responding.\n"
-                        f"DNS has been moved to {target_region}.\n\n"
-                        f"ACTION REQUIRED: Data tier must be promoted MANUALLY.\n"
-                        f"Your app in {target_region} CANNOT WRITE until promotion completes.\n\n"
-                        f"Time: {now.isoformat()}\n"
-                        f"Detection: {staleness['reason']}\n\n"
-                        f"{aurora_commands}\n"
-                        f"{elasticache_commands}\n\n"
-                        f"You will receive reminders every "
-                        f"{AURORA_PROMOTION_REMINDER_INTERVAL_MINUTES} minutes until "
-                        f"promotion is detected automatically."
-                        f"{advisor_appendix}"
+                journey_lines = [
+                    "[✗] Active region unresponsive",
+                    "[✓] Passive detected via staleness check",
+                    "[✓] Failover (DNS moved)",
+                ]
+                if cfg["aurora_present"]:
+                    journey_lines.append("[→] Aurora — operator action required")
+                if cfg["redis_present"]:
+                    journey_lines.append("[→] Redis — operator action required")
+
+                ctx = {
+                    "Failed region": active_region,
+                    "Target region": target_region,
+                    "Detection": staleness["reason"],
+                }
+                if cfg["aurora_present"]:
+                    ctx["Aurora action"] = "MANUAL — see commands below"
+                if cfg["redis_present"]:
+                    ctx["ElastiCache action"] = "MANUAL — see commands below"
+
+                subject, body = compose_message(
+                    severity=SEVERITY_CRITICAL,
+                    what=f"Region failure — {active_region} down, promote data tier in {target_region}",
+                    why=(
+                        f"The active region {active_region} stopped responding "
+                        f"({staleness['reason']}). DNS was moved to {target_region}, "
+                        f"but data-tier auto-promote is disabled (or it failed) so "
+                        f"the operator must run promotion commands now."
                     ),
+                    next_step="\n".join(next_step_parts),
+                    context=ctx,
+                    journey=journey_lines,
+                    source="failover-orchestrator",
+                    region=CURRENT_REGION,
                 )
+                send_notification(subject, body + (advisor_appendix or ""))
 
         except Exception as e:
             logger.error(f"Passive region failover handling FAILED: {e}")
-            send_notification(
-                subject=f"FAILOVER HANDLING FAILED in passive region",
-                message=(
-                    f"Region {active_region} appears down but failover handling "
-                    f"in {CURRENT_REGION} FAILED.\n\n"
-                    f"Error: {str(e)}\n\n"
-                    f"MANUAL INTERVENTION REQUIRED."
+            subject, body = compose_message(
+                severity=SEVERITY_CRITICAL,
+                what=f"Region failover handling FAILED in passive region {CURRENT_REGION}",
+                why=(
+                    f"The passive Lambda in {CURRENT_REGION} detected that "
+                    f"{active_region} was unresponsive and attempted to claim "
+                    f"failover, but the handler threw {type(e).__name__}: {e}"
                 ),
+                next_step=(
+                    f"**MANUAL INTERVENTION REQUIRED.** Inspect the passive "
+                    f"Lambda's CloudWatch logs in {CURRENT_REGION} for the full "
+                    f"traceback. Both regions may now be in inconsistent state — "
+                    f"verify Aurora writer location, ElastiCache primary, and "
+                    f"Route 53 failover record state before taking any action. "
+                    f"Likely causes: state backend write failure, IAM permission "
+                    f"issue, or cross-region API outage."
+                ),
+                context={
+                    "Failed region": active_region,
+                    "Passive region (this Lambda)": CURRENT_REGION,
+                    "Error type": type(e).__name__,
+                    "Error detail": str(e)[:200],
+                },
+                journey=[
+                    "[✗] Active region unresponsive",
+                    "[✓] Passive detected via staleness check",
+                    "[✗] Failover handling FAILED — manual recovery needed",
+                ],
+                source="failover-orchestrator",
+                region=CURRENT_REGION,
             )
+            send_notification(subject, body)
             raise
 
         # Failover claimed and handled successfully. Return immediately.
@@ -2482,17 +2907,49 @@ def _handle_passive_region(state: dict, active_region: str) -> dict:
 
     if not our_health["healthy"]:
         logger.warning(f"PASSIVE region {CURRENT_REGION} is NOT healthy!")
-        send_warning_notification(
-            subject=f"WARNING: Passive region {CURRENT_REGION} unhealthy",
-            message=(
-                f"The passive/standby region {CURRENT_REGION} is reporting unhealthy.\n"
-                f"If the active region ({active_region}) fails, failover will route traffic "
-                f"to an unhealthy region.\n\n"
-                f"Decision: {our_health.get('decision_reason', 'N/A')}\n"
-                f"Signals:\n{json.dumps(our_health['signals'], indent=2, default=str)}"
-            ),
-            state=state,
+        signals_brief = ", ".join(
+            f"{s['signal']}={'OK' if s.get('healthy') else 'FAIL'}"
+            for s in our_health.get("signals", [])
+            if not s.get("skipped")
         )
+        ctx = {
+            "Active region": active_region,
+            "Standby region (this Lambda)": CURRENT_REGION,
+            "Standby decision": our_health.get("decision_reason", "N/A"),
+        }
+        if signals_brief:
+            ctx["Standby signals"] = signals_brief
+        next_step = (
+            f"Investigate {CURRENT_REGION} now — even though traffic is still "
+            f"flowing to {active_region}, you have lost your failover safety net. "
+            f"If {active_region} fails right now, the orchestrator's dual-region "
+            f"circuit breaker will HALT failover (better to keep app down in one "
+            f"region than route to two unhealthy regions). Common causes: ECS "
+            f"deploy in progress in standby, ALB target group config issue, or "
+            f"the standby region's app was never wired to a healthcheck endpoint "
+            f"that returns 200 when warm."
+        )
+        subject, body = compose_message(
+            severity=SEVERITY_WARNING,
+            what=f"Standby region {CURRENT_REGION} is unhealthy — failover would be unsafe",
+            why=(
+                f"The standby region {CURRENT_REGION} is reporting unhealthy "
+                f"({our_health.get('decision_reason', 'health check failed')}). "
+                f"Traffic is still flowing normally to {active_region}, but the "
+                f"failover safety net is gone — if {active_region} fails before "
+                f"this is fixed, the orchestrator will refuse to fail over."
+            ),
+            next_step=next_step,
+            context=ctx,
+            journey=[
+                "[ ] Active region: serving (no failure detected)",
+                f"[⚠] Standby region {CURRENT_REGION}: UNHEALTHY",
+                "[⏸] Failover safety net DOWN until standby recovers",
+            ],
+            source="failover-orchestrator",
+            region=CURRENT_REGION,
+        )
+        send_warning_notification(subject, body, state)
 
     return {"statusCode": 200, "body": "Passive region check complete"}
 
@@ -2558,20 +3015,69 @@ def _handle_active_region(state: dict, active_region: str,
 
     if new_failure_count < CONSECUTIVE_FAILURES_THRESHOLD:
         publish_region_health_metric(CURRENT_REGION, True)
-        send_warning_notification(
-            subject=(
-                f"WARNING: {CURRENT_REGION} degraded "
-                f"({new_failure_count}/{CONSECUTIVE_FAILURES_THRESHOLD})"
-            ),
-            message=(
-                f"Region {CURRENT_REGION} health check failed.\n"
-                f"Consecutive failures: {new_failure_count}/{CONSECUTIVE_FAILURES_THRESHOLD}\n"
-                f"Decision: {health.get('decision_reason', 'N/A')}\n\n"
-                f"Failover triggers at {CONSECUTIVE_FAILURES_THRESHOLD} consecutive failures.\n\n"
-                f"Signals:\n{json.dumps(health['signals'], indent=2, default=str)}"
-            ),
-            state=state,
+        target_region = SECONDARY_REGION if active_region == PRIMARY_REGION else PRIMARY_REGION
+        is_first = new_failure_count == 1
+        if is_first:
+            what = (
+                f"Region {CURRENT_REGION} reported its FIRST health failure "
+                f"(1 of {CONSECUTIVE_FAILURES_THRESHOLD})"
+            )
+            why = (
+                f"{health.get('decision_reason', 'health check failed')}. "
+                f"This is the first failure of an incident — traffic is still flowing "
+                f"normally to {CURRENT_REGION}."
+            )
+            next_step = (
+                f"No action required. The orchestrator will keep evaluating health "
+                f"every 60s. You will receive a follow-up email if the failure "
+                f"persists. If {CONSECUTIVE_FAILURES_THRESHOLD} consecutive failures occur "
+                f"and the cooldown window has expired, traffic will move to "
+                f"{target_region} automatically."
+            )
+        else:
+            what = (
+                f"Region {CURRENT_REGION} health failure "
+                f"{new_failure_count} of {CONSECUTIVE_FAILURES_THRESHOLD} — "
+                f"sustained but below threshold"
+            )
+            why = (
+                f"{health.get('decision_reason', 'health check failed')}. "
+                f"This is failure {new_failure_count} in a row — one more and the "
+                f"orchestrator will move traffic to {target_region}."
+            )
+            next_step = (
+                f"Investigate the root cause in {CURRENT_REGION} now. If the next "
+                f"cycle (in ~60s) also fails, automatic failover will fire."
+            )
+        ctx = {
+            "Active region": CURRENT_REGION,
+            "Standby region": target_region,
+            "Consecutive failures": f"{new_failure_count} of {CONSECUTIVE_FAILURES_THRESHOLD}",
+            "Decision": health.get("decision_reason", "N/A"),
+        }
+        signals_brief = ", ".join(
+            f"{s['signal']}={'OK' if s.get('healthy') else 'FAIL'}"
+            for s in health.get("signals", [])
+            if not s.get("skipped")
         )
+        if signals_brief:
+            ctx["Health signals"] = signals_brief
+        journey = [
+            f"[{'1' if is_first else '✓'}] First failure",
+            f"[{'→' if not is_first else ' '}] Sustained ({new_failure_count}/{CONSECUTIVE_FAILURES_THRESHOLD})",
+            "[ ] Failover",
+        ]
+        subject, body = compose_message(
+            severity=SEVERITY_WARNING,
+            what=what,
+            why=why,
+            next_step=next_step,
+            context=ctx,
+            journey=journey,
+            source="failover-orchestrator",
+            region=CURRENT_REGION,
+        )
+        send_warning_notification(subject, body, state, bypass_throttle=is_first)
         return {"statusCode": 200, "body": "Below threshold, monitoring"}
 
     last_ts = datetime.fromisoformat(last_failover_ts.replace("Z", "+00:00"))
@@ -2581,18 +3087,53 @@ def _handle_active_region(state: dict, active_region: str,
         remaining = (cooldown_expiry - now).total_seconds() / 60
         logger.warning(f"Cooldown active, {remaining:.1f} min remaining. NOT failing over.")
         publish_region_health_metric(CURRENT_REGION, True)
-        send_warning_notification(
-            subject=f"CRITICAL: {CURRENT_REGION} unhealthy, cooldown active",
-            message=(
-                f"Region {CURRENT_REGION} has hit the failure threshold but cooldown "
-                f"prevents failover.\n"
-                f"Cooldown expires in {remaining:.1f} minutes.\n"
-                f"Manual intervention may be required.\n\n"
-                f"Decision: {health.get('decision_reason', 'N/A')}\n"
-                f"Signals:\n{json.dumps(health['signals'], indent=2, default=str)}"
-            ),
-            state=state,
+        target_region = SECONDARY_REGION if active_region == PRIMARY_REGION else PRIMARY_REGION
+        what = (
+            f"Region {CURRENT_REGION} unhealthy but failover blocked by cooldown "
+            f"({remaining:.0f} min remaining)"
         )
+        why = (
+            f"{health.get('decision_reason', 'health check failed')}. The "
+            f"{CONSECUTIVE_FAILURES_THRESHOLD}-failure threshold has been reached, "
+            f"but a previous failover happened within the {COOLDOWN_MINUTES}-minute "
+            f"cooldown window so the orchestrator will NOT fail over again right now."
+        )
+        next_step = (
+            f"Investigate {CURRENT_REGION} immediately — the app is degraded but "
+            f"traffic is still routed here. If the region cannot be restored before "
+            f"the cooldown expires (in {remaining:.0f} min), failover will fire on "
+            f"the next cycle. To override the cooldown, an operator can manually "
+            f"invoke the failover Lambda with {{\"execute_failover\": true}}."
+        )
+        ctx = {
+            "Active region": CURRENT_REGION,
+            "Standby region": target_region,
+            "Cooldown remaining": f"{remaining:.0f} min",
+            "Decision": health.get("decision_reason", "N/A"),
+        }
+        signals_brief = ", ".join(
+            f"{s['signal']}={'OK' if s.get('healthy') else 'FAIL'}"
+            for s in health.get("signals", [])
+            if not s.get("skipped")
+        )
+        if signals_brief:
+            ctx["Health signals"] = signals_brief
+        journey = [
+            "[✓] First failure",
+            f"[✓] Sustained ({CONSECUTIVE_FAILURES_THRESHOLD}/{CONSECUTIVE_FAILURES_THRESHOLD})",
+            "[⏸] Cooldown — failover deferred",
+        ]
+        subject, body = compose_message(
+            severity=SEVERITY_WARNING,
+            what=what,
+            why=why,
+            next_step=next_step,
+            context=ctx,
+            journey=journey,
+            source="failover-orchestrator",
+            region=CURRENT_REGION,
+        )
+        send_warning_notification(subject, body, state)
         return {"statusCode": 200, "body": "Cooldown active"}
 
     # =====================================================================
@@ -2622,19 +3163,49 @@ def _handle_active_region(state: dict, active_region: str,
             f"{'UNHEALTHY' if not peer_healthy else 'STALE'}. Halting failover."
         )
         publish_region_health_metric(CURRENT_REGION, True)  # Desperate attempt to keep DNS somewhere
-        send_notification(
-            subject=f"CRITICAL: Dual-Region Outage Detected ({APP_NAME})",
-            message=(
-                f"Region {CURRENT_REGION} has hit the failover threshold, BUT "
-                f"the target region {target_region} is ALSO unhealthy.\n\n"
-                f"Failover has been HALTED to prevent an infinite loop.\n"
-                f"Manual intervention is REQUIRED immediately.\n\n"
-                f"Current region health: UNHEALTHY\n"
-                f"Target region ({target_region}) health: "
-                f"{'UNHEALTHY' if not peer_healthy else 'STALE (Last heartbeat: ' + peer_ts_str + ')'}\n\n"
-                f"Decision: {health.get('decision_reason', 'N/A')}"
-            ),
+        peer_state = "UNHEALTHY" if not peer_healthy else f"STALE (last heartbeat: {peer_ts_str})"
+        next_step = (
+            "**APP IS DOWN.** This is NOT a failover candidate — moving DNS to "
+            f"{target_region} would route traffic to a region that also cannot "
+            "serve it. Steps:\n"
+            "  1. Page the on-call DBA and SRE immediately.\n"
+            f"  2. Investigate {CURRENT_REGION} (current decision below) AND "
+            f"{target_region} (peer is {('unhealthy' if not peer_healthy else 'stale heartbeat')}).\n"
+            "  3. Check Aurora, ElastiCache, and any cross-region dependencies — "
+            "a shared-fate failure (e.g., a global IAM/STS/Route53 issue) is the "
+            "most common cause of dual-region outage.\n"
+            "  4. Once at least one region is restored, the orchestrator will "
+            "auto-recover on the next 60s cycle. No operator action is needed "
+            "at this Lambda level."
         )
+        subject, body = compose_message(
+            severity=SEVERITY_CRITICAL,
+            what=f"Dual-region outage — failover HALTED, {APP_NAME or 'app'} is DOWN",
+            why=(
+                f"Region {CURRENT_REGION} hit the failover threshold ("
+                f"{health.get('decision_reason', 'health check failed')}), but "
+                f"the orchestrator's circuit breaker also detected that "
+                f"{target_region} is {peer_state.lower()}. Failing over would "
+                f"route traffic to an equally unhealthy region, so the "
+                f"orchestrator HALTED the failover to prevent infinite-loop flapping."
+            ),
+            next_step=next_step,
+            context={
+                f"{CURRENT_REGION} health": "UNHEALTHY (current region)",
+                f"{target_region} health": peer_state,
+                "Current decision": health.get("decision_reason", "N/A"),
+                "App name": APP_NAME or "(not set)",
+            },
+            journey=[
+                "[✓] Threshold reached",
+                "[✗] Circuit breaker — both regions unhealthy",
+                "[⏸] Failover HALTED",
+                "[ ] Auto-recovery on next cycle (when one region returns)",
+            ],
+            source="failover-orchestrator",
+            region=CURRENT_REGION,
+        )
+        send_notification(subject, body)
         return {"statusCode": 200, "body": "Dual-region outage, failover halted"}
 
     # In manual mode, notify but don't execute. The operator reviews
@@ -2649,26 +3220,55 @@ def _handle_active_region(state: dict, active_region: str,
         # Use throttled notification - in manual mode, the threshold stays
         # reached and this code runs every minute. The operator got the first
         # alert immediately, subsequent ones are throttled.
-        send_warning_notification(
-            subject=f"FAILOVER RECOMMENDED: {CURRENT_REGION} -> {target_region} (manual mode)",
-            message=(
-                f"The failover threshold has been reached but FAILOVER_MODE is set to 'manual'.\n"
-                f"DNS has NOT been moved. Traffic is still going to {CURRENT_REGION}.\n\n"
-                f"From: {active_region}\n"
-                f"To: {target_region}\n"
-                f"Decision: {health.get('decision_reason', 'N/A')}\n\n"
-                f"ACTION REQUIRED - Execute failover:\n\n"
-                f"  aws lambda invoke \\\n"
-                f"    --function-name {os.environ.get('AWS_LAMBDA_FUNCTION_NAME', 'failover-orchestrator')} \\\n"
-                f"    --payload '{{\"execute_failover\": true}}' \\\n"
-                f"    --region {CURRENT_REGION} \\\n"
-                f"    response.json\n\n"
-                f"This will move DNS to {target_region} and send Aurora promotion commands.\n\n"
-                f"To switch to automatic failover, change FAILOVER_MODE from 'manual' to 'auto'.\n\n"
-                f"Health Signals:\n{json.dumps(health['signals'], indent=2, default=str)}"
-            ),
-            state=state,
+        fn_name = os.environ.get("AWS_LAMBDA_FUNCTION_NAME", "failover-orchestrator")
+        signals_brief = ", ".join(
+            f"{s['signal']}={'OK' if s.get('healthy') else 'FAIL'}"
+            for s in health.get("signals", [])
+            if not s.get("skipped")
         )
+        ctx = {
+            "From region": active_region,
+            "To region": target_region,
+            "Decision": health.get("decision_reason", "N/A"),
+            "FAILOVER_MODE": "manual (auto-failover blocked by config)",
+        }
+        if signals_brief:
+            ctx["Health signals"] = signals_brief
+        next_step = (
+            "**Operator decision required.** Execute the failover with this command:\n\n"
+            f"  aws lambda invoke \\\n"
+            f"    --function-name {fn_name} \\\n"
+            f"    --payload '{{\"execute_failover\": true}}' \\\n"
+            f"    --region {CURRENT_REGION} \\\n"
+            f"    response.json\n\n"
+            f"This will move DNS to {target_region} and send Aurora promotion "
+            f"commands. To switch to automatic failover for future incidents, "
+            f"set the FAILOVER_MODE env var on this Lambda from 'manual' to 'auto'."
+        )
+        subject, body = compose_message(
+            severity=SEVERITY_WARNING,
+            what=f"Failover RECOMMENDED but blocked — FAILOVER_MODE is manual",
+            why=(
+                f"{health.get('decision_reason', 'health check failed')}. "
+                f"The failover threshold has been reached, but FAILOVER_MODE is "
+                f"set to 'manual' so the orchestrator did NOT move DNS. Traffic "
+                f"is still going to {CURRENT_REGION} (which is unhealthy). This "
+                f"alert will repeat every "
+                f"{WARNING_NOTIFICATION_COOLDOWN_MINUTES} min until the operator "
+                f"executes the failover or restores {CURRENT_REGION}."
+            ),
+            next_step=next_step,
+            context=ctx,
+            journey=[
+                "[✓] First failure",
+                "[✓] Sustained — threshold reached",
+                "[⏸] Awaiting operator (manual mode)",
+                "[ ] Failover",
+            ],
+            source="failover-orchestrator",
+            region=CURRENT_REGION,
+        )
+        send_warning_notification(subject, body, state)
 
         return {
             "statusCode": 200,
@@ -2736,27 +3336,57 @@ def _handle_active_region(state: dict, active_region: str,
             aurora_result = _auto_promote_aurora(target_region, "app_failure")
             if aurora_result["success"]:
                 aurora_handled = True
-                send_notification(
-                    subject=f"FAILOVER: DNS moved to {target_region} - Aurora {aurora_result['method']} initiated (AI-advised)",
-                    message=(
-                        f"Automated DNS failover triggered.\n\n"
-                        f"From: {active_region}\n"
-                        f"To: {target_region}\n"
-                        f"Time: {now.isoformat()}\n"
-                        f"Decision: {health.get('decision_reason', 'N/A')}\n\n"
-                        f"DNS has been moved. Route 53 is now routing traffic to {target_region}.\n\n"
-                        f"Aurora {aurora_result['method']} has been initiated AUTOMATICALLY "
-                        f"(AI advisor confidence: {advisor_rec.get('confidence')}%).\n"
-                        f"Monitor progress with:\n\n"
-                        f"  aws rds describe-db-clusters \\\n"
-                        f"    --db-cluster-identifier {AURORA_CLUSTER_ID} \\\n"
-                        f"    --query 'DBClusters[0].{{Status:Status,ReplicationSource:ReplicationSourceIdentifier}}' \\\n"
-                        f"    --region {target_region}\n\n"
-                        f"Latch is ENGAGED. {active_region} will remain marked unhealthy.\n\n"
-                        f"Signals:\n{json.dumps(health['signals'], indent=2, default=str)}"
-                        f"{ai_appendix}"
-                    ),
+                cfg = detect_data_tier_config()
+                confidence = advisor_rec.get("confidence")
+                journey_lines = ["[✓] Threshold reached", "[→] Failover IN PROGRESS"]
+                if cfg["aurora_present"]:
+                    journey_lines.append("[→] Aurora promoting (AI-advised)")
+                if cfg["redis_present"]:
+                    journey_lines.append("[→] Redis promoting" if cfg["redis_auto"]
+                                          else "[ ] Redis (manual — operator)")
+                ctx = {
+                    "From region": active_region,
+                    "To region": target_region,
+                    "Decision": health.get("decision_reason", "N/A"),
+                    "Aurora cluster": AURORA_CLUSTER_ID or "(not configured)",
+                    "Aurora action": f"{aurora_result['method']} (auto, AI-advised)",
+                    "AI confidence": f"{confidence}%",
+                }
+                signals_brief = ", ".join(
+                    f"{s['signal']}={'OK' if s.get('healthy') else 'FAIL'}"
+                    for s in health.get("signals", [])
+                    if not s.get("skipped")
                 )
+                if signals_brief:
+                    ctx["Health signals"] = signals_brief
+                next_step = (
+                    f"No immediate action. Aurora {aurora_result['method']} is "
+                    f"in flight (AI advisor recommended this method with "
+                    f"{confidence}% confidence). Monitor with:\n"
+                    f"  aws rds describe-db-clusters --db-cluster-identifier "
+                    f"{AURORA_CLUSTER_ID or '<cluster-id>'} "
+                    f"--query 'DBClusters[0].{{Status:Status,ReplicationSource:ReplicationSourceIdentifier}}' "
+                    f"--region {target_region}\n\n"
+                    f"Latch is ENGAGED. {active_region} stays unhealthy until "
+                    f"failback."
+                )
+                subject, body = compose_message(
+                    severity=SEVERITY_CRITICAL,
+                    what=f"Failover triggered (AI-advised) — {active_region} → {target_region}",
+                    why=(
+                        f"{health.get('decision_reason', 'health check failed')}. "
+                        f"Threshold reached and cooldown expired. The Aurora AI "
+                        f"advisor (mode=guided/autonomous) recommended a "
+                        f"{aurora_result['method']} with {confidence}% confidence "
+                        f"and the orchestrator executed it automatically."
+                    ),
+                    next_step=next_step + (ai_appendix or ""),
+                    context=ctx,
+                    journey=journey_lines,
+                    source="failover-orchestrator",
+                    region=CURRENT_REGION,
+                )
+                send_notification(subject, body)
             else:
                 logger.warning(
                     f"AI-advised Aurora promotion failed: {aurora_result['error']}. "
@@ -2767,26 +3397,60 @@ def _handle_active_region(state: dict, active_region: str,
             aurora_result = _auto_promote_aurora(target_region, "app_failure")
             if aurora_result["success"]:
                 aurora_handled = True
-                send_notification(
-                    subject=f"FAILOVER: DNS moved to {target_region} - Aurora {aurora_result['method']} initiated",
-                    message=(
-                        f"Automated DNS failover triggered.\n\n"
-                        f"From: {active_region}\n"
-                        f"To: {target_region}\n"
-                        f"Time: {now.isoformat()}\n"
-                        f"Decision: {health.get('decision_reason', 'N/A')}\n\n"
-                        f"DNS has been moved. Route 53 is now routing traffic to {target_region}.\n\n"
-                        f"Aurora {aurora_result['method']} has been initiated AUTOMATICALLY.\n"
-                        f"Monitor progress with:\n\n"
-                        f"  aws rds describe-db-clusters \\\n"
-                        f"    --db-cluster-identifier {AURORA_CLUSTER_ID} \\\n"
-                        f"    --query 'DBClusters[0].{{Status:Status,ReplicationSource:ReplicationSourceIdentifier}}' \\\n"
-                        f"    --region {target_region}\n\n"
-                        f"Latch is ENGAGED. {active_region} will remain marked unhealthy.\n\n"
-                        f"Signals:\n{json.dumps(health['signals'], indent=2, default=str)}"
-                        f"{ai_appendix}"
-                    ),
+                cfg = detect_data_tier_config()
+                # Journey: failover step is happening NOW; data-tier steps follow.
+                journey_lines = ["[✓] Threshold reached", "[→] Failover IN PROGRESS"]
+                if cfg["aurora_present"]:
+                    journey_lines.append("[→] Aurora promoting")
+                if cfg["redis_present"]:
+                    journey_lines.append("[ ] Redis promoting" if cfg["redis_auto"]
+                                          else "[ ] Redis (manual — operator)")
+                ctx = {
+                    "From region": active_region,
+                    "To region": target_region,
+                    "Decision": health.get("decision_reason", "N/A"),
+                    "Aurora cluster": AURORA_CLUSTER_ID or "(not configured)",
+                    "Aurora action": f"{aurora_result['method']} (auto, in progress)",
+                }
+                if cfg["redis_present"]:
+                    ctx["ElastiCache action"] = (
+                        "failover (auto, in progress)" if cfg["redis_auto"]
+                        else "MANUAL — see follow-up email"
+                    )
+                signals_brief = ", ".join(
+                    f"{s['signal']}={'OK' if s.get('healthy') else 'FAIL'}"
+                    for s in health.get("signals", [])
+                    if not s.get("skipped")
                 )
+                if signals_brief:
+                    ctx["Health signals"] = signals_brief
+                next_step = (
+                    f"No immediate action. Aurora {aurora_result['method']} is in "
+                    f"flight; you'll receive a confirmation email when it completes "
+                    f"(typically 1–5 min). The latch is ENGAGED — once {target_region} "
+                    f"is fully active, traffic will stay there until you run failback "
+                    f"manually. Monitor Aurora progress with:\n"
+                    f"  aws rds describe-db-clusters --db-cluster-identifier "
+                    f"{AURORA_CLUSTER_ID or '<cluster-id>'} "
+                    f"--query 'DBClusters[0].{{Status:Status,ReplicationSource:ReplicationSourceIdentifier}}' "
+                    f"--region {target_region}"
+                )
+                subject, body = compose_message(
+                    severity=SEVERITY_CRITICAL,
+                    what=f"Failover triggered — traffic moving from {active_region} to {target_region}",
+                    why=(
+                        f"{health.get('decision_reason', 'health check failed')}. "
+                        f"This was the third consecutive failure and the cooldown "
+                        f"window had expired, so the orchestrator triggered an "
+                        f"automatic DNS failover."
+                    ),
+                    next_step=next_step + (ai_appendix or ""),
+                    context=ctx,
+                    journey=journey_lines,
+                    source="failover-orchestrator",
+                    region=CURRENT_REGION,
+                )
+                send_notification(subject, body)
             else:
                 logger.warning(
                     f"Auto Aurora promotion failed: {aurora_result['error']}. "
@@ -2801,30 +3465,90 @@ def _handle_active_region(state: dict, active_region: str,
 
         if not aurora_handled:
             # Manual Aurora promotion (default, or auto-promote failed)
-            aurora_commands = build_aurora_promotion_commands(target_region, "app_failure")
-            elasticache_commands = build_elasticache_promotion_commands(target_region)
-
-            send_notification(
-                subject=f"FAILOVER: DNS moved to {target_region} - PROMOTE DATA TIER NOW",
-                message=(
-                    f"Automated DNS failover triggered.\n\n"
-                    f"From: {active_region}\n"
-                    f"To: {target_region}\n"
-                    f"Time: {now.isoformat()}\n"
-                    f"Decision: {health.get('decision_reason', 'N/A')}\n\n"
-                    f"DNS has been moved. Route 53 is now routing traffic to {target_region}.\n\n"
-                    f"ACTION REQUIRED: Data tier must be promoted MANUALLY.\n"
-                    f"Your app in {target_region} CANNOT WRITE until promotion completes.\n\n"
-                    f"{aurora_commands}\n"
-                    f"{elasticache_commands}\n\n"
-                    f"Latch is ENGAGED. {active_region} will remain marked unhealthy.\n"
-                    f"You will receive reminders every "
-                    f"{AURORA_PROMOTION_REMINDER_INTERVAL_MINUTES} minutes until "
-                    f"promotion is detected automatically.\n\n"
-                    f"Signals:\n{json.dumps(health['signals'], indent=2, default=str)}"
-                    f"{ai_appendix}"
-                ),
+            cfg = detect_data_tier_config()
+            aurora_commands = (
+                build_aurora_promotion_commands(target_region, "app_failure")
+                if cfg["aurora_present"] else ""
             )
+            elasticache_commands = (
+                build_elasticache_promotion_commands(target_region)
+                if cfg["redis_present"] else ""
+            )
+
+            # Journey reflects which manual steps the operator must do.
+            journey_lines = ["[✓] Threshold reached", "[✓] Failover (DNS moved)"]
+            if cfg["aurora_present"] and not cfg["aurora_auto"]:
+                journey_lines.append("[→] Aurora — operator action required")
+            elif cfg["aurora_present"]:
+                journey_lines.append("[→] Aurora — auto-promote attempted but failed")
+            if cfg["redis_present"] and not cfg["redis_auto"]:
+                journey_lines.append("[→] Redis — operator action required")
+            elif cfg["redis_present"]:
+                journey_lines.append("[→] Redis — auto-promote attempted but failed")
+            journey_lines.append("[ ] Latch released (after failback)")
+
+            ctx = {
+                "From region": active_region,
+                "To region": target_region,
+                "Decision": health.get("decision_reason", "N/A"),
+            }
+            if cfg["aurora_present"]:
+                ctx["Aurora cluster"] = AURORA_CLUSTER_ID or "(local cluster)"
+                ctx["Aurora action"] = (
+                    "MANUAL — promotion required (see commands below)"
+                    if not cfg["aurora_auto"]
+                    else "auto-promote FAILED — manual recovery required"
+                )
+            if cfg["redis_present"]:
+                ctx["ElastiCache RG"] = ELASTICACHE_REPLICATION_GROUP_ID or "(local RG)"
+                ctx["ElastiCache action"] = (
+                    "MANUAL — failover required (see commands below)"
+                    if not cfg["redis_auto"]
+                    else "auto-failover FAILED — manual recovery required"
+                )
+            signals_brief = ", ".join(
+                f"{s['signal']}={'OK' if s.get('healthy') else 'FAIL'}"
+                for s in health.get("signals", [])
+                if not s.get("skipped")
+            )
+            if signals_brief:
+                ctx["Health signals"] = signals_brief
+
+            # next_step embeds the actual CLI commands so the operator can
+            # copy/paste from the email without leaving the inbox.
+            next_step_parts = [
+                f"DNS has moved to {target_region} but the data tier is NOT ready. "
+                f"Your app in {target_region} CANNOT WRITE until you complete the steps below."
+            ]
+            if aurora_commands:
+                next_step_parts.append("\n--- Step 1: Promote Aurora ---\n" + aurora_commands)
+            if elasticache_commands:
+                step_n = 2 if aurora_commands else 1
+                next_step_parts.append(f"\n--- Step {step_n}: Promote ElastiCache ---\n" + elasticache_commands)
+            next_step_parts.append(
+                f"\nThe orchestrator polls every minute and will detect promotion automatically. "
+                f"You will receive a confirmation email per tier when each completes. The latch "
+                f"is ENGAGED — {active_region} stays marked unhealthy until you run failback."
+            )
+            next_step = "\n".join(next_step_parts) + (ai_appendix or "")
+
+            subject, body = compose_message(
+                severity=SEVERITY_CRITICAL,
+                what=f"Failover triggered — promote data tier in {target_region} now",
+                why=(
+                    f"{health.get('decision_reason', 'health check failed')}. "
+                    f"DNS was moved automatically but data-tier auto-promote is "
+                    f"disabled (or failed), so the operator must promote Aurora "
+                    f"and/or ElastiCache manually before the new active region "
+                    f"can serve writes."
+                ),
+                next_step=next_step,
+                context=ctx,
+                journey=journey_lines,
+                source="failover-orchestrator",
+                region=CURRENT_REGION,
+            )
+            send_notification(subject, body)
 
         return {
             "statusCode": 200,
@@ -2833,23 +3557,52 @@ def _handle_active_region(state: dict, active_region: str,
 
     except Exception as e:
         logger.error(f"FAILOVER FAILED: {e}")
+        revert_state = (
+            "PRIMARY_ACTIVE" if active_region == PRIMARY_REGION
+            else "SECONDARY_ACTIVE"
+        )
         update_failover_state({
-            "state": (
-                "PRIMARY_ACTIVE"
-                if active_region == PRIMARY_REGION
-                else "SECONDARY_ACTIVE"
-            ),
+            "state": revert_state,
             "consecutive_failures": 0,
             "aurora_promotion_pending": False,
             "redis_promotion_pending": False,
         })
-        send_notification(
-            subject=f"FAILOVER FAILED: {active_region} -> {target_region}",
-            message=(
-                f"DNS failover FAILED.\n"
-                f"Error: {str(e)}\n"
-                f"Manual intervention required.\n\n"
-                f"State has been reset. Orchestrator will re-evaluate next cycle."
+        subject, body = compose_message(
+            severity=SEVERITY_CRITICAL,
+            what=f"Auto-failover FAILED — {active_region} → {target_region} did not complete",
+            why=(
+                f"The orchestrator detected sustained failures in {active_region} "
+                f"and attempted an automatic DNS failover, but the failover "
+                f"handler threw {type(e).__name__} during execution. State has "
+                f"been reverted to {revert_state}. Error: {e}"
             ),
+            next_step=(
+                f"**Manual intervention required.** Inspect the orchestrator "
+                f"Lambda's CloudWatch logs in {CURRENT_REGION} for the full "
+                f"traceback. The orchestrator will re-evaluate health on the "
+                f"next 60s cycle and try again — but if the underlying issue "
+                f"causes the same exception, you'll get another FAILED email. "
+                f"Common causes: state backend write failure (IAM/connectivity), "
+                f"Aurora switchover-global-cluster API error, or CW PutMetricData "
+                f"failure. If {active_region} cannot be restored quickly, "
+                f"consider invoking the failover Lambda directly with "
+                f"`{{\"execute_failover\": true}}` once the underlying error "
+                f"is resolved."
+            ),
+            context={
+                "From region": active_region,
+                "To region": target_region,
+                "Error type": type(e).__name__,
+                "Error detail": str(e)[:200],
+                "State after revert": revert_state,
+            },
+            journey=[
+                "[✓] Threshold reached",
+                "[✗] Failover handler FAILED — state reverted",
+                "[ ] Will retry on next cycle",
+            ],
+            source="failover-orchestrator",
+            region=CURRENT_REGION,
         )
+        send_notification(subject, body)
         raise
