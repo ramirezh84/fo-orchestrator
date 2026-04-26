@@ -132,14 +132,26 @@ _CONFIG_MATRIX = [
 ]
 
 
+def _env_for(aurora_id, aurora_auto, redis_id, redis_auto):
+    """Build the os.environ patch dict for a configuration row."""
+    return {
+        "AURORA_CLUSTER_ID": aurora_id,
+        "AURORA_AUTO_PROMOTE": "true" if aurora_auto else "false",
+        "ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID": redis_id,
+        "ELASTICACHE_AUTO_PROMOTE": "true" if redis_auto else "false",
+    }
+
+
 @pytest.mark.parametrize("cid,aurora_id,aurora_auto,redis_id,redis_auto,expected",
                          _CONFIG_MATRIX, ids=[c[0] for c in _CONFIG_MATRIX])
 def test_detect_data_tier_config_orchestrator(cid, aurora_id, aurora_auto, redis_id, redis_auto, expected):
-    """Orchestrator's detect_data_tier_config returns correct flags for C1–C9."""
-    with patch.object(orch, "AURORA_CLUSTER_ID", aurora_id), \
-         patch.object(orch, "AURORA_AUTO_PROMOTE", aurora_auto), \
-         patch.object(orch, "ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID", redis_id), \
-         patch.object(orch, "ELASTICACHE_AUTO_PROMOTE", redis_auto):
+    """Orchestrator's detect_data_tier_config returns correct flags for C1–C9.
+
+    PR3c: helper now reads os.environ at call time so portal env-var flips
+    take effect without a Lambda cold start (and so per-test patches don't
+    require module attribute manipulation).
+    """
+    with patch.dict(os.environ, _env_for(aurora_id, aurora_auto, redis_id, redis_auto)):
         assert orch.detect_data_tier_config() == expected
 
 
@@ -147,17 +159,14 @@ def test_detect_data_tier_config_orchestrator(cid, aurora_id, aurora_auto, redis
                          _CONFIG_MATRIX, ids=[c[0] for c in _CONFIG_MATRIX])
 def test_detect_data_tier_config_failback(cid, aurora_id, aurora_auto, redis_id, redis_auto, expected):
     """Failback Lambda's helper must match the orchestrator exactly."""
-    with patch.object(failback, "AURORA_CLUSTER_ID", aurora_id), \
-         patch.object(failback, "AURORA_AUTO_PROMOTE", aurora_auto), \
-         patch.object(failback, "ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID", redis_id), \
-         patch.object(failback, "ELASTICACHE_AUTO_PROMOTE", redis_auto):
+    with patch.dict(os.environ, _env_for(aurora_id, aurora_auto, redis_id, redis_auto)):
         assert failback.detect_data_tier_config() == expected
 
 
 def test_aurora_auto_requires_aurora_present():
     """AURORA_AUTO_PROMOTE=true with empty AURORA_CLUSTER_ID → aurora_auto=False (defensive)."""
-    with patch.object(orch, "AURORA_CLUSTER_ID", ""), \
-         patch.object(orch, "AURORA_AUTO_PROMOTE", True):
+    with patch.dict(os.environ, {"AURORA_CLUSTER_ID": "",
+                                  "AURORA_AUTO_PROMOTE": "true"}):
         cfg = orch.detect_data_tier_config()
         assert cfg["aurora_present"] is False
         assert cfg["aurora_auto"] is False  # cannot auto-promote a tier that isn't there
@@ -165,8 +174,8 @@ def test_aurora_auto_requires_aurora_present():
 
 def test_redis_auto_requires_redis_present():
     """ELASTICACHE_AUTO_PROMOTE=true with empty global RG ID → redis_auto=False."""
-    with patch.object(orch, "ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID", ""), \
-         patch.object(orch, "ELASTICACHE_AUTO_PROMOTE", True):
+    with patch.dict(os.environ, {"ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID": "",
+                                  "ELASTICACHE_AUTO_PROMOTE": "true"}):
         cfg = orch.detect_data_tier_config()
         assert cfg["redis_present"] is False
         assert cfg["redis_auto"] is False

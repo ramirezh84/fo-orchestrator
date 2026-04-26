@@ -1533,14 +1533,19 @@ def detect_data_tier_config() -> dict:
     (redis ∈ {absent, manual, auto}) cover all supported deployments
     from app-only stacks (C1) to fully automated dual-tier (C9).
 
-    Read at invocation time — do not cache; the portal can flip these
-    env vars between cycles. Call after _reload_dynamic_config().
+    Reads os.environ directly (not module globals) so portal env-var
+    flips and per-test patch.dict overrides take effect immediately
+    without depending on _reload_dynamic_config() ordering.
     """
+    aurora_id = os.environ.get("AURORA_CLUSTER_ID", "")
+    redis_id = os.environ.get("ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID", "")
+    aurora_auto = os.environ.get("AURORA_AUTO_PROMOTE", "false").lower() == "true"
+    redis_auto = os.environ.get("ELASTICACHE_AUTO_PROMOTE", "false").lower() == "true"
     return {
-        "aurora_present": bool(AURORA_CLUSTER_ID),
-        "aurora_auto":    bool(AURORA_CLUSTER_ID) and AURORA_AUTO_PROMOTE,
-        "redis_present":  bool(ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID),
-        "redis_auto":     bool(ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID) and ELASTICACHE_AUTO_PROMOTE,
+        "aurora_present": bool(aurora_id),
+        "aurora_auto":    bool(aurora_id) and aurora_auto,
+        "redis_present":  bool(redis_id),
+        "redis_auto":     bool(redis_id) and redis_auto,
     }
 
 
@@ -3003,30 +3008,90 @@ def _handle_active_region(state: dict, active_region: str,
 
         if not aurora_handled:
             # Manual Aurora promotion (default, or auto-promote failed)
-            aurora_commands = build_aurora_promotion_commands(target_region, "app_failure")
-            elasticache_commands = build_elasticache_promotion_commands(target_region)
-
-            send_notification(
-                subject=f"FAILOVER: DNS moved to {target_region} - PROMOTE DATA TIER NOW",
-                message=(
-                    f"Automated DNS failover triggered.\n\n"
-                    f"From: {active_region}\n"
-                    f"To: {target_region}\n"
-                    f"Time: {now.isoformat()}\n"
-                    f"Decision: {health.get('decision_reason', 'N/A')}\n\n"
-                    f"DNS has been moved. Route 53 is now routing traffic to {target_region}.\n\n"
-                    f"ACTION REQUIRED: Data tier must be promoted MANUALLY.\n"
-                    f"Your app in {target_region} CANNOT WRITE until promotion completes.\n\n"
-                    f"{aurora_commands}\n"
-                    f"{elasticache_commands}\n\n"
-                    f"Latch is ENGAGED. {active_region} will remain marked unhealthy.\n"
-                    f"You will receive reminders every "
-                    f"{AURORA_PROMOTION_REMINDER_INTERVAL_MINUTES} minutes until "
-                    f"promotion is detected automatically.\n\n"
-                    f"Signals:\n{json.dumps(health['signals'], indent=2, default=str)}"
-                    f"{ai_appendix}"
-                ),
+            cfg = detect_data_tier_config()
+            aurora_commands = (
+                build_aurora_promotion_commands(target_region, "app_failure")
+                if cfg["aurora_present"] else ""
             )
+            elasticache_commands = (
+                build_elasticache_promotion_commands(target_region)
+                if cfg["redis_present"] else ""
+            )
+
+            # Journey reflects which manual steps the operator must do.
+            journey_lines = ["[✓] Threshold reached", "[✓] Failover (DNS moved)"]
+            if cfg["aurora_present"] and not cfg["aurora_auto"]:
+                journey_lines.append("[→] Aurora — operator action required")
+            elif cfg["aurora_present"]:
+                journey_lines.append("[→] Aurora — auto-promote attempted but failed")
+            if cfg["redis_present"] and not cfg["redis_auto"]:
+                journey_lines.append("[→] Redis — operator action required")
+            elif cfg["redis_present"]:
+                journey_lines.append("[→] Redis — auto-promote attempted but failed")
+            journey_lines.append("[ ] Latch released (after failback)")
+
+            ctx = {
+                "From region": active_region,
+                "To region": target_region,
+                "Decision": health.get("decision_reason", "N/A"),
+            }
+            if cfg["aurora_present"]:
+                ctx["Aurora cluster"] = AURORA_CLUSTER_ID or "(local cluster)"
+                ctx["Aurora action"] = (
+                    "MANUAL — promotion required (see commands below)"
+                    if not cfg["aurora_auto"]
+                    else "auto-promote FAILED — manual recovery required"
+                )
+            if cfg["redis_present"]:
+                ctx["ElastiCache RG"] = ELASTICACHE_REPLICATION_GROUP_ID or "(local RG)"
+                ctx["ElastiCache action"] = (
+                    "MANUAL — failover required (see commands below)"
+                    if not cfg["redis_auto"]
+                    else "auto-failover FAILED — manual recovery required"
+                )
+            signals_brief = ", ".join(
+                f"{s['signal']}={'OK' if s.get('healthy') else 'FAIL'}"
+                for s in health.get("signals", [])
+                if not s.get("skipped")
+            )
+            if signals_brief:
+                ctx["Health signals"] = signals_brief
+
+            # next_step embeds the actual CLI commands so the operator can
+            # copy/paste from the email without leaving the inbox.
+            next_step_parts = [
+                f"DNS has moved to {target_region} but the data tier is NOT ready. "
+                f"Your app in {target_region} CANNOT WRITE until you complete the steps below."
+            ]
+            if aurora_commands:
+                next_step_parts.append("\n--- Step 1: Promote Aurora ---\n" + aurora_commands)
+            if elasticache_commands:
+                step_n = 2 if aurora_commands else 1
+                next_step_parts.append(f"\n--- Step {step_n}: Promote ElastiCache ---\n" + elasticache_commands)
+            next_step_parts.append(
+                f"\nThe orchestrator polls every minute and will detect promotion automatically. "
+                f"You will receive a confirmation email per tier when each completes. The latch "
+                f"is ENGAGED — {active_region} stays marked unhealthy until you run failback."
+            )
+            next_step = "\n".join(next_step_parts) + (ai_appendix or "")
+
+            subject, body = compose_message(
+                severity=SEVERITY_CRITICAL,
+                what=f"Failover triggered — promote data tier in {target_region} now",
+                why=(
+                    f"{health.get('decision_reason', 'health check failed')}. "
+                    f"DNS was moved automatically but data-tier auto-promote is "
+                    f"disabled (or failed), so the operator must promote Aurora "
+                    f"and/or ElastiCache manually before the new active region "
+                    f"can serve writes."
+                ),
+                next_step=next_step,
+                context=ctx,
+                journey=journey_lines,
+                source="failover-orchestrator",
+                region=CURRENT_REGION,
+            )
+            send_notification(subject, body)
 
         return {
             "statusCode": 200,
