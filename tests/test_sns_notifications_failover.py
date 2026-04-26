@@ -284,20 +284,26 @@ class TestSNSDegradationWarnings:
     def test_degraded_warning_first_failure_explicit(
         self, mock_sns, mock_health, mock_inc, mock_pub, mock_upd
     ):
-        """v1.6: first failure (1 of 3) — subject says 'FIRST health failure'."""
+        """v1.7.2: first failure (1 of 3) is INFO-severity 'AWARENESS' framing —
+        no action needed yet. The subject must read as awareness-only so the
+        operator doesn't pager-respond on a transient blip."""
         mock_health.return_value = _unhealthy_health()
         state = _make_state(consecutive_failures=0)
 
         orch._handle_active_region(state, "us-east-1", 0, "1970-01-01T00:00:00Z")
 
         subject = _get_sns_subject(mock_sns)
-        assert "FIRST" in subject
+        # v1.7.2: severity downgraded WARNING → INFO for first failure.
+        assert "INFO" in subject
+        assert "AWARENESS" in subject.upper()
         assert "1 of 3" in subject
+        assert "no action needed" in subject.lower()
 
         body = _get_sns_message(mock_sns)
-        assert "first failure of an incident" in body
-        # First-failure journey breadcrumb shows "[1]" for the active step.
-        assert "[1] First failure" in body
+        # Body still names this as the first failure of the incident.
+        assert "FIRST failure" in body
+        # Body explicitly tells the operator the email is awareness-only.
+        assert "awareness" in body.lower()
 
     @patch.object(orch, "update_failover_state")
     @patch.object(orch, "publish_region_health_metric")
@@ -1809,25 +1815,36 @@ class TestSNSFailback:
     def test_failback_complete_sends_critical(
         self, mock_sns, mock_get_state, mock_upd, mock_pub, mock_cb
     ):
-        """v1.6: Successful failback emits CRITICAL completion email with full
-        journey breadcrumb showing every recovery step is done."""
+        """v1.7.2: Successful failback emits an INFO 'all back to normal' email.
+
+        Was CRITICAL in v1.6, but failback completion is good news, not an
+        incident — INFO matches the user's notification UX request.
+        """
         mock_cb.return_value = MagicMock()
         mock_get_state.return_value = _make_failback_state()
 
         result = failback.handler(self._run_failback(), None)
 
         assert result["statusCode"] == 200
-        assert mock_sns.publish.called
-        subject = _get_sns_subject(mock_sns)
-        assert subject.startswith("[Vigil] CRITICAL:")
-        assert "Failback COMPLETE" in subject
+        # Find the failback-complete notification (filter out any earlier ones).
+        complete_calls = [
+            c for c in mock_sns.publish.call_args_list
+            if "back to normal" in c[1].get("Subject", "").lower()
+        ]
+        assert len(complete_calls) == 1, "Exactly one 'back to normal' email expected"
+        subject = complete_calls[0][1]["Subject"]
+        # v1.7.2: severity INFO, "All back to normal" framing.
+        assert subject.startswith("[Vigil] INFO:")
+        assert "back to normal" in subject.lower()
         assert "us-east-1" in subject
         assert len(subject) <= 100
 
-        body = _get_sns_message(mock_sns)
+        body = complete_calls[0][1]["Message"]
         # Latch released and full journey arc shown.
         assert "Latch" in body and "RELEASED" in body
         assert "[✓] Latch released" in body
+        # Body explicitly says "back to normal".
+        assert "back to normal" in body.lower()
         # Next-step tells operator what to watch for after recovery.
         assert "Confirm Route 53" in body or "confirm route 53" in body.lower()
 
@@ -1878,7 +1895,10 @@ class TestSNSFailback:
         self, mock_sns, mock_get_state, mock_upd, mock_pub, mock_cb
     ):
         """S3 backend: failback complete subject identical to DynamoDB variant
-        (state backend is invisible to the notification template)."""
+        (state backend is invisible to the notification template).
+
+        v1.7.2: severity is INFO and message reads 'all back to normal'.
+        """
         mock_cb.return_value = MagicMock()
         mock_get_state.return_value = _make_failback_state()
 
@@ -1889,9 +1909,14 @@ class TestSNSFailback:
             result = failback.handler(self._run_failback(), None)
 
         assert result["statusCode"] == 200
-        subject = _get_sns_subject(mock_sns)
-        assert subject.startswith("[Vigil] CRITICAL:")
-        assert "Failback COMPLETE" in subject
+        complete_calls = [
+            c for c in mock_sns.publish.call_args_list
+            if "back to normal" in c[1].get("Subject", "").lower()
+        ]
+        assert len(complete_calls) == 1
+        subject = complete_calls[0][1]["Subject"]
+        assert subject.startswith("[Vigil] INFO:")
+        assert "back to normal" in subject.lower()
         assert "us-east-1" in subject
 
 
@@ -1962,7 +1987,10 @@ class TestSNSFailbackRedisGate:
     def test_redis_gate_passes_when_redis_confirmed(
         self, mock_sns, mock_get_state, mock_upd, mock_pub, mock_cb
     ):
-        """C5: aurora_confirmed=true + redis_confirmed=true → failback proceeds."""
+        """C5: aurora_confirmed=true + redis_confirmed=true → failback proceeds.
+
+        v1.7.2: completion notification re-framed as INFO 'all back to normal'.
+        """
         mock_cb.return_value = MagicMock()
         mock_get_state.return_value = _make_failback_state()
 
@@ -1978,7 +2006,7 @@ class TestSNSFailbackRedisGate:
 
         assert result["statusCode"] == 200
         subject = _get_sns_subject(mock_sns)
-        assert "Failback COMPLETE" in subject
+        assert "back to normal" in subject.lower()
 
     @patch.object(failback, "create_backend")
     @patch.object(failback, "publish_region_health_metric")

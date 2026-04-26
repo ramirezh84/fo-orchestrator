@@ -284,6 +284,85 @@ class TestAutoFailoverRedisComposesWait:
 
 
 # ---------------------------------------------------------------------------
+# F11: InvalidGlobalReplicationGroupState retry-on-transient-state
+# ---------------------------------------------------------------------------
+
+class TestF11InvalidStateRetry:
+    """v1.7.2: Global Datastore can return InvalidGlobalReplicationGroupState
+    for several minutes after a recent failover. We now retry the API call up
+    to 5 times with 30s backoff before giving up."""
+
+    def test_retries_on_invalid_state_then_succeeds(self):
+        from botocore.exceptions import ClientError
+        ec = MagicMock()
+        # First two calls return InvalidGlobalReplicationGroupState; third succeeds.
+        invalid_state_error = ClientError(
+            {"Error": {"Code": "InvalidGlobalReplicationGroupState",
+                       "Message": "Global Replication Group is not in a valid state"}},
+            "FailoverGlobalReplicationGroup",
+        )
+        ec.failover_global_replication_group.side_effect = [
+            invalid_state_error,
+            invalid_state_error,
+            {},  # third call succeeds
+        ]
+        ec.describe_global_replication_groups.return_value = {
+            "GlobalReplicationGroups": [{
+                "Members": [{"ReplicationGroupRegion": "us-east-1", "Role": "PRIMARY"}]
+            }]
+        }
+        with patch("boto3.client", return_value=ec), \
+             patch.object(failback, "ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID", "test-rg"), \
+             patch.object(failback, "ELASTICACHE_REPLICATION_GROUP_ID", "test-redis-e1"), \
+             patch.object(failback, "CURRENT_REGION", "us-east-1"), \
+             patch.object(failback.time, "sleep"):
+            result = failback._auto_failover_redis("us-east-1")
+        assert result["success"] is True
+        # API was retried 3 times before succeeding
+        assert ec.failover_global_replication_group.call_count == 3
+
+    def test_returns_failure_after_max_retries_exhausted(self):
+        from botocore.exceptions import ClientError
+        ec = MagicMock()
+        invalid_state_error = ClientError(
+            {"Error": {"Code": "InvalidGlobalReplicationGroupState",
+                       "Message": "Global Replication Group is not in a valid state"}},
+            "FailoverGlobalReplicationGroup",
+        )
+        ec.failover_global_replication_group.side_effect = invalid_state_error
+        with patch("boto3.client", return_value=ec), \
+             patch.object(failback, "ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID", "test-rg"), \
+             patch.object(failback, "ELASTICACHE_REPLICATION_GROUP_ID", "test-redis-e1"), \
+             patch.object(failback, "CURRENT_REGION", "us-east-1"), \
+             patch.object(failback.time, "sleep"):
+            result = failback._auto_failover_redis("us-east-1")
+        assert result["success"] is False
+        # All 5 attempts were made
+        assert ec.failover_global_replication_group.call_count == 5
+        assert "transient state" in result["error"].lower()
+        assert "5 retries" in result["error"]
+        # No wait loop on failure
+        ec.describe_global_replication_groups.assert_not_called()
+
+    def test_other_clienterror_fails_immediately_no_retry(self):
+        """Non-InvalidState ClientErrors should NOT trigger the retry loop."""
+        from botocore.exceptions import ClientError
+        ec = MagicMock()
+        ec.failover_global_replication_group.side_effect = ClientError(
+            {"Error": {"Code": "AccessDenied", "Message": "no perms"}},
+            "FailoverGlobalReplicationGroup",
+        )
+        with patch("boto3.client", return_value=ec), \
+             patch.object(failback, "ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID", "test-rg"), \
+             patch.object(failback, "ELASTICACHE_REPLICATION_GROUP_ID", "test-redis-e1"), \
+             patch.object(failback, "CURRENT_REGION", "us-east-1"):
+            result = failback._auto_failover_redis("us-east-1")
+        assert result["success"] is False
+        # AccessDenied should fail on first attempt — no retries
+        assert ec.failover_global_replication_group.call_count == 1
+
+
+# ---------------------------------------------------------------------------
 # Configurable timeout via env
 # ---------------------------------------------------------------------------
 

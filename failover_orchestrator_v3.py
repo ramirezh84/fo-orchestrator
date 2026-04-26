@@ -3430,6 +3430,65 @@ def _handle_active_region(state: dict, active_region: str,
         )
         update_failover_state({"state": new_state})
 
+        # v1.7.2: send an explicit "all stable on secondary" notification.
+        # This used to be silent — operator only knew failover was complete by
+        # noticing the absence of further reminder emails. Now we send one INFO
+        # email summarising the new steady state.
+        try:
+            origin_region = PRIMARY_REGION if active_region == SECONDARY_REGION else SECONDARY_REGION
+            cfg = detect_data_tier_config()
+            data_tier_summary = []
+            if cfg.get("aurora_present"):
+                data_tier_summary.append(f"Aurora writer: {active_region}")
+            if cfg.get("redis_present"):
+                data_tier_summary.append(f"Redis primary: {active_region}")
+            ctx = {
+                "Active region": active_region,
+                "Failed-over from": origin_region,
+                "State": new_state,
+                "Latch": "engaged (failback required to clear)",
+            }
+            if data_tier_summary:
+                ctx["Data tier"] = " · ".join(data_tier_summary)
+            subject, body = compose_message(
+                severity=SEVERITY_INFO,
+                what=(
+                    f"All stable on {active_region} — failover complete, "
+                    f"app fully running on the secondary"
+                ),
+                why=(
+                    f"The orchestrator confirmed Aurora and ElastiCache promotions "
+                    f"completed successfully. Traffic has moved from {origin_region} "
+                    f"to {active_region}, the data tier is in the right place, and "
+                    f"the system is in steady state ({new_state}). The latch is "
+                    f"engaged to prevent flip-flop — running in {active_region} until "
+                    f"manual failback."
+                ),
+                next_step=(
+                    f"No action required. Confirm Route 53 traffic is flowing to "
+                    f"{active_region} (DNS TTL ~60s after the failover claim). When "
+                    f"the underlying issue in {origin_region} is resolved and you "
+                    f"want traffic back, run the manual failback Lambda. Until then, "
+                    f"the system is stable here."
+                ),
+                context=ctx,
+                journey=[
+                    "[✓] Failover triggered",
+                    "[✓] Data tier promoted",
+                    f"[✓] All stable on {active_region}",
+                    "[ ] Failback (manual when ready)",
+                ],
+                source="failover-orchestrator",
+                region=CURRENT_REGION,
+            )
+            send_notification(subject, body)
+        except Exception as e:
+            # Notification failure must NOT block state transition.
+            logger.warning(
+                f"Failed to send 'all stable on secondary' notification "
+                f"(non-fatal): {type(e).__name__}: {e}"
+            )
+
     update_failover_state({
         "last_active_metric_ts": now.isoformat(),
     })
@@ -3460,24 +3519,33 @@ def _handle_active_region(state: dict, active_region: str,
         publish_region_health_metric(CURRENT_REGION, True)
         target_region = SECONDARY_REGION if active_region == PRIMARY_REGION else PRIMARY_REGION
         is_first = new_failure_count == 1
+        # v1.7.2: notification ladder
+        #   1st failure = INFO (awareness only — no action needed)
+        #   2nd...N-1 failures = WARNING (sustained, escalating)
+        #   Nth failure = CRITICAL failover (handled in the cf-threshold branch below)
+        # The user explicitly asked for the first one to read as "for awareness".
         if is_first:
+            severity = SEVERITY_INFO
             what = (
-                f"Region {CURRENT_REGION} reported its FIRST health failure "
-                f"(1 of {CONSECUTIVE_FAILURES_THRESHOLD})"
+                f"AWARENESS: {CURRENT_REGION} reported its first health failure "
+                f"(1 of {CONSECUTIVE_FAILURES_THRESHOLD}) — no action needed yet"
             )
             why = (
                 f"{health.get('decision_reason', 'health check failed')}. "
-                f"This is the first failure of an incident — traffic is still flowing "
-                f"normally to {CURRENT_REGION}."
+                f"This is the FIRST failure of an incident. Traffic is still flowing "
+                f"normally to {CURRENT_REGION}, and most first failures clear on their "
+                f"own. This email is awareness-only so you know the orchestrator is "
+                f"watching."
             )
             next_step = (
-                f"No action required. The orchestrator will keep evaluating health "
-                f"every 60s. You will receive a follow-up email if the failure "
-                f"persists. If {CONSECUTIVE_FAILURES_THRESHOLD} consecutive failures occur "
-                f"and the cooldown window has expired, traffic will move to "
-                f"{target_region} automatically."
+                f"No action needed yet. The orchestrator continues evaluating every "
+                f"60s. You will receive a separate WARNING email if a 2nd consecutive "
+                f"failure occurs (sustained), and a CRITICAL email if "
+                f"{CONSECUTIVE_FAILURES_THRESHOLD} consecutive failures trigger automatic "
+                f"failover to {target_region}."
             )
         else:
+            severity = SEVERITY_WARNING
             what = (
                 f"Region {CURRENT_REGION} health failure "
                 f"{new_failure_count} of {CONSECUTIVE_FAILURES_THRESHOLD} — "
@@ -3506,12 +3574,12 @@ def _handle_active_region(state: dict, active_region: str,
         if signals_brief:
             ctx["Health signals"] = signals_brief
         journey = [
-            f"[{'1' if is_first else '✓'}] First failure",
+            f"[{'1' if is_first else '✓'}] First failure (awareness)",
             f"[{'→' if not is_first else ' '}] Sustained ({new_failure_count}/{CONSECUTIVE_FAILURES_THRESHOLD})",
             "[ ] Failover",
         ]
         subject, body = compose_message(
-            severity=SEVERITY_WARNING,
+            severity=severity,
             what=what,
             why=why,
             next_step=next_step,
@@ -3520,6 +3588,8 @@ def _handle_active_region(state: dict, active_region: str,
             source="failover-orchestrator",
             region=CURRENT_REGION,
         )
+        # First-failure (INFO/awareness) bypasses the WARNING throttle so the
+        # operator gets it immediately. Sustained warnings respect the throttle.
         send_warning_notification(subject, body, state, bypass_throttle=is_first)
         return {"statusCode": 200, "body": "Below threshold, monitoring"}
 
