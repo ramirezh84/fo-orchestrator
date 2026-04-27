@@ -1223,9 +1223,11 @@ def handler(event, context):
 
         logger.info("  4d: Sending confirmation notification...")
         cfg = detect_data_tier_config()
-        # Journey: failback is the inverse of failover. All earlier journey
-        # steps map to "✓" and the lifecycle is back at PRIMARY_ACTIVE.
-        journey = ["[✓] Failback requested", "[✓] Aurora switchover (operator)"]
+        # Journey: failback is the inverse of failover. Skip the Aurora step
+        # when Aurora is not configured (app-only / Redis-only stacks).
+        journey = ["[✓] Failback requested"]
+        if cfg["aurora_present"]:
+            journey.append("[✓] Aurora switchover (operator)")
         if cfg["redis_present"]:
             journey.append("[✓] Redis switchover (operator)")
         journey.append("[✓] Latch released — system back to PRIMARY_ACTIVE")
@@ -1239,6 +1241,11 @@ def handler(event, context):
             f"5–10 minutes to confirm the underlying issue is fully resolved."
             + (readiness_appendix or "")
         )
+        validations = ["HTTP 200", "ECS healthy"]
+        if cfg["aurora_present"]:
+            validations.append(f"Aurora writer in {target_region}")
+        if cfg["redis_present"]:
+            validations.append(f"Redis primary in {target_region}")
         subject, body = compose_message(
             severity=SEVERITY_INFO,
             what=(
@@ -1248,11 +1255,10 @@ def handler(event, context):
             why=(
                 f"Operator {operator} initiated and completed manual failback "
                 f"from {active_region} back to {target_region}. The orchestrator "
-                f"validated target health (HTTP 200, ECS healthy, Aurora writer in "
-                f"{target_region}, Redis primary in {target_region} where applicable), "
-                f"released the latch, and updated state to PRIMARY_ACTIVE. The "
-                f"system is in steady state with {target_region} fully serving "
-                f"traffic and the failover safety net armed."
+                f"validated target health ({', '.join(validations)}), released "
+                f"the latch, and updated state to PRIMARY_ACTIVE. The system is "
+                f"in steady state with {target_region} fully serving traffic and "
+                f"the failover safety net armed."
             ),
             next_step=next_step,
             context={

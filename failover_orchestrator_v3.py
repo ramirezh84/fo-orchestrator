@@ -3482,10 +3482,13 @@ def _handle_active_region(state: dict, active_region: str,
             origin_region = PRIMARY_REGION if active_region == SECONDARY_REGION else SECONDARY_REGION
             cfg = detect_data_tier_config()
             data_tier_summary = []
+            tier_names = []
             if cfg.get("aurora_present"):
                 data_tier_summary.append(f"Aurora writer: {active_region}")
+                tier_names.append("Aurora")
             if cfg.get("redis_present"):
                 data_tier_summary.append(f"Redis primary: {active_region}")
+                tier_names.append("ElastiCache")
             ctx = {
                 "Active region": active_region,
                 "Failed-over from": origin_region,
@@ -3494,6 +3497,12 @@ def _handle_active_region(state: dict, active_region: str,
             }
             if data_tier_summary:
                 ctx["Data tier"] = " · ".join(data_tier_summary)
+            if len(tier_names) == 0:
+                tier_clause = "the failover completed successfully"
+            elif len(tier_names) == 1:
+                tier_clause = f"the {tier_names[0]} promotion completed successfully"
+            else:
+                tier_clause = f"the {' and '.join(tier_names)} promotions completed successfully"
             subject, body = compose_message(
                 severity=SEVERITY_INFO,
                 what=(
@@ -3501,12 +3510,11 @@ def _handle_active_region(state: dict, active_region: str,
                     f"app fully running on the secondary"
                 ),
                 why=(
-                    f"The orchestrator confirmed Aurora and ElastiCache promotions "
-                    f"completed successfully. Traffic has moved from {origin_region} "
-                    f"to {active_region}, the data tier is in the right place, and "
-                    f"the system is in steady state ({new_state}). The latch is "
-                    f"engaged to prevent flip-flop — running in {active_region} until "
-                    f"manual failback."
+                    f"The orchestrator confirmed {tier_clause}. "
+                    f"Traffic has moved from {origin_region} to {active_region}, "
+                    f"the data tier is in the right place, and the system is in "
+                    f"steady state ({new_state}). The latch is engaged to prevent "
+                    f"flip-flop — running in {active_region} until manual failback."
                 ),
                 next_step=(
                     f"No action required. Confirm Route 53 traffic is flowing to "
@@ -4093,14 +4101,23 @@ def _handle_active_region(state: dict, active_region: str,
             )
             next_step = "\n".join(next_step_parts) + (ai_appendix or "")
 
+            manual_tier_names = []
+            if cfg.get("aurora_present") and not cfg.get("aurora_auto"):
+                manual_tier_names.append("Aurora")
+            if cfg.get("redis_present") and not cfg.get("redis_auto"):
+                manual_tier_names.append("ElastiCache")
+            if not manual_tier_names:
+                manual_tier_phrase = "the failed data-tier promotion"
+            else:
+                manual_tier_phrase = " and ".join(manual_tier_names)
             subject, body = compose_message(
                 severity=SEVERITY_CRITICAL,
                 what=f"Failover triggered — promote data tier in {target_region} now",
                 why=(
                     f"{health.get('decision_reason', 'health check failed')}. "
                     f"DNS was moved automatically but data-tier auto-promote is "
-                    f"disabled (or failed), so the operator must promote Aurora "
-                    f"and/or ElastiCache manually before the new active region "
+                    f"disabled (or failed), so the operator must promote "
+                    f"{manual_tier_phrase} manually before the new active region "
                     f"can serve writes."
                 ),
                 next_step=next_step,
