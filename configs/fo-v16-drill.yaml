@@ -1,0 +1,61 @@
+# fo-v16-drill — single-app dashboard config (issue #100 schema)
+#
+# Generated 2026-04-27 from live AWS state in account 255025578193 (profile tbed).
+# Deployment shape: dual-region (us-east-1 primary, us-east-2 secondary), Aurora
+# Global Database wired in (manual promote), no ElastiCache Global Datastore
+# wired into the orchestrator env (the fo-v16-drill-elasticache CFN stack
+# exists, but ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID is unset on the Lambdas
+# so signal 6 is SKIPPED). No API Gateway in the data path. Active/passive.
+
+# --- Identity --------------------------------------------------------------
+dashboard_name:        "fo-v16-drill-failover"
+account_id:            "255025578193"
+app_name:              "fo-v16-drill"
+
+# --- Lambdas ---------------------------------------------------------------
+orchestrator_function: "fo-fo-v16-drill-orchestrator"
+failback_function:     "fo-fo-v16-drill-failback"
+
+# --- Regions ---------------------------------------------------------------
+primary_region:        "us-east-1"
+secondary_region:      "us-east-2"
+
+# --- Vigil custom metric ---------------------------------------------------
+cw_namespace:          "Custom/FoDemo"
+cw_metric:             "RegionActiveStatus"
+
+# --- Scenario flags --------------------------------------------------------
+routing_mode:          "failover"
+aurora_present:        true
+aurora_auto:           false   # AURORA_AUTO_PROMOTE=false on both Lambdas
+redis_present:         false   # ELASTICACHE_GLOBAL_REPLICATION_GROUP_ID="" on both Lambdas
+redis_auto:            false
+api_gw_present:        false
+
+# --- ECS -------------------------------------------------------------------
+ecs_cluster:           "fo-fo-v16-drill-cluster"
+ecs_service:           "fo-fo-v16-drill-app-svc"
+
+# --- Internal ALB ARN suffixes --------------------------------------------
+primary_alb_suffix:    "app/fo-fo-v16-drill-int-alb/6621737bef38f5e7"
+secondary_alb_suffix:  "app/fo-fo-v16-drill-int-alb/79201c8043ef5028"
+
+# --- Target group ARN suffixes --------------------------------------------
+primary_tg_suffix:     "targetgroup/fo-fo-v16-drill-fargate-tg/b0ceadc10d31c992"
+secondary_tg_suffix:   "targetgroup/fo-fo-v16-drill-fargate-tg/4edb697668d6e0b9"
+
+# --- Aurora ----------------------------------------------------------------
+primary_aurora_cluster:   "fo-v16-drill-aurora-e1"
+secondary_aurora_cluster: "fo-v16-drill-aurora-e2"
+
+# --- CloudWatch alarms backing R53 health checks --------------------------
+primary_alarm_name:    "fo-fo-v16-drill-region-inactive-us-east-1"
+secondary_alarm_name:  "fo-fo-v16-drill-region-inactive-us-east-2"
+
+# --- Route 53 health check IDs --------------------------------------------
+primary_r53_hc_id:     "cfe8f732-7210-421c-b15a-34cb6e0eb3b3"
+secondary_r53_hc_id:   "64aad0d1-3626-4004-9b84-c2f1e4ff5ec7"
+
+# --- Optional ---------------------------------------------------------------
+# CONSECUTIVE_FAILURES_THRESHOLD on the Lambdas is 3 (default).
+# consecutive_failures_threshold: 3
