@@ -226,6 +226,15 @@ def _row_alarms(c, y):
 
 
 def _row_region_active_status(c, y):
+    """RegionActiveStatus per region, with LatchEngaged overlaid.
+
+    Issue #102: previously labeled value=0 as 'Failed', which is misleading on
+    a latched failed-over-from region — there RegionActiveStatus=0 is the v1.0
+    anti-flip-flop latch's intended behavior, not a real failure. Overlaying
+    LatchEngaged on the same widget lets an operator immediately distinguish
+    'passive because latched' (LatchEngaged=1, RegionActiveStatus=0) from
+    'unhealthy and lost the active role' (LatchEngaged=0, RegionActiveStatus=0).
+    """
     p, s, ns, metric = c["primary_region"], c["secondary_region"], c["cw_namespace"], c["cw_metric"]
     yaxis = {"left": {"min": -0.1, "max": 1.5}}
     threshold_label = (
@@ -234,21 +243,29 @@ def _row_region_active_status(c, y):
     )
     annotations = {"horizontal": [
         {"value": 1, "color": "#2ca02c", "label": threshold_label},
-        {"value": 0, "color": "#d62728", "label": "Failed"},
+        {"value": 0, "color": "#7f7f7f", "label": "Inactive (passive or failed)"},
     ]}
     return [
         _metric(
             f"RegionActiveStatus — {p}",
             region=p,
-            metrics=[[ns, metric, "Region", p,
-                      {"color": "#2ca02c", "label": f"{p}"}]],
+            metrics=[
+                [ns, metric, "Region", p,
+                 {"color": "#2ca02c", "label": f"{p} active"}],
+                _vigil_metric(c, "LatchEngaged", p,
+                              color="#d62728", label="Latch engaged"),
+            ],
             x=0, y=y, w=12, h=4, yaxis=yaxis, annotations=annotations,
         ),
         _metric(
             f"RegionActiveStatus — {s}",
             region=s,
-            metrics=[[ns, metric, "Region", s,
-                      {"color": "#1f77b4", "label": f"{s}"}]],
+            metrics=[
+                [ns, metric, "Region", s,
+                 {"color": "#1f77b4", "label": f"{s} active"}],
+                _vigil_metric(c, "LatchEngaged", s,
+                              color="#d62728", label="Latch engaged"),
+            ],
             x=12, y=y, w=12, h=4, yaxis=yaxis, annotations=annotations,
         ),
     ], 4
@@ -569,20 +586,24 @@ def _row_promotion_durations(c, y):
         return [], 0
     p = c["primary_region"]
     metrics = []
+    tier_names = []
     if c["aurora_present"]:
         metrics.append(_vigil_metric(
             c, "AuroraPromotionDurationSeconds", p,
             color="#1f77b4", label="Aurora",
             extra_dims={"Tier": "Aurora"},
         ))
+        tier_names.append("Aurora")
     if c["redis_present"]:
         metrics.append(_vigil_metric(
             c, "RedisPromotionDurationSeconds", p,
             color="#9467bd", label="Redis",
             extra_dims={"Tier": "Redis"},
         ))
+        tier_names.append("Redis")
+    title = f"Promotion durations — {' and '.join(tier_names)} (seconds)"
     return [_metric(
-        "Promotion durations — Aurora / Redis (seconds)",
+        title,
         region=p, metrics=metrics,
         x=0, y=y, w=24, h=4,
         yaxis={"left": {"min": 0}}, stat="Maximum",
