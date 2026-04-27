@@ -397,3 +397,87 @@ class TestThresholdAnnotation:
                 assert any(a["value"] == 5 for a in anns)
                 return
         pytest.fail("Consecutive failures widget not generated")
+
+
+# ---------------------------------------------------------------------------
+# Issue #102 — RegionActiveStatus annotations + promotion duration title
+# ---------------------------------------------------------------------------
+
+class TestRegionActiveStatusAnnotation:
+    """Was 'Failed' on value=0 — misleading for latched failed-over-from
+    regions where 0 is intentional. Now 'Inactive (passive or failed)'
+    plus a LatchEngaged overlay so an operator immediately sees whether
+    the 0 is by design (latch) or unwanted."""
+
+    def _ras_widgets(self, c):
+        d = gd.build_dashboard(c)
+        return [w for w in d["widgets"]
+                if "RegionActiveStatus" in w.get("properties", {}).get("title", "")]
+
+    def test_annotation_label_is_not_failed(self):
+        widgets = self._ras_widgets(_aurora_cfg())
+        assert len(widgets) == 2  # primary + secondary
+        for w in widgets:
+            anns = w["properties"]["annotations"]["horizontal"]
+            zero_label = next(a["label"] for a in anns if a["value"] == 0)
+            assert zero_label != "Failed"
+            assert "passive" in zero_label.lower() or "inactive" in zero_label.lower()
+
+    def test_widget_includes_latch_engaged_overlay(self):
+        for w in self._ras_widgets(_aurora_cfg()):
+            metric_names = [
+                spec[1] for spec in w["properties"]["metrics"]
+                if isinstance(spec, list) and len(spec) >= 2
+            ]
+            assert "RegionActiveStatus" in metric_names
+            assert "LatchEngaged" in metric_names, \
+                "LatchEngaged overlay missing from RegionActiveStatus widget"
+
+    def test_latch_overlay_uses_correct_per_region_dim(self):
+        for w in self._ras_widgets(_aurora_cfg()):
+            title = w["properties"]["title"]
+            expected_region = title.split("— ")[1].strip()
+            for spec in w["properties"]["metrics"]:
+                if isinstance(spec, list) and len(spec) >= 2 and spec[1] == "LatchEngaged":
+                    region_idx = spec.index("Region")
+                    assert spec[region_idx + 1] == expected_region
+
+
+class TestPromotionDurationsTitle:
+    """Was hardcoded 'Aurora / Redis (seconds)' regardless of which tiers
+    were configured. Now reflects the actual deployment shape."""
+
+    def _duration_widget(self, c):
+        d = gd.build_dashboard(c)
+        for w in d["widgets"]:
+            t = w.get("properties", {}).get("title", "")
+            if "Promotion durations" in t:
+                return w
+        return None
+
+    def test_aurora_only_title(self):
+        w = self._duration_widget(_aurora_cfg())
+        assert w is not None
+        assert w["properties"]["title"] == "Promotion durations — Aurora (seconds)"
+
+    def test_aurora_and_redis_title(self):
+        w = self._duration_widget(_aurora_redis_cfg(aurora_auto=True))
+        assert w is not None
+        assert w["properties"]["title"] == "Promotion durations — Aurora and Redis (seconds)"
+
+    def test_redis_only_title(self):
+        # Edge case: Redis-only (no Aurora). Build a config with redis_present
+        # but aurora_present=False — _aurora_redis_cfg layers on top of
+        # _aurora_cfg, so go through _base_cfg explicitly.
+        cfg = _base_cfg(
+            redis_present=True,
+            primary_redis_rg="test-redis-w1",
+            secondary_redis_rg="test-redis-w2",
+        )
+        w = self._duration_widget(cfg)
+        assert w is not None
+        assert w["properties"]["title"] == "Promotion durations — Redis (seconds)"
+
+    def test_app_only_no_widget(self):
+        w = self._duration_widget(_base_cfg())
+        assert w is None  # row is omitted entirely
