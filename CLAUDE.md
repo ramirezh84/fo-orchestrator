@@ -21,6 +21,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | v1.4.2 | `v1.4.2` | + CFN resource naming fix: restore `fo-${Env}` prefix in `cfn/failover.yaml` |
 | v1.4.3 | `v1.4.3` | + Comprehensive SNS notification validation: 50 tests across all config variants (S3/DDB, ElastiCache on/off, API GW on/off, active/passive + active/active) |
 | v1.5 | `v1.5` | + Three-state CW staleness logic: network-layer CW failures now inconclusive (cw_stale=None) instead of confirming; heartbeat alone requires 2× deep staleness to fire failover when CW unreachable. Fixes false-failover on borderline heartbeat + transient CW timeout. |
+| v1.6 | `v1.6` | + Notification template (`compose_message`) + WARNING throttle 10→5min + config-aware failback gates + retry caps + R53 validator |
+| v1.7 | `v1.7` | + Per-region health keys fix S3-backend F7/F8 races |
+| v1.7.1 | `v1.7.1` | + Wait for promotion completion in failback Lambda (F10) |
+| v1.7.2 | `v1.7.2` | + F11: retry + notification UX (first-fail awareness, all-stable-on-secondary, all-back-to-normal) |
+| v1.8 | (issue #98) | + Comprehensive observability: `observability.py` publishes 4 state metrics + 6 per-signal metrics + 5 lifecycle counters + 2 promotion duration histograms, all with Region/AppName/RoutingMode dimensions |
 
 ### Demo Environment (v2.0 Platform)
 
@@ -88,7 +93,7 @@ python3 tools/publish_version.py --alias active --copy-from v1-2
 # Returns: {"ready": true/false, "checks": {"state_backend": ..., "cloudwatch_metric": ..., "sns_topic": ...}}
 
 # Package and deploy orchestrator Lambda (production)
-zip failover_orchestrator_v3.zip failover_orchestrator_v3.py state_backend.py notifications.py ai/__init__.py ai/config.py ai/llm_client.py ai/collector.py ai/rca_analyzer.py ai/stability_collector.py ai/aurora_advisor.py
+zip failover_orchestrator_v3.zip failover_orchestrator_v3.py state_backend.py notifications.py observability.py ai/__init__.py ai/config.py ai/llm_client.py ai/collector.py ai/rca_analyzer.py ai/stability_collector.py ai/aurora_advisor.py
 aws lambda update-function-code \
   --function-name failover-orchestrator-prod \
   --zip-file fileb://failover_orchestrator_v3.zip \
@@ -96,7 +101,7 @@ aws lambda update-function-code \
 # Repeat for us-west-2
 
 # Package and deploy failback Lambda (production)
-zip manual_failback_v2.zip manual_failback_v2.py state_backend.py notifications.py ai/__init__.py ai/config.py ai/llm_client.py ai/stability_collector.py ai/failback_readiness.py
+zip manual_failback_v2.zip manual_failback_v2.py state_backend.py notifications.py observability.py ai/__init__.py ai/config.py ai/llm_client.py ai/stability_collector.py ai/failback_readiness.py
 aws lambda update-function-code \
   --function-name failover-manual-failback-prod \
   --zip-file fileb://manual_failback_v2.zip \
@@ -121,6 +126,7 @@ Runtime dependencies: `boto3`, `botocore` (provided by Lambda runtime). Portal a
 | `failover_orchestrator_v3.py` | Main Lambda (~2,100 lines). Deployed in both regions. Evaluates health, publishes Route 53 metrics, triggers failover. |
 | `manual_failback_v2.py` | Failback Lambda. Operator-triggered to return traffic to primary. |
 | `state_backend.py` | State backend abstraction: DynamoDB Global Table or S3 CRR. |
+| `observability.py` | Shared CW metric helpers: state machine, per-signal, lifecycle counters, promotion durations. Auto-attaches Region+AppName+RoutingMode dims. |
 | `failover_cli.py` | Interactive CLI for operators: live health monitoring, failure simulation, state inspection. |
 | `failover_dashboard_local.py` | Flask web dashboard reading state from backend. |
 | `ai/config.py` | AI configuration: provider, model, timeouts, feature toggles. |
@@ -141,6 +147,7 @@ Runtime dependencies: `boto3`, `botocore` (provided by Lambda runtime). Portal a
 | `.github/workflows/deploy.yml` | GitHub Actions: publish Lambda version on tag push. |
 | `tests/test_orchestrator.py` | Regression tests for core orchestrator logic (52 tests). |
 | `tests/test_state_backend.py` | Unit + integration + CRR replication tests for state backends. |
+| `tests/test_observability.py` | Unit tests for `observability.py` metric helpers (19 tests, issue #98). |
 | `tests/test_e2e_s3_backend.py` | End-to-end scenario tests for S3 backend. |
 | `tests/test_rca.py` | Unit + integration tests for AI RCA module (32 tests). |
 | `tests/test_llm_client.py` | Unit tests for shared LLM client (14 tests). |
@@ -421,9 +428,9 @@ python3 tools/setup_s3_state_backend.py
 #    STATE_BUCKET=failover-state-<region>-<account-id>
 #    STATE_PREFIX=failover-state/
 
-# 3. Include state_backend.py and notifications.py in the Lambda deployment zip:
-zip failover_orchestrator_v3.zip failover_orchestrator_v3.py state_backend.py notifications.py
-zip manual_failback_v2.zip manual_failback_v2.py state_backend.py notifications.py ai/__init__.py ai/config.py ai/llm_client.py ai/stability_collector.py ai/failback_readiness.py
+# 3. Include state_backend.py, notifications.py, and observability.py in the Lambda deployment zip:
+zip failover_orchestrator_v3.zip failover_orchestrator_v3.py state_backend.py notifications.py observability.py
+zip manual_failback_v2.zip manual_failback_v2.py state_backend.py notifications.py observability.py ai/__init__.py ai/config.py ai/llm_client.py ai/stability_collector.py ai/failback_readiness.py
 ```
 
 ### Trade-offs vs DynamoDB

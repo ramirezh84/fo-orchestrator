@@ -53,6 +53,12 @@ from notifications import (
     SEVERITY_WARNING,
     SEVERITY_CRITICAL,
 )
+from observability import (
+    publish_state_metrics,
+    publish_signal_metrics,
+    increment_counter,
+    record_duration_seconds,
+)
 
 # AI modules imported lazily inside functions to support v1.0 mode
 
@@ -700,6 +706,10 @@ def wait_for_aurora_writer(target_region: str, timeout_seconds: int) -> dict:
                         logger.info(
                             f"Aurora writer is now in {target_region} after {elapsed}s"
                         )
+                        record_duration_seconds(
+                            "AuroraPromotionDurationSeconds", elapsed, CURRENT_REGION,
+                            dimensions={"Tier": "Aurora", "Source": "failback"},
+                        )
                         return {"success": True, "elapsed_seconds": elapsed, "error": ""}
         except ClientError as e:
             logger.warning(f"describe_global_clusters during wait: {e}")
@@ -833,6 +843,10 @@ def wait_for_redis_primary(target_region: str, timeout_seconds: int) -> dict:
                         elapsed = int(time.monotonic() - start)
                         logger.info(
                             f"ElastiCache primary is now in {target_region} after {elapsed}s"
+                        )
+                        record_duration_seconds(
+                            "RedisPromotionDurationSeconds", elapsed, CURRENT_REGION,
+                            dimensions={"Tier": "Redis", "Source": "failback"},
                         )
                         return {"success": True, "elapsed_seconds": elapsed, "error": ""}
         except ClientError as e:
@@ -1254,6 +1268,19 @@ def handler(event, context):
         )
         send_notification(subject, body)
         msg_for_return = body  # full body for any caller that logs it
+
+        # Issue #98: emit lifecycle metrics so the dashboard sees the latch
+        # release and the cumulative failback count immediately, without
+        # waiting for the orchestrator's next 60s cycle.
+        increment_counter("FailbacksCompleted", CURRENT_REGION,
+                          dimensions={"Operator": operator})
+        try:
+            publish_state_metrics(get_failover_state(), CURRENT_REGION)
+        except Exception as e:
+            logger.warning(
+                f"Failed to publish state metrics after failback (non-fatal): "
+                f"{type(e).__name__}: {e}"
+            )
 
         logger.info(f"FAILBACK COMPLETE: {active_region} -> {target_region}")
         return {"statusCode": 200, "body": msg_for_return}

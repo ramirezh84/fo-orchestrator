@@ -64,6 +64,12 @@ from notifications import (
     SEVERITY_WARNING,
     SEVERITY_CRITICAL,
 )
+from observability import (
+    publish_state_metrics,
+    publish_signal_metrics,
+    increment_counter,
+    record_duration_seconds,
+)
 
 # AI modules are imported lazily inside functions to support v1.0 mode
 # (where AI_RCA_ENABLED=false and AI modules may not be needed)
@@ -1461,6 +1467,7 @@ def _handle_active_active(state: dict) -> dict:
 
     # Evaluate health
     health = evaluate_region_health()
+    publish_signal_metrics(health, CURRENT_REGION)
     logger.info(
         f"Active-active health: healthy={health['healthy']}, "
         f"failures={consecutive_failures}, reason={health.get('decision_reason', 'N/A')}"
@@ -1981,85 +1988,98 @@ def handler(event, context):
     if event.get("preflight", False):
         return _run_preflight_checks(include_r53=event.get("include_r53", False))
 
-    # Re-read dynamic config (portal may have changed env vars)
-    _reload_dynamic_config()
+    # Issue #98 — every non-preflight invocation publishes the 4 state-machine
+    # metrics in a finally block so the dashboard sees post-mutation state on
+    # every return path. Wrapped in its own try/except inside finally so a CW
+    # outage never crashes the handler.
+    try:
+        # Re-read dynamic config (portal may have changed env vars)
+        _reload_dynamic_config()
 
-    logger.info(
-        f"Failover Orchestrator running in {CURRENT_REGION}, "
-        f"mode={FAILOVER_MODE}, routing={ROUTING_MODE}"
-    )
+        logger.info(
+            f"Failover Orchestrator running in {CURRENT_REGION}, "
+            f"mode={FAILOVER_MODE}, routing={ROUTING_MODE}"
+        )
 
-    # -----------------------------------------------------------------
-    # Reset state: operator invokes with reset_state=true
-    # -----------------------------------------------------------------
-    if event.get("reset_state", False):
-        logger.info("State reset requested via event payload")
-        return _reset_state()
+        # -----------------------------------------------------------------
+        # Reset state: operator invokes with reset_state=true
+        # -----------------------------------------------------------------
+        if event.get("reset_state", False):
+            logger.info("State reset requested via event payload")
+            return _reset_state()
 
-    state = get_failover_state()
+        state = get_failover_state()
 
-    # -----------------------------------------------------------------
-    # Active-active mode: skip failover logic, just evaluate own health
-    # -----------------------------------------------------------------
-    if ROUTING_MODE == "active-active":
-        return _handle_active_active(state)
+        # -----------------------------------------------------------------
+        # Active-active mode: skip failover logic, just evaluate own health
+        # -----------------------------------------------------------------
+        if ROUTING_MODE == "active-active":
+            return _handle_active_active(state)
 
-    # -----------------------------------------------------------------
-    # Manual failover trigger: operator invokes with execute_failover=true
-    # (failover mode only — not applicable to active-active)
-    # -----------------------------------------------------------------
-    if event.get("execute_failover", False):
-        logger.info("Manual failover execution requested via event payload")
-        return _execute_manual_failover()
-    active_region = state.get("active_region", PRIMARY_REGION)
-    current_state = state.get("state", "PRIMARY_ACTIVE")
-    latch_engaged = state.get("latch_engaged", False)
-    consecutive_failures = int(state.get("consecutive_failures", 0))
-    last_failover_ts = state.get("last_failover_ts", "1970-01-01T00:00:00Z")
-    aurora_promotion_pending = state.get("aurora_promotion_pending", False)
-    redis_promotion_pending = state.get("redis_promotion_pending", False)
+        # -----------------------------------------------------------------
+        # Manual failover trigger: operator invokes with execute_failover=true
+        # (failover mode only — not applicable to active-active)
+        # -----------------------------------------------------------------
+        if event.get("execute_failover", False):
+            logger.info("Manual failover execution requested via event payload")
+            return _execute_manual_failover()
+        active_region = state.get("active_region", PRIMARY_REGION)
+        current_state = state.get("state", "PRIMARY_ACTIVE")
+        latch_engaged = state.get("latch_engaged", False)
+        consecutive_failures = int(state.get("consecutive_failures", 0))
+        last_failover_ts = state.get("last_failover_ts", "1970-01-01T00:00:00Z")
+        aurora_promotion_pending = state.get("aurora_promotion_pending", False)
+        redis_promotion_pending = state.get("redis_promotion_pending", False)
 
-    logger.info(
-        f"State: active={active_region}, state={current_state}, "
-        f"latch={latch_engaged}, failures={consecutive_failures}, "
-        f"aurora_pending={aurora_promotion_pending}, "
-        f"redis_pending={redis_promotion_pending}, current_region={CURRENT_REGION}"
-    )
+        logger.info(
+            f"State: active={active_region}, state={current_state}, "
+            f"latch={latch_engaged}, failures={consecutive_failures}, "
+            f"aurora_pending={aurora_promotion_pending}, "
+            f"redis_pending={redis_promotion_pending}, current_region={CURRENT_REGION}"
+        )
 
-    # Skip if a failover or failback is already in progress
-    if current_state in ("FAILOVER_IN_PROGRESS", "FAILBACK_IN_PROGRESS"):
-        logger.info(f"State is {current_state}, skipping evaluation")
-        return {"statusCode": 200, "body": f"Skipping - {current_state}"}
+        # Skip if a failover or failback is already in progress
+        if current_state in ("FAILOVER_IN_PROGRESS", "FAILBACK_IN_PROGRESS"):
+            logger.info(f"State is {current_state}, skipping evaluation")
+            return {"statusCode": 200, "body": f"Skipping - {current_state}"}
 
-    # If data tier promotion is pending (Aurora and/or ElastiCache), handle
-    # reminders. Only the Lambda in the NEW active region handles this.
-    # The Lambda in the failed region falls through to passive handler.
-    any_promotion_pending = aurora_promotion_pending or redis_promotion_pending
-    if any_promotion_pending and current_state == "WAITING_AURORA_PROMOTION":
-        if CURRENT_REGION == active_region:
-            if aurora_promotion_pending:
-                _handle_aurora_promotion_reminder(state)
-            if redis_promotion_pending:
-                _handle_elasticache_promotion_reminder(state)
+        # If data tier promotion is pending (Aurora and/or ElastiCache), handle
+        # reminders. Only the Lambda in the NEW active region handles this.
+        # The Lambda in the failed region falls through to passive handler.
+        any_promotion_pending = aurora_promotion_pending or redis_promotion_pending
+        if any_promotion_pending and current_state == "WAITING_AURORA_PROMOTION":
+            if CURRENT_REGION == active_region:
+                if aurora_promotion_pending:
+                    _handle_aurora_promotion_reminder(state)
+                if redis_promotion_pending:
+                    _handle_elasticache_promotion_reminder(state)
 
-            # Re-read state to check if both flags are now cleared
-            state = get_failover_state()
-            aurora_still = state.get("aurora_promotion_pending", False)
-            redis_still = state.get("redis_promotion_pending", False)
+                # Re-read state to check if both flags are now cleared
+                state = get_failover_state()
+                aurora_still = state.get("aurora_promotion_pending", False)
+                redis_still = state.get("redis_promotion_pending", False)
 
-            if aurora_still or redis_still:
-                publish_region_health_metric(CURRENT_REGION, True)
-                return {"statusCode": 200, "body": "Waiting for data tier promotion"}
-            # Both cleared — fall through to _handle_active_region which
-            # transitions from WAITING_AURORA_PROMOTION to steady state
-        # If we're not the active region, fall through to passive handler
-        # which will publish 0 for us (latch is engaged)
+                if aurora_still or redis_still:
+                    publish_region_health_metric(CURRENT_REGION, True)
+                    return {"statusCode": 200, "body": "Waiting for data tier promotion"}
+                # Both cleared — fall through to _handle_active_region which
+                # transitions from WAITING_AURORA_PROMOTION to steady state
+            # If we're not the active region, fall through to passive handler
+            # which will publish 0 for us (latch is engaged)
 
-    if CURRENT_REGION != active_region:
-        return _handle_passive_region(state, active_region)
+        if CURRENT_REGION != active_region:
+            return _handle_passive_region(state, active_region)
 
-    return _handle_active_region(state, active_region,
-                                consecutive_failures, last_failover_ts)
+        return _handle_active_region(state, active_region,
+                                    consecutive_failures, last_failover_ts)
+    finally:
+        try:
+            publish_state_metrics(get_failover_state(), CURRENT_REGION)
+        except Exception as e:
+            logger.warning(
+                f"Failed to publish state metrics (non-fatal): "
+                f"{type(e).__name__}: {e}"
+            )
 
 
 def _execute_manual_failover() -> dict:
@@ -2119,6 +2139,8 @@ def _execute_manual_failover() -> dict:
         logger.info(msg)
         return {"statusCode": 200, "body": msg}
 
+    increment_counter("FailoversTriggered", CURRENT_REGION,
+                      dimensions={"Trigger": "MANUAL_EXECUTE"})
     _emit_failover_event(
         event_type="FAILOVER_INITIATED",
         source_region=active_region,
@@ -2863,6 +2885,11 @@ def _auto_promote_aurora(target_region: str, scenario: str) -> dict:
     if not target_arn:
         return {"success": False, "method": "none", "error": "Cannot construct target cluster ARN"}
 
+    # Issue #98: now that we've passed config validation, this counts as a real
+    # promotion attempt. Pre-flight failures (no global cluster id, no ARN) are
+    # NOT counted — they're operator misconfigurations, not promotion failures.
+    increment_counter("PromotionsAttempted", CURRENT_REGION, dimensions={"Tier": "Aurora"})
+
     # For app failure, try planned switchover first
     if scenario == "app_failure":
         logger.info(f"Attempting Aurora planned switchover to {target_region}")
@@ -2872,6 +2899,8 @@ def _auto_promote_aurora(target_region: str, scenario: str) -> dict:
                 TargetDbClusterIdentifier=target_arn,
             )
             logger.info(f"Aurora switchover initiated to {target_region}")
+            increment_counter("PromotionsSucceeded", CURRENT_REGION,
+                              dimensions={"Tier": "Aurora", "Method": "switchover"})
             return {"success": True, "method": "switchover", "error": ""}
         except ClientError as e:
             logger.warning(
@@ -2888,10 +2917,14 @@ def _auto_promote_aurora(target_region: str, scenario: str) -> dict:
             AllowDataLoss=True,
         )
         logger.info(f"Aurora failover initiated to {target_region}")
+        increment_counter("PromotionsSucceeded", CURRENT_REGION,
+                          dimensions={"Tier": "Aurora", "Method": "failover"})
         return {"success": True, "method": "failover", "error": ""}
     except ClientError as e:
         error_msg = f"Aurora failover failed: {e}"
         logger.error(error_msg)
+        increment_counter("PromotionsFailed", CURRENT_REGION,
+                          dimensions={"Tier": "Aurora", "Method": "failover"})
         return {"success": False, "method": "failover", "error": error_msg}
 
 
@@ -2973,6 +3006,9 @@ def _auto_promote_elasticache(target_region: str, scenario: str) -> dict:
         return {"success": False, "method": "none",
                 "error": f"Cannot determine ElastiCache replication group ID in {target_region}"}
 
+    # Issue #98: post-config-validation, this is a real promotion attempt.
+    increment_counter("PromotionsAttempted", CURRENT_REGION, dimensions={"Tier": "Redis"})
+
     logger.info(f"Attempting ElastiCache global failover to {target_region} (RG: {target_rg_id})")
     try:
         elasticache_client.failover_global_replication_group(
@@ -2981,10 +3017,14 @@ def _auto_promote_elasticache(target_region: str, scenario: str) -> dict:
             PrimaryReplicationGroupId=target_rg_id,
         )
         logger.info(f"ElastiCache failover initiated to {target_region}")
+        increment_counter("PromotionsSucceeded", CURRENT_REGION,
+                          dimensions={"Tier": "Redis", "Method": "failover"})
         return {"success": True, "method": "failover", "error": ""}
     except ClientError as e:
         error_msg = f"ElastiCache failover failed: {e}"
         logger.error(error_msg)
+        increment_counter("PromotionsFailed", CURRENT_REGION,
+                          dimensions={"Tier": "Redis", "Method": "failover"})
         return {"success": False, "method": "failover", "error": error_msg}
 
 
@@ -3038,6 +3078,7 @@ def _handle_passive_region(state: dict, active_region: str) -> dict:
     # v1.7: write to per-region key instead of merging into shared state.
     # Avoids the F7/F8 RMW race that blocked v1.6 in the bilateral-CRR drill.
     our_health = evaluate_region_health()
+    publish_signal_metrics(our_health, CURRENT_REGION)
     write_own_region_health(our_health["healthy"], signals=our_health.get("signals"))
 
     if latch_engaged:
@@ -3092,6 +3133,8 @@ def _handle_passive_region(state: dict, active_region: str) -> dict:
             )
             return {"statusCode": 200, "body": "Region failure already handled"}
 
+        increment_counter("FailoversTriggered", CURRENT_REGION,
+                          dimensions={"Trigger": "AUTO_PASSIVE"})
         _emit_failover_event(
             event_type="FAILOVER_INITIATED",
             source_region=active_region,
@@ -3346,6 +3389,7 @@ def _handle_passive_region(state: dict, active_region: str) -> dict:
         return {"statusCode": 200, "body": "Passive region, PASSIVE_PUBLISH_ZERO active"}
 
     our_health = evaluate_region_health()
+    publish_signal_metrics(our_health, CURRENT_REGION)
     publish_region_health_metric(CURRENT_REGION, our_health["healthy"])
 
     if not our_health["healthy"]:
@@ -3494,6 +3538,7 @@ def _handle_active_region(state: dict, active_region: str,
     })
 
     health = evaluate_region_health()
+    publish_signal_metrics(health, CURRENT_REGION)
     logger.info(f"Health evaluation: {json.dumps(health, default=str)}")
 
     if health["healthy"]:
@@ -3813,6 +3858,8 @@ def _handle_active_region(state: dict, active_region: str,
         logger.info("Another invocation already claimed the failover, yielding")
         return {"statusCode": 200, "body": "Failover already claimed by another invocation"}
 
+    increment_counter("FailoversTriggered", CURRENT_REGION,
+                      dimensions={"Trigger": "AUTO_ACTIVE"})
     _emit_failover_event(
         event_type="FAILOVER_INITIATED",
         source_region=active_region,
