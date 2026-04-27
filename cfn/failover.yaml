@@ -27,6 +27,10 @@ Parameters:
     Type: String
     Description: ALB ARN suffix (from ALB ARN after /app/)
     Default: ''
+  TgArnSuffix:
+    Type: String
+    Description: ALB target group ARN suffix (from TG ARN after /targetgroup/). Required alongside AlbArnSuffix for the orchestrator's HealthyHostCount signal — when either is empty the ALB check is SKIPPED.
+    Default: ''
   EcsClusterName:
     Type: String
   EcsServiceName:
@@ -233,6 +237,7 @@ Resources:
           HEALTH_CHECK_TIMEOUT_SECONDS: '5'
           HEALTH_CHECK_DISABLE_SSL_VERIFY: 'false'
           ALB_ARN_SUFFIX: !Ref AlbArnSuffix
+          TG_ARN_SUFFIX: !Ref TgArnSuffix
           ECS_CLUSTER_NAME: !Ref EcsClusterName
           ECS_SERVICE_NAME: !Ref EcsServiceName
           AURORA_CLUSTER_ID: !Ref AuroraClusterId
