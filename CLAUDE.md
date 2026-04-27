@@ -142,7 +142,9 @@ Runtime dependencies: `boto3`, `botocore` (provided by Lambda runtime). Portal a
 | `portal/lock.py` | DynamoDB-based test locking (prevents concurrent tests). |
 | `tools/publish_version.py` | Publish Lambda version and create/update alias. Used by CI/CD and manually. |
 | `tools/setup_s3_state_backend.py` | Infrastructure setup script for S3 CRR backend. |
-| `tools/generate_dashboard.py` | CloudWatch dashboard generator. |
+| `tools/generate_dashboard.py` | Scenario-aware CloudWatch dashboard generator. Reads per-app YAML; conditionally renders Aurora / ElastiCache / API GW rows; consumes the issue #98 metrics for state-machine, lifecycle, and duration panels. (issue #100) |
+| `tools/dashboard_config.example.yaml` | Per-app YAML schema for `generate_dashboard.py` — scenario flags + resource IDs. |
+| `tools/validate_dashboard.py` | Drift check: diffs deployed dashboard JSON against generator output. Exit 1 on drift. (issue #100) |
 | `.github/workflows/test.yml` | GitHub Actions: run pytest on every PR to main. |
 | `.github/workflows/deploy.yml` | GitHub Actions: publish Lambda version on tag push. |
 | `tests/test_orchestrator.py` | Regression tests for core orchestrator logic (52 tests). |
@@ -156,6 +158,7 @@ Runtime dependencies: `boto3`, `botocore` (provided by Lambda runtime). Portal a
 | `tests/test_aurora_advisor.py` | Unit tests for Aurora promotion advisor, all phases (32 tests). |
 | `tests/test_elasticache.py` | Unit tests for ElastiCache Global Datastore failover support (25 tests). |
 | `tests/test_sns_notifications_failover.py` | SNS notification validation (v1.4.3) across all config variants: S3/DDB, ElastiCache on/off, API GW on/off, active/passive + active/active, AI disabled (50 tests). |
+| `tests/test_generate_dashboard.py` | Scenario snapshot tests for `tools/generate_dashboard.py` (31 tests, issue #100). |
 | `cfn/network.yaml` | CloudFormation: VPC, subnets, NAT Gateway. |
 | `cfn/app.yaml` | CloudFormation: ECS, ALB, security groups, VPC endpoints. |
 | `cfn/aurora.yaml` | CloudFormation: Aurora Global Database cluster. |
